@@ -183,10 +183,22 @@ export async function startInteractiveRepl(options: {
   try {
     while (true) {
       state.inMainPrompt = true;
-      const line = (await rl.question("\n👤 你 > ")).trim();
+      let line = "";
+      try {
+        line = (await rl.question("\n👤 你 > ")).trim();
+      } catch (err) {
+        if (err instanceof Error && (err.name === "AbortError" || err.message.includes("Ctrl+C"))) {
+          process.stdout.write("\r\n\x1b[J👋 已退出 Duo-Harness。\n");
+          break;
+        }
+        throw err;
+      }
       state.inMainPrompt = false;
       if (!line) continue;
-      if (line === "/exit" || line === "/quit" || line === "/e") break;
+      if (line === "/exit" || line === "/quit" || line === "/e") {
+        process.stdout.write("👋 已退出 Duo-Harness。\n");
+        break;
+      }
       if (await handleSlashCommand(line, state)) continue;
       const res = await runAgentSession(line, {
         workspaceRoot: state.paths.workspaceRoot,

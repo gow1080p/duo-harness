@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import {
   AssistantMessageSchema,
@@ -154,8 +155,10 @@ function loadApiKey(envName: string, dotFileName: string): string {
   if (process.env[envName]?.trim()) {
     return process.env[envName]!.trim();
   }
-  const localEnvKey = readKeyFromFile(path.resolve(process.cwd(), ".env.local"), envName, false);
-  if (localEnvKey) return localEnvKey;
+  const cwdEnv = readKeyFromFile(path.resolve(process.cwd(), ".env.local"), envName, false);
+  if (cwdEnv) return cwdEnv;
+  const harnessRootEnv = readKeyFromFile(path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../.env.local"), envName, false);
+  if (harnessRootEnv) return harnessRootEnv;
   return readKeyFromFile(path.join(os.homedir(), ".gemini", "antigravity", dotFileName), envName, true);
 }
 
