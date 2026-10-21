@@ -206,17 +206,45 @@ describe("Stage 3: 写工具 (edit_file/run_bash/rollback_version)、暂停审�
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   });
 
-  it("5. 纯只读查询类 run_bash (如 find ... | head -100, git status) 自动放行不打扰用户，危险命令正常拦截", async () => {
-    const { isReadonlyBashCommand } = await import("../src/adapters/cli.js");
+  it("5. 纯只读查询类 run_bash (含 2>/dev/null、; 复合统计、find -o) 自动放行，所有写/注入命令严格拦截", async () => {
+    const { isReadonlyBashCommand, buildDefaultSystemPrompt, formatApprovalBox, formatStepToolCalls } =
+      await import("../src/adapters/ui-logger.js");
     expect(
       isReadonlyBashCommand(
         'find . -type f -not -path "*/node_modules/*" -not -path "*/.git/*" | head -100',
       ),
     ).toBe(true);
-    expect(isReadonlyBashCommand("git status && git diff")).toBe(true);
+    expect(isReadonlyBashCommand('wc -l backend/*.py 2>/dev/null; echo "---"; cat backend/requirements.txt')).toBe(true);
+    expect(isReadonlyBashCommand('find . -name "*.py" -o -name "*.ts" | wc -l')).toBe(true);
+    expect(isReadonlyBashCommand("git status && git diff && git branch --show-current")).toBe(true);
+    expect(isReadonlyBashCommand("node -v && python3 --version")).toBe(true);
+
+    // 严防绕过测试
     expect(isReadonlyBashCommand("find . -name '*.tmp' -delete")).toBe(false);
+    expect(isReadonlyBashCommand("sort a.txt -o b.txt")).toBe(false);
+    expect(isReadonlyBashCommand("tree -o out.txt")).toBe(false);
+    expect(isReadonlyBashCommand("cat a > b 2>/dev/null")).toBe(false);
+    expect(isReadonlyBashCommand("env rm -rf dist")).toBe(false);
+    expect(isReadonlyBashCommand('node -e "console.log(1)"')).toBe(false);
     expect(isReadonlyBashCommand("git branch -D feature")).toBe(false);
     expect(isReadonlyBashCommand("ls > out.txt")).toBe(false);
     expect(isReadonlyBashCommand("rm -rf dist")).toBe(false);
+
+    // 验证 System Prompt 注入工作区路径且审批框严格区分修改文件与运行命令
+    expect(buildDefaultSystemPrompt("/tmp/my-ai-kb")).toContain("/tmp/my-ai-kb");
+    const editBox = formatApprovalBox([
+      { id: "1", name: "edit_file", arguments: { path: "a.ts", oldText: "a\nb", newText: "a\nb\nc" } },
+    ]);
+    expect(editBox).toContain("申请修改文件");
+    expect(editBox).toContain("-2 行 / +3 行");
+    const bashBox = formatApprovalBox([{ id: "2", name: "run_bash", arguments: { command: "pytest" } }]);
+    expect(bashBox).toContain("申请执行终端命令");
+    const stepTree = formatStepToolCalls(
+      1,
+      [{ id: "3", name: "read_file", arguments: { path: "README.md", startLine: 1, endLine: 50 } }],
+      new Map([["read_file", true]]),
+    );
+    expect(stepTree).toContain("正在探索与读取项目");
+    expect(stepTree).toContain("README.md (第 1~50 行)");
   });
 });
