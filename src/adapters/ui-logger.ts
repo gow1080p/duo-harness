@@ -4,7 +4,7 @@ import { summarizeWireCost } from "./cost-tracker.js";
 import type { HttpWireLogEntry } from "./sse-stream.js";
 
 const SAFE_CMD_PREFIX =
-  /^(ls|find|wc|head|tail|cat|pwd|which|stat|file|grep|rg|tree|du|df|echo|cd|sort|uniq|git\s+(status|diff|log|show|rev-parse|branch\s+--show-current)|node\s+(-v|--version)|python3?\s+(-V|--version))\b/;
+  /^(ls|find|wc|head|tail|cat|pwd|which|stat|file|grep|rg|tree|du|df|echo|cd|sort|uniq|uname|realpath|basename|dirname|git\s+(status|diff|log|show|rev-parse|remote\s+-v|tag\s+(-l|--list)|branch\s+(--show-current|-a|-r|--list))|node\s+(-v|--version)|python3?\s+(-V|--version))\b/;
 
 export function buildDefaultSystemPrompt(workspaceRoot: string): string {
   return [
@@ -20,6 +20,7 @@ export function buildDefaultSystemPrompt(workspaceRoot: string): string {
 export function isReadonlyBashCommand(cmd: string): boolean {
   const cleaned = cmd
     .replace(/\b2>\s*\/dev\/null\b/g, "")
+    .replace(/<\s*\/dev\/null\b/g, "")
     .replace(/\b2>&1\b/g, "")
     .trim();
   if (
