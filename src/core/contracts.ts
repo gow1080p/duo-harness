@@ -1,9 +1,6 @@
 import { z } from "zod";
 
-/**
- * 1. 模型返回的工具调用请求 (ToolCall)
- * 当模型需要调用本地函数时返回此结构，id 为该次调用的唯一请求号。
- */
+/** 1. 模型返回的工具调用请求 (ToolCall) */
 export const ToolCallSchema = z.object({
   id: z.string().min(1, "toolCall.id 不能为空"),
   name: z.string().min(1, "工具函数名称不能为空"),
@@ -11,9 +8,7 @@ export const ToolCallSchema = z.object({
 });
 export type ToolCall = z.infer<typeof ToolCallSchema>;
 
-/**
- * 2. 四种标准消息角色 (system / user / assistant / tool)
- */
+/** 2. 四种标准消息角色 (system / user / assistant / tool) */
 export const SystemMessageSchema = z.object({
   role: z.literal("system"),
   content: z.string(),
@@ -26,14 +21,8 @@ export const UserMessageSchema = z.object({
 
 export const AssistantMessageSchema = z.object({
   role: z.literal("assistant"),
-  /** 模型触发 tool_calls 时 content 常为 null，自动兜底转为空字符串 "" */
-  content: z
-    .string()
-    .nullable()
-    .optional()
-    .transform((val) => val ?? ""),
+  content: z.string().nullable().optional().transform((val) => val ?? ""),
   toolCalls: z.array(ToolCallSchema).optional(),
-  /** 推理模型的思考过程字段 */
   reasoningContent: z.string().optional(),
 });
 
@@ -103,23 +92,22 @@ export interface LoopStepResult {
   effect: LoopEffect;
 }
 
-/**
- * 4. 原子工具契约 (ToolContract)
- */
+/** 4. 原子工具契约 (ToolContract) 与厂商无关大模型契约 (LlmProvider) */
 export interface ToolContract<TArgs = unknown> {
   name: string;
   description: string;
   parameters: z.ZodType<TArgs, z.ZodTypeDef, any>;
+  inputSchema?: Record<string, unknown>;
   readonly: boolean;
   execute: (args: TArgs) => Promise<string> | string;
 }
 
-/**
- * 5. 厂商无关的大模型调用抽象契约 (LlmProvider)
- * 核心层只认“输入消息列表与工具定义 -> 返回 AssistantMessage”，完全不关心底层是具体哪家大模型还是本地录像回放。
- */
 export interface LlmProvider {
-  chat(messages: Message[], tools?: ToolContract[]): Promise<AssistantMessage>;
+  chat(
+    messages: Message[],
+    tools?: ToolContract[],
+    options?: { signal?: AbortSignal },
+  ): Promise<AssistantMessage>;
 }
 
 export const SessionEntrySchema = z.object({

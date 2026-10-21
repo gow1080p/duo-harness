@@ -79,9 +79,29 @@ export function compactMessages(
 
   const headPrefix = folded.slice(0, headCount);
   const units = groupIntoAtomicUnits(folded.slice(headCount));
+  const evictedActions: string[] = [];
 
   while (units.length > 1 && estimateMessagesChars([...headPrefix, ...units.flat()]) > maxTotalChars) {
-    units.shift();
+    const removed = units.shift()!;
+    for (const m of removed) {
+      if (m.role === "assistant" && m.toolCalls) {
+        for (const tc of m.toolCalls) {
+          const target = String(tc.arguments.path ?? tc.arguments.command ?? "").slice(0, 24);
+          evictedActions.push(`${tc.name}(${target})`);
+        }
+      }
+    }
+  }
+
+  if (evictedActions.length > 0 && maxTotalChars >= 300) {
+    const anchor: Message = {
+      role: "user",
+      content: `[历史操作轨迹摘要: 已淘汰早期轮次，曾执行 ${evictedActions.slice(0, 8).join(", ")}]`,
+    };
+    const withAnchor = [...headPrefix, anchor, ...units.flat()];
+    if (estimateMessagesChars(withAnchor) <= maxTotalChars) {
+      return withAnchor;
+    }
   }
 
   return [...headPrefix, ...units.flat()];

@@ -1,8 +1,6 @@
 import type { Message, SessionEntry } from "./contracts.js";
 
-/**
- * 1. 将新增的 Message 数组转换为带 id 和 parentId 的树节点列表（纯函数）
- */
+/** 1. 将新增的 Message 数组转换为带 id 和 parentId 的树节点列表（纯函数） */
 export function buildSessionEntries(
   existingEntries: readonly SessionEntry[],
   newMessages: readonly Message[],
@@ -16,22 +14,14 @@ export function buildSessionEntries(
       : (existingEntries[existingEntries.length - 1]?.id ?? null);
 
   for (let i = 0; i < newMessages.length; i++) {
-    const seq = existingEntries.length + i + 1;
-    const id = `msg_${seq}`;
-    result.push({
-      id,
-      parentId: currentParentId,
-      timestamp: baseTimestamp + i,
-      message: newMessages[i]!,
-    });
+    const id = `msg_${existingEntries.length + i + 1}`;
+    result.push({ id, parentId: currentParentId, timestamp: baseTimestamp + i, message: newMessages[i]! });
     currentParentId = id;
   }
   return result;
 }
 
-/**
- * 2. 顺着 parentId 从指定终点（默认最后一条）往上回溯，拼出当前分支的 Message[] 数组
- */
+/** 2. 顺着 parentId 从指定终点（默认最后一条）往上回溯，拼出当前分支的 Message[] 数组 */
 export function projectToMessages(
   entries: readonly SessionEntry[],
   leafId?: string,

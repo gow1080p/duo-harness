@@ -4,6 +4,7 @@ import { z } from "zod";
 import type { LlmProvider } from "../core/contracts.js";
 import { runAgentSession } from "./cli.js";
 import { runCodeReview } from "./reviewer.js";
+import { analyzeSessionXray } from "./xray.js";
 
 const RpcRequestSchema = z.object({
   prompt: z.string().default(""),
@@ -56,12 +57,14 @@ async function streamAskSession(
   body: z.infer<typeof RpcRequestSchema>,
   options: HarnessRpcServerOptions,
 ): Promise<void> {
+  const abortCtrl = new AbortController();
   let clientClosed = false;
-  const markClosed = () => {
-    clientClosed = true;
-  };
-  req.on("close", markClosed);
-  res.on("close", markClosed);
+  res.on("close", () => {
+    if (!res.writableEnded) {
+      clientClosed = true;
+      abortCtrl.abort();
+    }
+  });
   res.on("error", () => {});
   res.writeHead(200, {
     "Content-Type": "text/event-stream; charset=utf-8",
@@ -79,6 +82,7 @@ async function streamAskSession(
       workspaceRoot: options.workspaceRoot,
       provider: options.provider,
       maxSteps: body.maxSteps,
+      signal: abortCtrl.signal,
       enableWriteTools: false,
       onStepEvent: (evt) => writeSse("step", evt),
     });
@@ -151,6 +155,10 @@ export function createHarnessRpcServer(
     const url = req.url ?? "/";
     if (req.method === "GET" && url === "/health") {
       sendJson(res, 200, { ok: true, status: "healthy" });
+      return;
+    }
+    if (req.method === "GET" && url === "/xray") {
+      sendJson(res, 200, { ok: true, xray: analyzeSessionXray() });
       return;
     }
     if (req.method === "POST" && url === "/api/session") {
