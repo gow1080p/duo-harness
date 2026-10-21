@@ -1,4 +1,3 @@
-import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -6,81 +5,29 @@ import * as readline from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 import type { LlmProvider, ToolCall } from "../core/contracts.js";
 import { runAgentSession } from "./cli.js";
-import { loadAndFormatWireCost } from "./cost-tracker.js";
+import { loadAndFormatWireCost, padCols } from "./cost-tracker.js";
+import {
+  attachLiveSlashDropdown,
+  createReplCompleter,
+  listManagedProjects,
+  type ManagedProjectSummary,
+  type ProjectSessionPaths,
+  resolveProjectSessionPaths,
+  SLASH_COMMANDS,
+} from "./project-store.js";
 import { createRouterProvider } from "./router.js";
 import { loadJsonlEntries } from "./store.js";
 import { type FileVersionSnapshot, rollbackFileSnapshots } from "./write-tools.js";
 import { analyzeSessionXray, formatXrayReport } from "./xray.js";
 
-export interface ProjectSessionPaths {
-  projectKey: string;
-  workspaceRoot: string;
-  projectDir: string;
-  sessionFile: string;
-  wireLogFile: string;
-  metaFile: string;
-}
-
-export interface ManagedProjectSummary {
-  projectKey: string;
-  workspaceRoot: string;
-  updatedAt: string;
-  entryCount: number;
-  lastLeafId: string | null;
-}
-
-export function resolveProjectSessionPaths(
-  workspaceRoot = process.cwd(),
-  homeBaseDir = path.join(os.homedir(), ".duo-harness", "projects"),
-): ProjectSessionPaths {
-  const resolved = path.resolve(workspaceRoot);
-  const realRoot = fs.existsSync(resolved) ? fs.realpathSync(resolved) : resolved;
-  const baseName = path.basename(realRoot).replace(/[^a-zA-Z0-9_-]/g, "_") || "root";
-  const hash8 = crypto.createHash("sha256").update(realRoot).digest("hex").slice(0, 8);
-  const projectKey = `${baseName}-${hash8}`;
-  const projectDir = path.join(homeBaseDir, projectKey);
-  fs.mkdirSync(projectDir, { recursive: true });
-  const metaFile = path.join(projectDir, "meta.json");
-  fs.writeFileSync(
-    metaFile,
-    JSON.stringify({ projectKey, workspaceRoot: realRoot, updatedAt: new Date().toISOString() }, null, 2),
-    "utf-8",
-  );
-  return {
-    projectKey,
-    workspaceRoot: realRoot,
-    projectDir,
-    sessionFile: path.join(projectDir, "chat.jsonl"),
-    wireLogFile: path.join(projectDir, "http-wire.json"),
-    metaFile,
-  };
-}
-
-export function listManagedProjects(
-  homeBaseDir = path.join(os.homedir(), ".duo-harness", "projects"),
-): ManagedProjectSummary[] {
-  if (!fs.existsSync(homeBaseDir)) return [];
-  const dirs = fs.readdirSync(homeBaseDir, { withFileTypes: true }).filter((d) => d.isDirectory());
-  const list: ManagedProjectSummary[] = [];
-  for (const d of dirs) {
-    try {
-      const pDir = path.join(homeBaseDir, d.name);
-      const meta = JSON.parse(fs.readFileSync(path.join(pDir, "meta.json"), "utf-8"));
-      const sFile = path.join(pDir, "chat.jsonl");
-      const entries = fs.existsSync(sFile) ? loadJsonlEntries(sFile) : [];
-      list.push({
-        projectKey: String(meta.projectKey ?? d.name),
-        workspaceRoot: String(meta.workspaceRoot ?? ""),
-        updatedAt: String(meta.updatedAt ?? ""),
-        entryCount: entries.length,
-        lastLeafId: entries.length > 0 ? entries[entries.length - 1]!.id : null,
-      });
-    } catch {
-      continue;
-    }
-  }
-  return list.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-}
+export {
+  createReplCompleter,
+  listManagedProjects,
+  type ManagedProjectSummary,
+  type ProjectSessionPaths,
+  resolveProjectSessionPaths,
+  SLASH_COMMANDS,
+};
 
 interface ReplRuntimeState {
   paths: ProjectSessionPaths;
@@ -88,6 +35,7 @@ interface ReplRuntimeState {
   snapshots: FileVersionSnapshot[];
   leafId: string | null;
   autoApprove: boolean;
+  inMainPrompt: boolean;
   homeBaseDir?: string;
   customProvider?: LlmProvider;
 }
@@ -108,8 +56,18 @@ function switchProjectWorkspace(targetArg: string, state: ReplRuntimeState): voi
   console.log(`🗂️  [会话存档位置]: ${state.paths.sessionFile} (共 ${existing.length} 条历史记录)`);
 }
 
-function handleSlashCommand(cmd: string, state: ReplRuntimeState): Promise<boolean> | boolean {
+function handleSlashCommand(rawCmd: string, state: ReplRuntimeState): Promise<boolean> | boolean {
   const { paths, snapshots } = state;
+  if (rawCmd === "/" || rawCmd === "/help" || rawCmd === "?") {
+    console.log("\n💡 [快捷命令菜单 (输入 / 时下方会自动弹出提示，按 Tab 可自动补全路径)]:");
+    for (const m of SLASH_COMMANDS) console.log(`  ${padCols(m.label, 14)} - ${m.desc}`);
+    return true;
+  }
+  const exactOrUnique = !rawCmd.includes(" ")
+    ? SLASH_COMMANDS.filter((c) => c.cmd.trim().startsWith(rawCmd))
+    : [];
+  const cmd = exactOrUnique.length === 1 ? exactOrUnique[0]!.cmd.trim() : rawCmd;
+
   if (cmd.startsWith("/cd ")) {
     switchProjectWorkspace(cmd.slice("/cd ".length).trim(), state);
     return true;
@@ -133,11 +91,7 @@ function handleSlashCommand(cmd: string, state: ReplRuntimeState): Promise<boole
   }
   if (cmd === "/undo") {
     return rollbackFileSnapshots(paths.workspaceRoot, snapshots, 1).then((rb) => {
-      console.log(
-        rb.rolledBackCount > 0
-          ? `🔄 已撤回最近 1 次修改: ${rb.touchedPaths.join(", ")}`
-          : "ℹ️ 当前没有可撤回的文件修改。",
-      );
+      console.log(rb.rolledBackCount > 0 ? `🔄 已撤回修改: ${rb.touchedPaths.join(", ")}` : "ℹ️ 当前没有可撤回的修改。");
       return true;
     });
   }
@@ -145,8 +99,8 @@ function handleSlashCommand(cmd: string, state: ReplRuntimeState): Promise<boole
     const projects = listManagedProjects(path.dirname(paths.projectDir));
     console.log(`\n📁 [本机已管理的项目列表 (共 ${projects.length} 个)]:`);
     for (const p of projects) {
-      const activeTag = p.projectKey === paths.projectKey ? " (当前项目)" : "";
-      console.log(`  - ${p.projectKey}${activeTag}: ${p.entryCount} 条记录 | 路径: ${p.workspaceRoot}`);
+      const tag = p.projectKey === paths.projectKey ? " (当前项目)" : "";
+      console.log(`  - ${p.projectKey}${tag}: ${p.entryCount} 条记录 | 路径: ${p.workspaceRoot}`);
     }
     return true;
   }
@@ -173,51 +127,45 @@ export async function startInteractiveRepl(options: {
     snapshots: [],
     leafId: existing.length > 0 ? existing[existing.length - 1]!.id : null,
     autoApprove: false,
+    inMainPrompt: false,
     homeBaseDir: options.homeBaseDir,
     customProvider: options.provider,
   };
 
   console.log(`\n🚀 [Duo-Harness 交互终端] 当前工作区: ${state.paths.workspaceRoot}`);
   console.log(`🗂️  [会话存档位置 (零污染项目 Git)]: ${state.paths.sessionFile}`);
-  if (state.leafId) {
-    console.log(`🔗 [已自动接续上次对话]: 共 ${existing.length} 条记录，当前节点 ${state.leafId}`);
-  }
-  console.log(`💡 快捷命令: /cd <路径> (切换项目) | /projects (项目列表) | /xray (看账单与明细) | /tree (看节点) | /branch <id> (分叉) | /undo (撤回) | /clear (清空) | /exit\n`);
+  if (state.leafId) console.log(`🔗 [已自动接续上次对话]: 共 ${existing.length} 条记录，当前节点 ${state.leafId}`);
+  console.log(`💡 输入 / 自动弹出命令菜单，按 Tab 自动补全指令与路径 (/cd, /projects, /xray, /tree, /branch, /undo, /clear, /exit)\n`);
 
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    completer: createReplCompleter(() => state.paths.workspaceRoot, () => state.paths.sessionFile),
+  });
+  const detachDropdown = attachLiveSlashDropdown(rl, () => state.inMainPrompt, 8);
   const askApproval = async (toolCalls: ToolCall[]) => {
     if (state.autoApprove) return { approved: true };
+    state.inMainPrompt = false;
     console.log(`\n┌─ ⚠️  需要你确认以下修改操作 ──────────────────────────────────`);
     for (const c of toolCalls) {
-      if (c.name === "run_bash") {
-        console.log(`│ 💻 执行命令: ${String(c.arguments?.command ?? "")}`);
-      } else if (c.name === "edit_file") {
-        console.log(`│ 📝 修改文件: ${String(c.arguments?.path ?? "")}`);
-      } else {
-        console.log(`│ 🔧 调用工具: ${c.name} ${JSON.stringify(c.arguments)}`);
-      }
+      const detail = c.name === "run_bash" ? `💻 执行命令: ${c.arguments?.command}` : `📝 修改文件: ${c.arguments?.path ?? c.name}`;
+      console.log(`│ ${detail}`);
     }
-    const ans = (
-      await rl.question(`└─ 是否允许执行？[直接回车/y=允许本次 | a=本轮全自动放行 | n=拒绝] > `)
-    )
-      .trim()
-      .toLowerCase();
-    if (ans === "a") {
-      state.autoApprove = true;
-      return { approved: true };
-    }
-    return ans === "" || ans === "y" || ans === "yes"
+    const ans = (await rl.question(`└─ 是否允许执行？[直接回车/y=允许本次 | a=本轮全自动放行 | n=拒绝] > `)).trim().toLowerCase();
+    if (ans === "a") state.autoApprove = true;
+    return ans === "" || ans === "y" || ans === "yes" || ans === "a"
       ? { approved: true }
       : { approved: false, reason: "用户在终端拒绝了该操作" };
   };
 
   try {
     while (true) {
+      state.inMainPrompt = true;
       const line = (await rl.question("\n👤 你 > ")).trim();
+      state.inMainPrompt = false;
       if (!line) continue;
-      if (line === "/exit" || line === "/quit") break;
+      if (line === "/exit" || line === "/quit" || line === "/e") break;
       if (await handleSlashCommand(line, state)) continue;
-
       const res = await runAgentSession(line, {
         workspaceRoot: state.paths.workspaceRoot,
         sessionFile: state.paths.sessionFile,
@@ -233,6 +181,7 @@ export async function startInteractiveRepl(options: {
       state.leafId = res.leafId;
     }
   } finally {
+    detachDropdown();
     rl.close();
   }
 }

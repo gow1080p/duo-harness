@@ -108,7 +108,7 @@ describe("Stage 2: .jsonl 会话树与断网录像回放测试", () => {
   });
 
   it("4. 支持多轮连续对话 (leafId 续写同一 .jsonl 不重复插 system 且不清空旧记录) 与多项目目录隔离", async () => {
-    const { resolveProjectSessionPaths, listManagedProjects } = await import("../src/adapters/repl.js");
+    const { resolveProjectSessionPaths, listManagedProjects, createReplCompleter } = await import("../src/adapters/repl.js");
     const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "duo-projects-"));
     const projA = path.join(tmpBase, "app-alpha");
     const projB = path.join(tmpBase, "app-beta");
@@ -146,6 +146,11 @@ describe("Stage 2: .jsonl 会话树与断网录像回放测试", () => {
     });
     expect(turn2.entries).toHaveLength(5); // 追加了 msg_4(user2, parent=msg_3), msg_5(asst2, parent=msg_4)
     expect(turn2.finalAnswer).toContain("收到了4条消息");
+
+    const completer = createReplCompleter(() => tmpBase, () => pathsA.sessionFile);
+    expect(completer("/p")[0]).toEqual(["/projects"]);
+    expect(completer("/cd app-")[0]).toContain("/cd app-alpha/");
+    expect(completer("/branch msg_")[0]).toContain("/branch msg_3");
 
     const projects = listManagedProjects(tmpBase);
     expect(projects).toHaveLength(2);
