@@ -2,19 +2,13 @@ import { fileURLToPath } from "node:url";
 import { compactMessages, type CompactorOptions } from "../core/compactor.js";
 import type { LlmProvider, LoopStepResult, SessionEntry, ToolCall, ToolContract } from "../core/contracts.js";
 import { createInitialState, stepAgentLoop } from "../core/loop.js";
-import { assertSessionInvariant, buildSessionEntries, projectToMessages } from "../core/session-tree.js";
+import { assertSessionInvariant, buildSessionEntries, projectToMessages, repairDanglingToolCalls } from "../core/session-tree.js";
 import { createRouterProvider, resolveRouteTier } from "./router.js";
 import { loadAndFormatWireCost } from "./cost-tracker.js";
 import { appendJsonlEntries, createReplayProvider, loadJsonlEntries } from "./store.js";
 import { createBuiltinTools, executeToolCalls } from "./tools.js";
 import { createWriteTools, type FileVersionSnapshot, rollbackFileSnapshots } from "./write-tools.js";
-import {
-  buildDefaultSystemPrompt,
-  formatCompactTurnFooter,
-  formatStepToolCalls,
-  formatToolResultLine,
-  isReadonlyBashCommand,
-} from "./ui-logger.js";
+import { buildDefaultSystemPrompt, formatCompactTurnFooter, formatStepToolCalls, formatToolResultLine, isReadonlyBashCommand } from "./ui-logger.js";
 
 export { buildDefaultSystemPrompt, isReadonlyBashCommand };
 
@@ -34,12 +28,8 @@ export interface RunSessionOptions {
   showCostReport?: boolean;
   suppressFinalEcho?: boolean;
   leafId?: string;
-  onApprovalRequest?: (
-    toolCalls: ToolCall[],
-  ) => Promise<{ approved: boolean; reason?: string }> | { approved: boolean; reason?: string };
-  verifyCompletion?: (
-    finalAnswer: string,
-  ) => Promise<{ ok: boolean; errorOutput?: string }> | { ok: boolean; errorOutput?: string };
+  onApprovalRequest?: (toolCalls: ToolCall[]) => Promise<{ approved: boolean; reason?: string }> | { approved: boolean; reason?: string };
+  verifyCompletion?: (finalAnswer: string) => Promise<{ ok: boolean; errorOutput?: string }> | { ok: boolean; errorOutput?: string };
   onStepEvent?: (event: { phase: string; step: number; detail?: string }) => void;
 }
 
@@ -48,13 +38,7 @@ interface SessionCursor {
   leafId: string | null;
 }
 
-function syncNewMessagesToDisk(
-  sessionFile: string | undefined,
-  recordedEntries: SessionEntry[],
-  allMessages: readonly any[],
-  cursor: SessionCursor,
-  isFirstWrite: boolean,
-): void {
+function syncNewMessagesToDisk(sessionFile: string | undefined, recordedEntries: SessionEntry[], allMessages: readonly any[], cursor: SessionCursor, isFirstWrite: boolean): void {
   const unsavedMessages = allMessages.slice(cursor.persistedCount);
   if (unsavedMessages.length === 0) return;
   const newEntries = buildSessionEntries(recordedEntries, unsavedMessages, Date.now(), cursor.leafId);
@@ -83,7 +67,7 @@ async function runSingleEffectStep(
 ): Promise<LoopStepResult> {
   const { state, effect } = current;
   if (effect.type === "REQUEST_LLM") {
-    const rawMessages = projectToMessages(recordedEntries, cursor.leafId ?? undefined);
+    const rawMessages = repairDanglingToolCalls(projectToMessages(recordedEntries, cursor.leafId ?? undefined));
     const messagesToSend = compactMessages(rawMessages, options.compactor);
     assertSessionInvariant(messagesToSend);
     let reply;
@@ -145,17 +129,27 @@ function initSessionContext(userPrompt: string, workspaceRoot: string, options: 
     }
   }
   const baseState = createInitialState({ systemPrompt, maxSteps: options.maxSteps ?? 8 });
-  const priorMessages =
+  const rawPrior =
     existingEntries.length > 0 && options.leafId
       ? projectToMessages(existingEntries, options.leafId)
       : baseState.messages;
-  const recordedEntries: SessionEntry[] = [...existingEntries];
+  const priorMessages = repairDanglingToolCalls(rawPrior);
+  while (priorMessages.length > 0 && priorMessages[priorMessages.length - 1]!.role === "user") {
+    priorMessages.pop();
+  }
+  const wasHealed =
+    existingEntries.length > 0 &&
+    (priorMessages.length !== rawPrior.length || priorMessages.some((m, i) => m !== rawPrior[i]));
+  const recordedEntries: SessionEntry[] = wasHealed
+    ? buildSessionEntries([], priorMessages, Date.now(), null)
+    : [...existingEntries];
+  if (wasHealed && options.sessionFile) appendJsonlEntries(options.sessionFile, recordedEntries, true);
   const cursor: SessionCursor = {
     persistedCount: existingEntries.length > 0 && options.leafId ? priorMessages.length : 0,
-    leafId: options.leafId ?? null,
+    leafId: wasHealed ? (recordedEntries[recordedEntries.length - 1]?.id ?? null) : (options.leafId ?? null),
   };
   const stepRes = stepAgentLoop({ ...baseState, messages: priorMessages }, { type: "START", userPrompt });
-  syncNewMessagesToDisk(options.sessionFile, recordedEntries, stepRes.state.messages, cursor, existingEntries.length === 0);
+  syncNewMessagesToDisk(options.sessionFile, recordedEntries, stepRes.state.messages, cursor, existingEntries.length === 0 && !wasHealed);
   return { stepRes, recordedEntries, cursor };
 }
 
@@ -215,7 +209,9 @@ export async function runAgentSession(
     }
     options.onStepEvent?.({ phase: stepRes.state.phase, step: stepRes.state.step, detail: stepRes.effect.type });
     stepRes = await runSingleEffectStep(stepRes, recordedEntries, cursor, provider, tools, readonlyMap, options);
-    syncNewMessagesToDisk(options.sessionFile, recordedEntries, stepRes.state.messages, cursor, false);
+    if (stepRes.state.phase !== "awaiting_approval" && stepRes.state.phase !== "executing") {
+      syncNewMessagesToDisk(options.sessionFile, recordedEntries, stepRes.state.messages, cursor, false);
+    }
   }
 
   if (!options.suppressFinalEcho) {

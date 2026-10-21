@@ -7,28 +7,14 @@ import type { LlmProvider, ToolCall } from "../core/contracts.js";
 import { runAgentSession } from "./cli.js";
 import { loadAndFormatWireCost, padCols } from "./cost-tracker.js";
 import { attachLiveSlashDropdown, getPromptVisualCols } from "./dropdown.js";
-import {
-  createReplCompleter,
-  listManagedProjects,
-  type ManagedProjectSummary,
-  type ProjectSessionPaths,
-  resolveProjectSessionPaths,
-  SLASH_COMMANDS,
-} from "./project-store.js";
+import { createReplCompleter, listManagedProjects, type ManagedProjectSummary, type ProjectSessionPaths, resolveProjectSessionPaths, SLASH_COMMANDS } from "./project-store.js";
 import { createRouterProvider, resolveRouteTier } from "./router.js";
 import { loadJsonlEntries } from "./store.js";
 import { formatApprovalBox } from "./ui-logger.js";
 import { type FileVersionSnapshot, rollbackFileSnapshots } from "./write-tools.js";
 import { analyzeSessionXray, formatXrayReport } from "./xray.js";
 
-export {
-  createReplCompleter,
-  listManagedProjects,
-  type ManagedProjectSummary,
-  type ProjectSessionPaths,
-  resolveProjectSessionPaths,
-  SLASH_COMMANDS,
-};
+export { createReplCompleter, listManagedProjects, type ManagedProjectSummary, type ProjectSessionPaths, resolveProjectSessionPaths, SLASH_COMMANDS };
 
 interface ReplRuntimeState {
   paths: ProjectSessionPaths;
@@ -185,11 +171,15 @@ export async function startInteractiveRepl(options: {
     if (state.autoApprove) return { approved: true };
     state.inMainPrompt = false;
     console.log(formatApprovalBox(toolCalls));
-    const ans = (await rl.question(`└─ 是否允许执行？[直接回车/y=允许本次 | a=本轮全自动放行 | n=拒绝] > `)).trim().toLowerCase();
-    if (ans === "a") state.autoApprove = true;
-    return ans === "" || ans === "y" || ans === "yes" || ans === "a"
-      ? { approved: true }
-      : { approved: false, reason: "用户在终端拒绝了该操作" };
+    try {
+      const ans = (await rl.question(`└─ 是否允许执行？[直接回车/y=允许本次 | a=本轮全自动放行 | n=拒绝] > `)).trim().toLowerCase();
+      if (ans === "a") state.autoApprove = true;
+      return ans === "" || ans === "y" || ans === "yes" || ans === "a"
+        ? { approved: true }
+        : { approved: false, reason: "用户在终端拒绝了该操作" };
+    } catch {
+      return { approved: false, reason: "用户按 Ctrl+C 取消了该操作" };
+    }
   };
 
   try {
@@ -207,24 +197,28 @@ export async function startInteractiveRepl(options: {
       }
       state.inMainPrompt = false;
       if (!line) continue;
-      if (line === "/exit" || line === "/quit" || line === "/e") {
+      if (line === "exit" || line === "quit" || line === "/exit" || line === "/quit" || line === "/e") {
         process.stdout.write("👋 已退出 Duo-Harness。\n");
         break;
       }
       if (await handleSlashCommand(line, state)) continue;
-      const res = await runAgentSession(line, {
-        workspaceRoot: state.paths.workspaceRoot,
-        sessionFile: state.paths.sessionFile,
-        wireLogFile: state.paths.wireLogFile,
-        leafId: state.leafId ?? undefined,
-        provider: state.provider,
-        snapshots: state.snapshots,
-        enableWriteTools: true,
-        showCostReport: true,
-        suppressFinalEcho: true,
-        onApprovalRequest: askApproval,
-      });
-      state.leafId = res.leafId;
+      try {
+        const res = await runAgentSession(line, {
+          workspaceRoot: state.paths.workspaceRoot,
+          sessionFile: state.paths.sessionFile,
+          wireLogFile: state.paths.wireLogFile,
+          leafId: state.leafId ?? undefined,
+          provider: state.provider,
+          snapshots: state.snapshots,
+          enableWriteTools: true,
+          showCostReport: false,
+          suppressFinalEcho: true,
+          onApprovalRequest: askApproval,
+        });
+        state.leafId = res.leafId;
+      } catch (err) {
+        console.error(`\n❌ 本轮运行异常: ${err instanceof Error ? err.message : String(err)}`);
+      }
     }
   } finally {
     detachDropdown();
