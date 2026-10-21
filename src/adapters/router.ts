@@ -45,7 +45,7 @@ export function resolveRouteTier(utcTimestampMs: number, options: RouteOptions =
       tier: "tier1_mimo_peak",
       beijingHour,
       isWorkday,
-      reason: `工作日白天高峰 (${beijingHour}:00) 优先走小米 MiMo 2.6 赠金档`,
+      reason: `工作日高峰时段 (${beijingHour}:00 · 自动路由高速主力模型)`,
     };
   }
 
@@ -53,7 +53,7 @@ export function resolveRouteTier(utcTimestampMs: number, options: RouteOptions =
     tier: "tier2_deepseek_offpeak",
     beijingHour,
     isWorkday,
-    reason: `低谷半价窗 (${isWorkday ? "工作日午休/夜间" : "周末"} ${beijingHour}:00) 走 DeepSeek`,
+    reason: `低谷优惠时段 (${isWorkday ? "工作日午休/夜间" : "周末"} ${beijingHour}:00 · 自动路由 DeepSeek)`,
   };
 }
 
