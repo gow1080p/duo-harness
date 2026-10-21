@@ -65,6 +65,7 @@ export function resolveSafePath(
 
   if (mode === "read") {
     const readonlyRoots = [
+      path.join(home, ".duo-harness", "skills"),
       path.join(home, ".gemini", "config", "plugins"),
       path.join(home, ".codex", "skills"),
       path.join(home, ".agents", "skills"),
