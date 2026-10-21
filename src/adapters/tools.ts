@@ -221,24 +221,3 @@ export async function executeToolCalls(
 
   return Promise.all(toolCalls.map((call) => executeSingleToolCall(call, toolMap)));
 }
-
-/** 扫描技能目录提取 SKILL.md 极简索引（静态固化于 systemPrompt 尾部，按需通过 read_file 懒加载） */
-export function buildSkillsIndex(skillDirs: readonly string[]): string {
-  const entries: string[] = [];
-  for (const rawDir of skillDirs) {
-    const dir = rawDir.startsWith("~/") ? path.join(os.homedir(), rawDir.slice(2)) : rawDir;
-    if (!fsSync.existsSync(dir)) continue;
-    for (const sub of fsSync.readdirSync(dir, { withFileTypes: true })) {
-      if (!sub.isDirectory()) continue;
-      const skillFile = path.join(dir, sub.name, "SKILL.md");
-      if (!fsSync.existsSync(skillFile)) continue;
-      const head = fsSync.readFileSync(skillFile, "utf-8").slice(0, 600);
-      const name = head.match(/^name:\s*(.+)$/m)?.[1]?.trim() ?? sub.name;
-      const desc = head.match(/^description:\s*([^\n]+)/m)?.[1]?.trim() ?? "专业技能指令";
-      entries.push(`- ${name} (${skillFile}): ${desc}`);
-    }
-  }
-  return entries.length > 0
-    ? `\n<skills>\n需要特定领域指南时，请调用 read_file 读取对应 SKILL.md：\n${entries.join("\n")}\n</skills>`
-    : "";
-}
