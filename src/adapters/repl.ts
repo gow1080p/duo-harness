@@ -40,11 +40,32 @@ interface ReplRuntimeState {
   customProvider?: LlmProvider;
 }
 
-function switchProjectWorkspace(targetArg: string, state: ReplRuntimeState): void {
+function resolveTargetWorkspace(targetArg: string, state: ReplRuntimeState): string | null {
+  const projects = listManagedProjects(path.dirname(state.paths.projectDir));
+  const idx = Number(targetArg);
+  if (Number.isInteger(idx) && idx >= 1 && idx <= projects.length) {
+    return projects[idx - 1]!.workspaceRoot;
+  }
+  const byManaged = projects.find(
+    (p) => p.projectKey === targetArg || path.basename(p.workspaceRoot) === targetArg || p.projectKey.startsWith(`${targetArg}-`),
+  );
+  if (byManaged && fs.existsSync(byManaged.workspaceRoot)) {
+    return byManaged.workspaceRoot;
+  }
   const expanded = targetArg.startsWith("~/") ? path.join(os.homedir(), targetArg.slice(2)) : targetArg;
   const candidate = path.resolve(state.paths.workspaceRoot, expanded);
-  if (!fs.existsSync(candidate) || !fs.statSync(candidate).isDirectory()) {
-    console.log(`⚠️ 目录不存在: ${candidate}`);
+  if (fs.existsSync(candidate) && fs.statSync(candidate).isDirectory()) return candidate;
+  for (const up of ["..", "../.."]) {
+    const sibling = path.resolve(state.paths.workspaceRoot, up, targetArg);
+    if (fs.existsSync(sibling) && fs.statSync(sibling).isDirectory()) return sibling;
+  }
+  return null;
+}
+
+function switchProjectWorkspace(targetArg: string, state: ReplRuntimeState): void {
+  const candidate = resolveTargetWorkspace(targetArg, state);
+  if (!candidate) {
+    console.log(`⚠️ 未找到项目或目录 "${targetArg}"（可输入 /projects 查看序号，用 /cd 2 或 /cd <路径> 切换）`);
     return;
   }
   state.paths = resolveProjectSessionPaths(candidate, state.homeBaseDir);
@@ -95,13 +116,14 @@ function handleSlashCommand(rawCmd: string, state: ReplRuntimeState): Promise<bo
       return true;
     });
   }
-  if (cmd === "/projects") {
+  if (cmd === "/projects" || cmd === "/cd") {
     const projects = listManagedProjects(path.dirname(paths.projectDir));
     console.log(`\n📁 [本机已管理的项目列表 (共 ${projects.length} 个)]:`);
-    for (const p of projects) {
+    projects.forEach((p, i) => {
       const tag = p.projectKey === paths.projectKey ? " (当前项目)" : "";
-      console.log(`  - ${p.projectKey}${tag}: ${p.entryCount} 条记录 | 路径: ${p.workspaceRoot}`);
-    }
+      console.log(`  [${i + 1}] ${p.projectKey}${tag}: ${p.entryCount} 条记录 | 路径: ${p.workspaceRoot}`);
+    });
+    console.log(`👉 切换方式: 直接输入 /cd 2 或 /cd my-ai-kb 或 /cd <任意目录路径>`);
     return true;
   }
   if (cmd === "/clear" || cmd === "/new") {
