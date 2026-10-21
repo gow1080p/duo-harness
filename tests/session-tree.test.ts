@@ -106,4 +106,53 @@ describe("Stage 2: .jsonl 会话树与断网录像回放测试", () => {
     expect(res.entries).toHaveLength(5);
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
+
+  it("4. 支持多轮连续对话 (leafId 续写同一 .jsonl 不重复插 system 且不清空旧记录) 与多项目目录隔离", async () => {
+    const { resolveProjectSessionPaths, listManagedProjects } = await import("../src/adapters/repl.js");
+    const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "duo-projects-"));
+    const projA = path.join(tmpBase, "app-alpha");
+    const projB = path.join(tmpBase, "app-beta");
+    fs.mkdirSync(projA, { recursive: true });
+    fs.mkdirSync(projB, { recursive: true });
+
+    const pathsA = resolveProjectSessionPaths(projA, tmpBase);
+    const pathsB = resolveProjectSessionPaths(projB, tmpBase);
+    expect(pathsA.projectKey).not.toBe(pathsB.projectKey);
+
+    let callIdx = 0;
+    const mockProvider = {
+      async chat(messages: any[]) {
+        callIdx += 1;
+        // 验证第 2 轮发送的 messages 里只有 1 条 system 消息，且完整携带了第 1 轮问答
+        const sysCount = messages.filter((m) => m.role === "system").length;
+        expect(sysCount).toBe(1);
+        return { role: "assistant" as const, content: `第${callIdx}轮回答 (收到了${messages.length}条消息)` };
+      },
+    };
+
+    const turn1 = await runAgentSession("第一句提问", {
+      workspaceRoot: projA,
+      sessionFile: pathsA.sessionFile,
+      provider: mockProvider,
+    });
+    expect(turn1.entries).toHaveLength(3); // msg_1(sys), msg_2(user1), msg_3(asst1)
+    expect(turn1.leafId).toBe("msg_3");
+
+    const turn2 = await runAgentSession("第二句追问", {
+      workspaceRoot: projA,
+      sessionFile: pathsA.sessionFile,
+      leafId: turn1.leafId!,
+      provider: mockProvider,
+    });
+    expect(turn2.entries).toHaveLength(5); // 追加了 msg_4(user2, parent=msg_3), msg_5(asst2, parent=msg_4)
+    expect(turn2.finalAnswer).toContain("收到了4条消息");
+
+    const projects = listManagedProjects(tmpBase);
+    expect(projects).toHaveLength(2);
+    const foundA = projects.find((p) => p.projectKey === pathsA.projectKey);
+    expect(foundA?.entryCount).toBe(5);
+    expect(foundA?.lastLeafId).toBe("msg_5");
+
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  });
 });

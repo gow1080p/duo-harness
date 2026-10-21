@@ -160,40 +160,26 @@ function loadApiKey(envName: string, dotFileName: string): string {
 }
 
 /** 5. 创建真实 HTTP 大模型调用器（支持按时段路由小米 MiMo 2.6 / DeepSeek） */
-export function createRouterProvider(wireLogFile = ".sessions/http-wire.json"): LlmProvider {
+export function createRouterProvider(wireLogFile = ".sessions/http-wire.json", appendExistingWire = false): LlmProvider {
   let roundCount = 0;
   return {
-    async chat(
-      messages: Message[],
-      tools: ToolContract<any>[] = [],
-      options: { signal?: AbortSignal } = {},
-    ): Promise<AssistantMessage> {
+    async chat(messages: Message[], tools: ToolContract<any>[] = [], options: { signal?: AbortSignal } = {}): Promise<AssistantMessage> {
       const decision = resolveRouteTier(Date.now());
       const mimoKey = loadApiKey("MIMO_API_KEY", ".mimo_key");
       const deepseekKey = loadApiKey("DEEPSEEK_API_KEY", ".deepseek_key");
-
       const useMimo = decision.tier === "tier1_mimo_peak" && mimoKey.length > 0;
       const isTokenPlan = mimoKey.startsWith("tp-") || mimoKey.startsWith("ttp-");
       const mimoBaseUrl =
         process.env.MIMO_BASE_URL?.trim() ||
         (isTokenPlan ? "https://token-plan-cn.xiaomimimo.com/v1" : "https://api.xiaomimimo.com/v1");
-
-      const apiUrl = useMimo
-        ? `${mimoBaseUrl.replace(/\/$/, "")}/chat/completions`
-        : "https://api.deepseek.com/chat/completions";
+      const apiUrl = useMimo ? `${mimoBaseUrl.replace(/\/$/, "")}/chat/completions` : "https://api.deepseek.com/chat/completions";
       const model = useMimo ? process.env.MIMO_MODEL?.trim() || "mimo-v2.6-pro" : "deepseek-chat";
       const apiKey = useMimo ? mimoKey : deepseekKey;
-      if (!apiKey) {
-        throw new Error("未检测到 MIMO_API_KEY (.mimo_key) 或 DEEPSEEK_API_KEY (.deepseek_key)");
-      }
+      if (!apiKey) throw new Error("未检测到 MIMO_API_KEY (.mimo_key) 或 DEEPSEEK_API_KEY (.deepseek_key)");
 
       const openAiTools = tools.map((t) => ({
         type: "function",
-        function: {
-          name: t.name,
-          description: t.description,
-          parameters: t.inputSchema ?? zodObjectToJsonSchema(t.parameters),
-        },
+        function: { name: t.name, description: t.description, parameters: t.inputSchema ?? zodObjectToJsonSchema(t.parameters) },
       }));
       const requestBody: Record<string, unknown> = {
         model,
@@ -204,18 +190,13 @@ export function createRouterProvider(wireLogFile = ".sessions/http-wire.json"): 
       };
       const timeoutSig = AbortSignal.timeout(60_000);
       const signal = options.signal ? AbortSignal.any([options.signal, timeoutSig]) : timeoutSig;
-
       const res = await fetch(apiUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
         body: JSON.stringify(requestBody),
         signal,
       });
-
-      if (!res.ok) {
-        const errText = await res.text();
-        throw new Error(`LLM HTTP ${res.status}: ${errText.slice(0, 300)}`);
-      }
+      if (!res.ok) throw new Error(`LLM HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
 
       let printedHeader = false;
       const { message, rawSseLines } = await readOpenAiSseStream(res, (chunk) => {
@@ -227,17 +208,8 @@ export function createRouterProvider(wireLogFile = ".sessions/http-wire.json"): 
       });
       if (printedHeader) process.stdout.write("\n");
 
-      recordHttpWireLog(
-        {
-          roundTimestamp: new Date().toISOString(),
-          apiUrl,
-          requestBody,
-          rawSseLines,
-          assembledMessage: message,
-        },
-        wireLogFile,
-        roundCount === 0,
-      );
+      const entry = { roundTimestamp: new Date().toISOString(), apiUrl, requestBody, rawSseLines, assembledMessage: message };
+      recordHttpWireLog(entry, wireLogFile, roundCount === 0 && !appendExistingWire);
       roundCount += 1;
       return message;
     },
