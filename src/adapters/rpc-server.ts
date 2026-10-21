@@ -4,7 +4,6 @@ import { z } from "zod";
 import type { LlmProvider } from "../core/contracts.js";
 import { runAgentSession } from "./cli.js";
 import { runCodeReview } from "./reviewer.js";
-import { analyzeSessionXray } from "./xray.js";
 
 const RpcRequestSchema = z.object({
   prompt: z.string().default(""),
@@ -155,10 +154,6 @@ export function createHarnessRpcServer(
     const url = req.url ?? "/";
     if (req.method === "GET" && url === "/health") {
       sendJson(res, 200, { ok: true, status: "healthy" });
-      return;
-    }
-    if (req.method === "GET" && url === "/xray") {
-      sendJson(res, 200, { ok: true, xray: analyzeSessionXray() });
       return;
     }
     if (req.method === "POST" && url === "/api/session") {

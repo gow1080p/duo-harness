@@ -1,5 +1,4 @@
 import { fileURLToPath } from "node:url";
-import { z } from "zod";
 import { compactMessages, type CompactorOptions } from "../core/compactor.js";
 import type { LlmProvider, LoopStepResult, SessionEntry, ToolCall, ToolContract } from "../core/contracts.js";
 import { createInitialState, stepAgentLoop } from "../core/loop.js";
@@ -7,15 +6,13 @@ import { assertSessionInvariant, buildSessionEntries, projectToMessages } from "
 import { createRouterProvider, resolveRouteTier } from "./router.js";
 import { loadAndFormatWireCost } from "./cost-tracker.js";
 import { appendJsonlEntries, createReplayProvider, loadJsonlEntries } from "./store.js";
-import { buildSkillsIndex, createBuiltinTools, executeToolCalls } from "./tools.js";
+import { createBuiltinTools, executeToolCalls } from "./tools.js";
 import { createWriteTools, type FileVersionSnapshot, rollbackFileSnapshots } from "./write-tools.js";
 
 export interface RunSessionOptions {
   provider?: LlmProvider;
   tools?: ToolContract<any>[];
   enableWriteTools?: boolean;
-  enableSubagent?: boolean;
-  skillDirs?: string[];
   signal?: AbortSignal;
   workspaceRoot?: string;
   snapshots?: FileVersionSnapshot[];
@@ -116,19 +113,6 @@ async function runSingleEffectStep(
   return current;
 }
 
-function createSubagentTool(provider: LlmProvider, workspaceRoot: string, signal?: AbortSignal): ToolContract<{ task: string }> {
-  return {
-    name: "delegate_task",
-    description: "派生独立只读子代理探路检索，仅返回精炼结论以保护主会话 KV 缓存",
-    parameters: z.object({ task: z.string().min(1) }),
-    readonly: true,
-    async execute({ task }) {
-      const subRes = await runAgentSession(task, { provider, workspaceRoot, enableWriteTools: false, enableSubagent: false, maxSteps: 4, signal });
-      return subRes.finalAnswer.slice(0, 800);
-    },
-  };
-}
-
 function printCostIfEnabled(options: RunSessionOptions, wireLogFile: string, isReplay: boolean): void {
   if (!options.showCostReport) return;
   const report = loadAndFormatWireCost(wireLogFile, { isReplay });
@@ -148,7 +132,6 @@ export async function runAgentSession(
     : (options.provider ?? createRouterProvider(wireLogFile));
   const defaultTools = [
     ...createBuiltinTools(workspaceRoot),
-    ...(options.enableSubagent ? [createSubagentTool(provider, workspaceRoot, options.signal)] : []),
     ...(options.enableWriteTools ? createWriteTools(workspaceRoot, snapshots, options.signal) : []),
   ];
   const tools = options.tools ?? defaultTools;
@@ -156,11 +139,10 @@ export async function runAgentSession(
   console.log(`\n⚡ [路由决策] ${resolveRouteTier(Date.now(), { isReplay }).reason}`);
   console.log(`👤 [用户提问] ${userPrompt}\n`);
 
-  const skillsSuffix = options.skillDirs ? buildSkillsIndex(options.skillDirs) : "";
-  const basePrompt =
+  const systemPrompt =
     options.systemPrompt ??
     "你是一个运行在本地代码库中的智能体。请调用工具读取或修改真实文件后再回答，回答请简明扼要。";
-  const initialState = createInitialState({ systemPrompt: `${basePrompt}${skillsSuffix}`, maxSteps: options.maxSteps ?? 8 });
+  const initialState = createInitialState({ systemPrompt, maxSteps: options.maxSteps ?? 8 });
   const recordedEntries: SessionEntry[] = [];
   const cursor: SessionCursor = { persistedCount: 0, leafId: options.leafId ?? null };
   let stepRes = stepAgentLoop(initialState, { type: "START", userPrompt });

@@ -4,7 +4,7 @@ import {
   createReplayProvider,
   loadJsonlEntries,
 } from "./src/adapters/store.js";
-import { analyzeSessionXray, formatXrayReport, writeXrayMarkdownReport } from "./src/adapters/xray.js";
+import { analyzeSessionXray, formatXrayReport } from "./src/adapters/xray.js";
 
 const sessionFile = ".sessions/play.jsonl";
 const wireLogFile = ".sessions/http-wire.json";
@@ -58,11 +58,9 @@ async function main() {
     enableWriteTools: true,
   });
   const costMs = (performance.now() - startMs).toFixed(1);
-  const xray = analyzeSessionXray(sessionFile, wireLogFile);
-  console.log(formatXrayReport(xray));
-  writeXrayMarkdownReport(xray);
+  console.log(formatXrayReport(analyzeSessionXray(sessionFile, wireLogFile)));
   console.log(
-    `\n⚡ [回放与 X-Ray 透视完成] 耗时仅 ${costMs} 毫秒！已同步生成 .sessions/xray-report.md 全链路时序图。`,
+    `\n⚡ [回放与 X-Ray 透视完成] 耗时仅 ${costMs} 毫秒！你也可以运行 pnpm xray 生成可视化 Mermaid 时序报告。`,
   );
 }
 
