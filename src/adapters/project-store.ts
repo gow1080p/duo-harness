@@ -90,6 +90,10 @@ export function createReplCompleter(getWorkspaceRoot: () => string, getSessionFi
   return (line: string): [string[], string] => {
     if (line.startsWith("/cd ")) {
       const rawArg = line.slice(4);
+      const managedNames = listManagedProjects()
+        .map((p) => path.basename(p.workspaceRoot))
+        .filter((name) => name.startsWith(rawArg))
+        .map((name) => `/cd ${name}`);
       const expanded = rawArg.startsWith("~/") ? path.join(os.homedir(), rawArg.slice(2)) : rawArg;
       const fullTarget = path.resolve(getWorkspaceRoot(), expanded || ".");
       const searchDir = rawArg.endsWith("/") && fs.existsSync(fullTarget) ? fullTarget : path.dirname(fullTarget);
@@ -99,9 +103,9 @@ export function createReplCompleter(getWorkspaceRoot: () => string, getSessionFi
           .readdirSync(searchDir, { withFileTypes: true })
           .filter((d) => d.isDirectory() && !d.name.startsWith(".") && d.name.startsWith(prefix))
           .map((d) => `/cd ${rawArg.slice(0, rawArg.length - prefix.length)}${d.name}/`);
-        return [dirs, line];
+        return [[...new Set([...managedNames, ...dirs])], line];
       } catch {
-        return [[], line];
+        return [managedNames, line];
       }
     }
     if (line.startsWith("/branch ")) {
@@ -123,17 +127,17 @@ export function attachLiveSlashDropdown(rl: any, isActivePrompt: () => boolean, 
   if (!process.stdin.isTTY || !process.stdout.isTTY) return () => {};
   let menuShown = false;
   const onKeypress = (_str: string, key?: { name?: string }) => {
+    if (key?.name === "return" || key?.name === "enter") {
+      if (menuShown) {
+        process.stdout.write("\r\x1b[2K\x1b[J");
+        menuShown = false;
+      }
+      return;
+    }
     setImmediate(() => {
       if (!isActivePrompt()) return;
       const line: string = typeof rl.line === "string" ? rl.line : "";
       const cursor: number = typeof rl.cursor === "number" ? rl.cursor : line.length;
-      if (key?.name === "return" || key?.name === "enter") {
-        if (menuShown) {
-          process.stdout.write("\x1b[J");
-          menuShown = false;
-        }
-        return;
-      }
       if (line.startsWith("/") && !line.includes(" ")) {
         const matches = SLASH_COMMANDS.filter((c) => c.cmd.trim().startsWith(line.trim()));
         if (matches.length > 0) {
