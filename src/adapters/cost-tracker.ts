@@ -114,19 +114,22 @@ function computeRoundMetric(
 
   let expectedPrefixTokens = 0;
   let prefixRetentionPct: number | null = null;
-  let diagnosis = "⚪ 首轮建库";
+  let diagnosis = "第1次发请求";
 
   if (prev) {
     const prevContext = prev.promptTokens + (prev.completionTokens - prev.reasoningTokens);
     if (prevContext < rates.minCacheTokens || usage.promptTokens < rates.minCacheTokens) {
-      diagnosis = `⚪ 未达起缓线 (<${rates.minCacheTokens})`;
+      diagnosis = `未满${rates.minCacheTokens}词不缓存`;
     } else {
       expectedPrefixTokens = Math.min(Math.floor(prevContext / 64) * 64, Math.floor(usage.promptTokens / 64) * 64);
       if (expectedPrefixTokens > 0) {
         prefixRetentionPct = Math.min(100, (Math.min(usage.cacheHitTokens, expectedPrefixTokens) / expectedPrefixTokens) * 100);
-        diagnosis = prefixRetentionPct >= 85 ? `🟢 前缀复用 ${prefixRetentionPct.toFixed(1)}%` : `🟡 前缀复用 ${prefixRetentionPct.toFixed(1)}%`;
+        diagnosis =
+          prefixRetentionPct >= 99.5
+            ? "旧内容100%命中"
+            : `旧内容命中 ${prefixRetentionPct.toFixed(0)}%`;
       } else {
-        diagnosis = `⚪ 未达起缓线 (<${rates.minCacheTokens})`;
+        diagnosis = `未满${rates.minCacheTokens}词不缓存`;
       }
     }
   }
@@ -204,23 +207,22 @@ export function formatCostReport(summary: SessionCostSummary): string {
   if (summary.rounds.length === 0) return "";
   const rule = "─".repeat(66);
   const lines: string[] = [
-    `\n[成本与 KV 缓存账单] ${summary.periodLabel}`,
+    `\n[每步 Token 消耗与缓存账单] ${summary.periodLabel}`,
     rule,
-    `${padCols("轮次", 4)} | ${padCols("输入(命/总)", 13)} | ${padCols("前缀缓存诊断", 18)} | ${padCols("输出", 8)} | 实付 / 省`,
+    `${padCols("步骤", 6)} | ${padCols("命中缓存 / 总输入", 18)} | ${padCols("缓存状态", 16)} | ${padCols("输出", 6)} | 本步费用`,
     rule,
   ];
   for (const r of summary.rounds) {
-    const inCol = padCols(`${r.cacheHitTokens}/${r.promptTokens}`, 13, "right");
-    const diagShort = r.diagnosis.replace(/^[🔵⚪🟢🟡🔴]\s*/u, "");
-    const diagCol = padCols(diagShort, 18);
-    const outCol = padCols(`${r.completionTokens}(${r.reasoningTokens})`, 8, "right");
+    const inCol = padCols(`命中${r.cacheHitTokens}/共${r.promptTokens}`, 18, "right");
+    const diagCol = padCols(r.diagnosis, 16);
+    const outCol = padCols(`${r.completionTokens}词`, 6, "right");
     lines.push(
-      `${padCols(`#${r.round}`, 4)} | ${inCol} | ${diagCol} | ${outCol} | ¥${r.costCny.toFixed(4)}/省¥${r.savedCny.toFixed(4)}`,
+      `${padCols(`第${r.round}步`, 6)} | ${inCol} | ${diagCol} | ${outCol} | ¥${r.costCny.toFixed(4)} (省¥${r.savedCny.toFixed(4)})`,
     );
   }
   lines.push(rule);
   lines.push(
-    `合计(${summary.rounds.length}轮): 命${summary.totalCacheHitTokens}/总${summary.totalPromptTokens} tok (${summary.overallCacheRatePct.toFixed(1)}%) | 出${summary.totalCompletionTokens} tok | 实付¥${summary.totalCostCny.toFixed(4)} (省¥${summary.totalSavedCny.toFixed(4)})`,
+    `总计 ${summary.rounds.length} 步: 共输入 ${summary.totalPromptTokens} 词 (缓存命中 ${summary.totalCacheHitTokens} 词, 占 ${summary.overallCacheRatePct.toFixed(1)}%) | 实付 ¥${summary.totalCostCny.toFixed(4)}`,
   );
   return lines.join("\n");
 }
