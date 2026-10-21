@@ -1,0 +1,9 @@
+node_modules/
+dist/
+references/
+.env
+.env.*
+*.key
+.DS_Store
+.sessions/ask-latest.jsonl
+.sessions/wire-*.json
