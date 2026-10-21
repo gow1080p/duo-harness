@@ -60,7 +60,7 @@ async function main() {
   const costMs = (performance.now() - startMs).toFixed(1);
   console.log(formatXrayReport(analyzeSessionXray(sessionFile, wireLogFile)));
   console.log(
-    `\n⚡ [回放与 X-Ray 透视完成] 耗时仅 ${costMs} 毫秒！你也可以运行 pnpm xray 生成可视化 Mermaid 时序报告。`,
+    `\n⚡ [回放与明细检查完成] 耗时仅 ${costMs} 毫秒！你也可以运行 pnpm xray 生成可视化时序图报告。`,
   );
 }
 

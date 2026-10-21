@@ -87,12 +87,12 @@ function inspectSingleWireRound(
   });
   const reasoning = entry.assembledMessage?.reasoningContent ?? "";
 
-  let statusLabel = "首轮建库";
+  let statusLabel = "第1次提问";
   if (idx > 0) {
     statusLabel =
       mutatedIndices.length === 0 && lockedPrefixCount === prevMsgs.length
-        ? `前缀锁死(${lockedPrefixCount}/${prevMsgs.length}恒等)`
-        : `改写第[${mutatedIndices.join(",")}]条`;
+        ? "旧消息未改动(正常)"
+        : `警告:第[${mutatedIndices.join(",")}]条被改`;
   }
 
   return {
@@ -152,24 +152,27 @@ export function analyzeSessionXray(
 export function formatXrayReport(report: SessionXrayReport): string {
   const rule = "─".repeat(66);
   const lines: string[] = [
-    `\n[Duo-Harness X-Ray 零黑盒物理透视台] (${report.sessionFile})`,
+    `\n[每步消息与工具调用明细] (${report.sessionFile})`,
     rule,
-    `${padCols("轮次", 4)} | ${padCols("消息(锁/增)", 11)} | ${padCols("前缀字节比对", 18)} | ${padCols("缓存(hit/in)", 12)} | 动作`,
+    `${padCols("步骤", 5)} | ${padCols("发出的消息", 10)} | ${padCols("历史消息检查", 18)} | 本步执行的动作`,
     rule,
   ];
 
   for (const r of report.wireRounds) {
-    const msgCol = padCols(`${r.messageCount}(${r.lockedPrefixCount}/${r.appendedCount})`, 11);
+    const msgText =
+      r.lockedPrefixCount === 0
+        ? `${r.appendedCount}条新消息`
+        : `${r.lockedPrefixCount}旧 + ${r.appendedCount}新`;
+    const msgCol = padCols(msgText, 10);
     const statusCol = padCols(r.statusLabel, 18);
-    const cacheCol = padCols(`${r.cachedTokens}/${r.promptTokens}`, 12, "right");
-    const actRaw = r.toolCallsSummary.length > 0 ? r.toolCallsSummary.join(", ") : "最终回复";
-    lines.push(`${padCols(`#${r.round}`, 4)} | ${msgCol} | ${statusCol} | ${cacheCol} | ${truncateCols(actRaw, 22)}`);
+    const actRaw = r.toolCallsSummary.length > 0 ? r.toolCallsSummary.join(", ") : "输出最终回答";
+    lines.push(`${padCols(`第${r.round}步`, 5)} | ${msgCol} | ${statusCol} | ${truncateCols(actRaw, 24)}`);
   }
 
   lines.push(rule);
-  lines.push(`[.jsonl 会话树拓扑] (共 ${report.treeNodes.length} 个节点):`);
+  lines.push(`[硬盘保存的消息记录] (共 ${report.treeNodes.length} 条):`);
   for (const n of report.treeNodes) {
-    const pTag = padCols(n.parentId ? `<-${n.parentId}` : "(root)", 8);
+    const pTag = padCols(n.parentId ? `<-${n.parentId}` : "(起点)", 8);
     lines.push(`  ${padCols(n.id, 6)} [${padCols(n.role, 14)}] ${pTag} ${padCols(`${n.chars}字`, 6, "right")}: ${n.summary}`);
   }
   return lines.join("\n");
@@ -180,23 +183,23 @@ export function writeXrayMarkdownReport(
   outFile = ".sessions/xray-report.md",
 ): string {
   const mermaidLines = [
-    "# 🔬 Duo-Harness 零黑盒全链路透视报告 (X-Ray)",
+    "# 🔬 每步消息与工具调用明细报告",
     "",
     "```mermaid",
     "sequenceDiagram",
-    "  participant U as User / Loop",
-    "  participant R as Router (Wire)",
-    "  participant M as Cloud LLM",
-    "  participant T as Sandbox Tools",
+    "  participant U as Agent 循环",
+    "  participant R as 网络请求 (Router)",
+    "  participant M as 云端模型",
+    "  participant T as 本地工具",
   ];
   for (const r of report.wireRounds) {
-    mermaidLines.push(`  U->>R: Round #${r.round} (${r.messageCount} msgs, locked=${r.lockedPrefixCount})`);
-    mermaidLines.push(`  R->>M: POST /chat/completions (in=${r.promptTokens}, hit=${r.cachedTokens})`);
+    mermaidLines.push(`  U->>R: 第${r.round}步 (共${r.messageCount}条消息, 其中${r.lockedPrefixCount}条旧消息未改动)`);
+    mermaidLines.push(`  R->>M: 发送请求 (总输入=${r.promptTokens}词, 缓存命中=${r.cachedTokens}词)`);
     if (r.toolCallsSummary.length > 0) {
-      mermaidLines.push(`  M-->>T: ${r.toolCallsSummary.join(", ").replace(/["{}]/g, "")}`);
-      mermaidLines.push(`  T-->>U: ToolResultMessage`);
+      mermaidLines.push(`  M-->>T: 调用 ${r.toolCallsSummary.join(", ").replace(/["{}]/g, "")}`);
+      mermaidLines.push(`  T-->>U: 返回工具执行结果`);
     } else {
-      mermaidLines.push(`  M-->>U: Final Answer`);
+      mermaidLines.push(`  M-->>U: 返回最终回答`);
     }
   }
   mermaidLines.push("```", "", "```text", formatXrayReport(report), "```");
@@ -212,5 +215,5 @@ if (isMain) {
   const report = analyzeSessionXray(sessionFile, wireLogFile);
   console.log(formatXrayReport(report));
   const mdFile = writeXrayMarkdownReport(report);
-  console.log(`\n📄 [已生成可视化 Mermaid 时序与透视报告]: ${mdFile}`);
+  console.log(`\n📄 [已生成可视化时序图与明细报告]: ${mdFile}`);
 }

@@ -223,10 +223,10 @@ describe("Stage 5: 自主探路代码审查特工 (reviewer.ts)、RepoMap 与轻
     const summary = summarizeWireCost(mockWireEntries);
     expect(summary.rounds).toHaveLength(3);
     expect(summary.rounds[0]!.costCny).toBeCloseTo(0.00136, 6);
-    expect(summary.rounds[0]!.diagnosis).toContain("首轮建库");
-    expect(summary.rounds[1]!.diagnosis).toContain("未达起缓线 (<1024)");
+    expect(summary.rounds[0]!.diagnosis).toContain("第1次发请求");
+    expect(summary.rounds[1]!.diagnosis).toContain("未满1024词不缓存");
     expect(summary.rounds[2]!.prefixRetentionPct).toBeCloseTo((3840 / 3968) * 100, 1);
-    expect(summary.rounds[2]!.diagnosis).toContain("🟢 前缀复用");
+    expect(summary.rounds[2]!.diagnosis).toContain("旧内容命中");
 
     const replaySummary = summarizeWireCost(mockWireEntries, { isReplay: true });
     expect(replaySummary.totalCostCny).toBe(0);
@@ -244,6 +244,6 @@ describe("Stage 5: 自主探路代码审查特工 (reviewer.ts)、RepoMap 与轻
     expect(openAiPayload[3]!.reasoning_content).toBe("当前回合工具步思考应保留");
 
     const xray = analyzeSessionXray(".sessions/play.jsonl", ".sessions/http-wire.json");
-    expect(formatXrayReport(xray)).toContain("Duo-Harness X-Ray 零黑盒物理透视台");
+    expect(formatXrayReport(xray)).toContain("每步消息与工具调用明细");
   });
 });
