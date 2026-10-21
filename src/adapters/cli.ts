@@ -119,10 +119,37 @@ function printCostIfEnabled(options: RunSessionOptions, wireLogFile: string, isR
   if (report) console.log(report);
 }
 
+function initSessionContext(userPrompt: string, options: RunSessionOptions) {
+  const systemPrompt =
+    options.systemPrompt ??
+    "你是一个运行在本地代码库中的智能体。请调用工具读取或修改真实文件后再回答，回答请简明扼要。";
+  let existingEntries: SessionEntry[] = [];
+  if (options.leafId && options.sessionFile) {
+    try {
+      existingEntries = loadJsonlEntries(options.sessionFile);
+    } catch {
+      existingEntries = [];
+    }
+  }
+  const baseState = createInitialState({ systemPrompt, maxSteps: options.maxSteps ?? 8 });
+  const priorMessages =
+    existingEntries.length > 0 && options.leafId
+      ? projectToMessages(existingEntries, options.leafId)
+      : baseState.messages;
+  const recordedEntries: SessionEntry[] = [...existingEntries];
+  const cursor: SessionCursor = {
+    persistedCount: existingEntries.length > 0 && options.leafId ? priorMessages.length : 0,
+    leafId: options.leafId ?? null,
+  };
+  const stepRes = stepAgentLoop({ ...baseState, messages: priorMessages }, { type: "START", userPrompt });
+  syncNewMessagesToDisk(options.sessionFile, recordedEntries, stepRes.state.messages, cursor, existingEntries.length === 0);
+  return { stepRes, recordedEntries, cursor };
+}
+
 export async function runAgentSession(
   userPrompt: string,
   options: RunSessionOptions = {},
-): Promise<{ finalAnswer: string; stepsUsed: number; entries: SessionEntry[] }> {
+): Promise<{ finalAnswer: string; stepsUsed: number; entries: SessionEntry[]; leafId: string | null }> {
   const isReplay = Boolean(options.replayFromFile);
   const workspaceRoot = options.workspaceRoot ?? process.cwd();
   const snapshots = options.snapshots ?? [];
@@ -139,14 +166,7 @@ export async function runAgentSession(
   console.log(`\n⚡ [路由决策] ${resolveRouteTier(Date.now(), { isReplay }).reason}`);
   console.log(`👤 [用户提问] ${userPrompt}\n`);
 
-  const systemPrompt =
-    options.systemPrompt ??
-    "你是一个运行在本地代码库中的智能体。请调用工具读取或修改真实文件后再回答，回答请简明扼要。";
-  const initialState = createInitialState({ systemPrompt, maxSteps: options.maxSteps ?? 8 });
-  const recordedEntries: SessionEntry[] = [];
-  const cursor: SessionCursor = { persistedCount: 0, leafId: options.leafId ?? null };
-  let stepRes = stepAgentLoop(initialState, { type: "START", userPrompt });
-  syncNewMessagesToDisk(options.sessionFile, recordedEntries, stepRes.state.messages, cursor, true);
+  let { stepRes, recordedEntries, cursor } = initSessionContext(userPrompt, options);
 
   while (true) {
     if (options.signal?.aborted) {
@@ -162,7 +182,7 @@ export async function runAgentSession(
       }
       printCostIfEnabled(options, wireLogFile, isReplay);
       console.error(`\n❌ [循环熔断终止] ${stepRes.effect.reason}`);
-      return { finalAnswer: `[ABORT] ${stepRes.effect.reason}`, stepsUsed: stepRes.state.step, entries: recordedEntries };
+      return { finalAnswer: `[ABORT] ${stepRes.effect.reason}`, stepsUsed: stepRes.state.step, entries: recordedEntries, leafId: cursor.leafId };
     }
     if (stepRes.effect.type === "COMPLETE") {
       if (options.verifyCompletion) {
@@ -186,7 +206,7 @@ export async function runAgentSession(
   if (options.sessionFile) console.log(`💾 [已保存会话记录] ${options.sessionFile} (共 ${recordedEntries.length} 行 JSON)`);
   printCostIfEnabled(options, wireLogFile, isReplay);
   console.log(`\n✅ [最终回答 (共执行 ${stepRes.state.step} 步)]:\n${stepRes.effect.finalAnswer}`);
-  return { finalAnswer: stepRes.effect.finalAnswer, stepsUsed: stepRes.state.step, entries: recordedEntries };
+  return { finalAnswer: stepRes.effect.finalAnswer, stepsUsed: stepRes.state.step, entries: recordedEntries, leafId: cursor.leafId };
 }
 
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];

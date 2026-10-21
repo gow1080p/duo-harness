@@ -7,11 +7,15 @@
   "exports": {
     ".": "./src/index.ts"
   },
+  "bin": {
+    "duo": "./bin/duo.mjs"
+  },
   "engines": {
     "node": ">=22.0.0"
   },
   "scripts": {
     "play": "tsx play.ts",
+    "chat": "tsx src/adapters/repl.ts",
     "ask": "tsx src/adapters/cli.ts",
     "review": "tsx src/adapters/reviewer.ts",
     "serve": "tsx src/adapters/rpc-server.ts",

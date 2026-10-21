@@ -20,9 +20,9 @@ flowchart LR
 | **Core (纯内核)** | `src/core/loop.ts` | 驱动 `Idle -> Thinking -> AwaitingApproval -> Executing -> Done/Error` | ✅ 严禁任何 I/O | ✅ 已就绪 (158行) |
 | **Core (纯内核)** | `src/core/session-tree.ts` | 顺着 `parentId` 拼出当前分支 `messages[]` + 发请求前配对格式检查 | ✅ 严禁任何 I/O | ✅ 已就绪 (105行) |
 | **Core (纯内核)** | `src/core/compactor.ts` | 锁死头部前缀 + 按需增量折叠旧超长工具输出 + 按原子块淘汰超长历史 | ✅ 严禁任何 I/O | ✅ 已就绪 (88行) |
-| **Adapter (外壳)** | `src/adapters/router.ts`, `sse-stream.ts` & `cost-tracker.ts` | 四档分时路由、同轮思考链透传、SSE 抓包与零 Bug 成本缓存统计 | ❌ 隔离网络与计费 | ✅ 已就绪 (245/154/217行) |
+| **Adapter (外壳)** | `src/adapters/router.ts`, `sse-stream.ts` & `cost-tracker.ts` | 四档分时路由、同轮思考链透传、SSE 抓包与零 Bug 成本缓存统计 | ❌ 隔离网络与计费 | ✅ 已就绪 (248/154/241行) |
 | **Adapter (外壳)** | `src/adapters/store.ts` | `.jsonl` 会话文件追加读写 + `createReplayProvider` 断网 0 毫秒回放 | ❌ 隔离硬盘读写 | ✅ 已就绪 (87行) |
 | **Adapter (外壳)** | `src/adapters/tools.ts` & `write-tools.ts` | 带行号只读工具（`read_file/list_dir/grep`）+ 批量 `edits[]` 写工具与多步回滚 | ❌ 隔离文件与子进程 | ✅ 已就绪 (223/227行) |
 | **Adapter (外壳)** | `src/adapters/mcp-client.ts` | 标准 `stdio` JSON-RPC 2.0 客户端，透传 `inputSchema` 转为 `ToolContract` | ❌ 隔离子进程管道 | ✅ 已就绪 (170行) |
-| **Adapter (外壳)** | `src/adapters/reviewer.ts` & `xray.ts` | `RepoMap` 骨架图、只读探路外审、Zod 门禁 + 零黑盒字节级 X-Ray 透视台 | ❌ 隔离外审与透视 | ✅ 已就绪 (227/214行) |
-| **Adapter (外壳)** | `src/adapters/cli.ts` & `rpc-server.ts` | `while` 循环驱动器、`AbortSignal` 级联取消与 HTTP/SSE 服务端接口 | ❌ 隔离终端与 HTTP | ✅ 已就绪 (205/174行) |
+| **Adapter (外壳)** | `src/adapters/reviewer.ts` & `xray.ts` | `RepoMap` 骨架图、只读探路外审、Zod 门禁 + 直白消息与账单明细表 | ❌ 隔离外审与透视 | ✅ 已就绪 (227/219行) |
+| **Adapter (外壳)** | `src/adapters/cli.ts`, `repl.ts` & `rpc-server.ts` | 多轮续聊驱动器、`~/.duo-harness/projects` 多项目交互终端与 HTTP/SSE 服务 | ❌ 隔离终端与 HTTP | ✅ 已就绪 (225/186/174行) |

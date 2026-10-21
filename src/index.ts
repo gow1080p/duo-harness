@@ -12,5 +12,6 @@ export * from "./adapters/write-tools.js";
 export * from "./adapters/mcp-client.js";
 export * from "./adapters/reviewer.js";
 export * from "./adapters/cli.js";
+export * from "./adapters/repl.js";
 export * from "./adapters/rpc-server.js";
 export * from "./adapters/xray.js";
