@@ -181,24 +181,46 @@ export function summarizeWireCost(
   };
 }
 
+export function truncateCols(str: string, maxCols: number): string {
+  let width = 0;
+  let out = "";
+  for (const ch of str) {
+    const w = (ch.codePointAt(0) ?? 0) > 0xff ? 2 : 1;
+    if (width + w > maxCols) return `${out}..`;
+    out += ch;
+    width += w;
+  }
+  return out;
+}
+
+export function padCols(str: string, targetCols: number, align: "left" | "right" = "left"): string {
+  let width = 0;
+  for (const ch of str) width += (ch.codePointAt(0) ?? 0) > 0xff ? 2 : 1;
+  const pad = Math.max(0, targetCols - width);
+  return align === "right" ? " ".repeat(pad) + str : str + " ".repeat(pad);
+}
+
 export function formatCostReport(summary: SessionCostSummary): string {
   if (summary.rounds.length === 0) return "";
+  const rule = "─".repeat(66);
   const lines: string[] = [
-    `\n📊 [成本与 KV 缓存账单] ${summary.periodLabel}`,
-    "----------------------------------------------------------------------------------------",
-    "轮次 | 消息 | 总输入(tok) | 命中缓存(账单占比) | 历史前缀诊断         | 输出(含思考) | 实付(¥) / 缓存省(¥)",
-    "----------------------------------------------------------------------------------------",
+    `\n[成本与 KV 缓存账单] ${summary.periodLabel}`,
+    rule,
+    `${padCols("轮次", 4)} | ${padCols("输入(命/总)", 13)} | ${padCols("前缀缓存诊断", 18)} | ${padCols("输出", 8)} | 实付 / 省`,
+    rule,
   ];
   for (const r of summary.rounds) {
-    const hitStr = `${String(r.cacheHitTokens).padStart(6)} (${r.billCacheRatePct.toFixed(1).padStart(5)}%)`;
-    const outStr = `${String(r.completionTokens).padStart(4)} (思${String(r.reasoningTokens).padStart(3)})`;
+    const inCol = padCols(`${r.cacheHitTokens}/${r.promptTokens}`, 13, "right");
+    const diagShort = r.diagnosis.replace(/^[🔵⚪🟢🟡🔴]\s*/u, "");
+    const diagCol = padCols(diagShort, 18);
+    const outCol = padCols(`${r.completionTokens}(${r.reasoningTokens})`, 8, "right");
     lines.push(
-      ` #${String(r.round).padEnd(2)} | ${String(r.messageCount).padStart(4)} | ${String(r.promptTokens).padStart(11)} | ${hitStr.padEnd(18)} | ${r.diagnosis.padEnd(18)} | ${outStr.padEnd(12)} | ¥${r.costCny.toFixed(4)} / 省¥${r.savedCny.toFixed(4)}`,
+      `${padCols(`#${r.round}`, 4)} | ${inCol} | ${diagCol} | ${outCol} | ¥${r.costCny.toFixed(4)}/省¥${r.savedCny.toFixed(4)}`,
     );
   }
-  lines.push("----------------------------------------------------------------------------------------");
+  lines.push(rule);
   lines.push(
-    ` 合计 (${summary.rounds.length}轮) | 输入 ${summary.totalPromptTokens} tok (命中 ${summary.totalCacheHitTokens} tok · 总缓 ${summary.overallCacheRatePct.toFixed(1)}%) | 输出 ${summary.totalCompletionTokens} tok | 💰实付 ¥${summary.totalCostCny.toFixed(4)} (净省 ¥${summary.totalSavedCny.toFixed(4)})`,
+    `合计(${summary.rounds.length}轮): 命${summary.totalCacheHitTokens}/总${summary.totalPromptTokens} tok (${summary.overallCacheRatePct.toFixed(1)}%) | 出${summary.totalCompletionTokens} tok | 实付¥${summary.totalCostCny.toFixed(4)} (省¥${summary.totalSavedCny.toFixed(4)})`,
   );
   return lines.join("\n");
 }

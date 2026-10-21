@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { SessionEntry } from "../core/contracts.js";
-import { extractUsageFromSseLines } from "./cost-tracker.js";
+import { extractUsageFromSseLines, padCols, truncateCols } from "./cost-tracker.js";
 import type { HttpWireLogEntry } from "./sse-stream.js";
 import { loadJsonlEntries } from "./store.js";
 
@@ -81,15 +81,18 @@ function inspectSingleWireRound(
     String(entry.requestBody?.model ?? "unknown"),
   );
   const calls = entry.assembledMessage?.toolCalls ?? [];
-  const toolCallsSummary = calls.map((c) => `${c.name}(${JSON.stringify(c.arguments).slice(0, 40)})`);
+  const toolCallsSummary = calls.map((c) => {
+    const argVal = String(c.arguments.pattern ?? c.arguments.path ?? c.arguments.command ?? "");
+    return argVal ? `${c.name}(${argVal.slice(0, 14)})` : c.name;
+  });
   const reasoning = entry.assembledMessage?.reasoningContent ?? "";
 
-  let statusLabel = "🔵 首轮建库";
+  let statusLabel = "首轮建库";
   if (idx > 0) {
     statusLabel =
       mutatedIndices.length === 0 && lockedPrefixCount === prevMsgs.length
-        ? `🟢 前缀100%锁死 (${lockedPrefixCount}/${prevMsgs.length}条恒等)`
-        : `🟡 改写历史第[${mutatedIndices.join(",")}]条 (锁前${lockedPrefixCount}条)`;
+        ? `前缀锁死(${lockedPrefixCount}/${prevMsgs.length}恒等)`
+        : `改写第[${mutatedIndices.join(",")}]条`;
   }
 
   return {
@@ -124,14 +127,14 @@ export function analyzeSessionXray(
 
   const treeNodes = entries.map((e) => {
     const m = e.message;
-    const calls = m.role === "assistant" && m.toolCalls ? ` -> 🛠️ ${m.toolCalls.map((c) => c.name).join(",")}` : "";
-    const preview = m.content.replace(/\n/g, " ").slice(0, 42);
+    const calls = m.role === "assistant" && m.toolCalls ? ` -> [${m.toolCalls.map((c) => c.name).join(",")}]` : "";
+    const rawText = `${m.content.replace(/\n/g, " ")}${calls}`;
     return {
       id: e.id,
       parentId: e.parentId,
       role: m.role === "tool" ? `tool:${m.name}` : m.role,
       chars: m.content.length,
-      summary: `${preview}${m.content.length > 42 ? "..." : ""}${calls}`,
+      summary: truncateCols(rawText, 28),
     };
   });
 
@@ -147,28 +150,27 @@ export function analyzeSessionXray(
 }
 
 export function formatXrayReport(report: SessionXrayReport): string {
+  const rule = "─".repeat(66);
   const lines: string[] = [
-    `\n🔬 [Duo-Harness X-Ray 零黑盒物理透视台] (会话: ${report.sessionFile} | 抓包: ${report.wireLogFile})`,
-    "─".repeat(104),
-    "轮次 | 消息数(锁/增) | 物理前缀字节比对诊断                 | 同轮思考链 | 云端缓存(hit/in) | 本轮动作与思考切片",
-    "─".repeat(104),
+    `\n[Duo-Harness X-Ray 零黑盒物理透视台] (${report.sessionFile})`,
+    rule,
+    `${padCols("轮次", 4)} | ${padCols("消息(锁/增)", 11)} | ${padCols("前缀字节比对", 18)} | ${padCols("缓存(hit/in)", 12)} | 动作`,
+    rule,
   ];
 
   for (const r of report.wireRounds) {
-    const msgStat = `${String(r.messageCount).padStart(2)} (${r.lockedPrefixCount}/${r.appendedCount})`.padEnd(13);
-    const thinkStat = r.leakedOldReasoning > 0 ? `🔴漏${r.leakedOldReasoning}` : `🟢留${r.preservedActiveReasoning}`;
-    const cacheStat = `${r.cachedTokens}/${r.promptTokens}`.padStart(14);
-    const action = r.toolCallsSummary.length > 0 ? `🛠️ ${r.toolCallsSummary.join(", ")}` : "✅ 最终回复";
-    lines.push(
-      ` #${r.round}  | ${msgStat} | ${r.statusLabel.padEnd(32)} | ${thinkStat.padEnd(8)} | ${cacheStat}   | ${action}`,
-    );
+    const msgCol = padCols(`${r.messageCount}(${r.lockedPrefixCount}/${r.appendedCount})`, 11);
+    const statusCol = padCols(r.statusLabel, 18);
+    const cacheCol = padCols(`${r.cachedTokens}/${r.promptTokens}`, 12, "right");
+    const actRaw = r.toolCallsSummary.length > 0 ? r.toolCallsSummary.join(", ") : "最终回复";
+    lines.push(`${padCols(`#${r.round}`, 4)} | ${msgCol} | ${statusCol} | ${cacheCol} | ${truncateCols(actRaw, 22)}`);
   }
 
-  lines.push("─".repeat(104));
-  lines.push(`🌳 [.jsonl 会话树节点拓扑] (共 ${report.treeNodes.length} 个不可变节点):`);
+  lines.push(rule);
+  lines.push(`[.jsonl 会话树拓扑] (共 ${report.treeNodes.length} 个节点):`);
   for (const n of report.treeNodes) {
-    const parentTag = n.parentId ? `<- ${n.parentId}` : "(root)";
-    lines.push(`  • ${n.id.padEnd(6)} [${n.role.padEnd(14)}] ${parentTag.padEnd(9)} (${String(n.chars).padStart(4)}字): ${n.summary}`);
+    const pTag = padCols(n.parentId ? `<-${n.parentId}` : "(root)", 8);
+    lines.push(`  ${padCols(n.id, 6)} [${padCols(n.role, 14)}] ${pTag} ${padCols(`${n.chars}字`, 6, "right")}: ${n.summary}`);
   }
   return lines.join("\n");
 }

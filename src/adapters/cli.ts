@@ -85,7 +85,7 @@ async function runSingleEffectStep(
     const calls = reply.toolCalls ?? [];
     if (calls.length > 0) {
       const summary = calls.map((c) => `${c.name}(${JSON.stringify(c.arguments)})`).join(", ");
-      console.log(`🛠️  [大模型决定调工具] -> ${summary}`);
+      console.log(`-> [大模型调用工具] ${summary}`);
     }
     const hasWriteCall = calls.some((c) => readonlyMap.get(c.name) === false);
     const requiresApproval = hasWriteCall && Boolean(options.onApprovalRequest);
@@ -93,7 +93,7 @@ async function runSingleEffectStep(
   }
 
   if (effect.type === "AWAIT_APPROVAL") {
-    console.log(`⏸️  [暂停等待审批] 检测到写操作工具调用: ${effect.toolCalls.map((c) => c.name).join(", ")}`);
+    console.log(`[暂停等待审批] 检测到写操作工具调用: ${effect.toolCalls.map((c) => c.name).join(", ")}`);
     const decision = options.onApprovalRequest
       ? await options.onApprovalRequest(effect.toolCalls)
       : { approved: false, reason: "未配置审批回调，默认拒绝写操作" };
