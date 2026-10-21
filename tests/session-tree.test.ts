@@ -160,4 +160,52 @@ describe("Stage 2: .jsonl 会话树与断网录像回放测试", () => {
 
     fs.rmSync(tmpBase, { recursive: true, force: true });
   });
+
+  it("5. 当历史 session.jsonl 因审批中断残留未闭合 toolCalls (及崩溃残留尾部 user 消息) 时，下次续聊自动自愈而不崩溃", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "duo-dangling-"));
+    const sessionFile = path.join(tmpDir, "session.jsonl");
+    // 100% 还原用户 my-ai-kb 崩溃现场：msg_8 是未闭合的 assistant toolCall，且 msg_9 是崩溃前已写入的孤儿 user 消息
+    const brokenEntries: SessionEntry[] = [
+      { id: "msg_1", parentId: null, timestamp: 1, message: { role: "system", content: "sys" } },
+      { id: "msg_2", parentId: "msg_1", timestamp: 2, message: { role: "user", content: "查看项目" } },
+      {
+        id: "msg_8",
+        parentId: "msg_2",
+        timestamp: 3,
+        message: {
+          role: "assistant",
+          content: "准备统计行数",
+          toolCalls: [
+            {
+              id: "call_9dcba1abe2924419866632429117cd18f4a32823b216a",
+              name: "run_bash",
+              arguments: { command: "wc -l backend/*.py" },
+            },
+          ],
+        },
+      },
+      { id: "msg_9", parentId: "msg_8", timestamp: 4, message: { role: "user", content: "分析代码，看下哪里有缺陷" } },
+    ];
+    fs.writeFileSync(sessionFile, brokenEntries.map((e) => JSON.stringify(e)).join("\n") + "\n", "utf-8");
+
+    const res = await runAgentSession("分析代码，看下哪里有缺陷", {
+      workspaceRoot: tmpDir,
+      sessionFile,
+      leafId: "msg_9",
+      provider: {
+        async chat(messages) {
+          const healedTool = messages.find(
+            (m) => m.role === "tool" && m.toolCallId === "call_9dcba1abe2924419866632429117cd18f4a32823b216a",
+          );
+          expect(healedTool).toBeDefined();
+          // 验证不会出现两条连续的 user("分析代码，看下哪里有缺陷")
+          const userCount = messages.filter((m) => m.role === "user" && m.content === "分析代码，看下哪里有缺陷").length;
+          expect(userCount).toBe(1);
+          return { role: "assistant", content: "已自动修复中断记录并完成代码缺陷分析！" };
+        },
+      },
+    });
+    expect(res.finalAnswer).toBe("已自动修复中断记录并完成代码缺陷分析！");
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
 });
