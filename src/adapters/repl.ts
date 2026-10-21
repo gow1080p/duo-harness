@@ -82,12 +82,38 @@ export function listManagedProjects(
   return list.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
 
-function handleSlashCommand(
-  cmd: string,
-  paths: ProjectSessionPaths,
-  snapshots: FileVersionSnapshot[],
-  state: { leafId: string | null },
-): Promise<boolean> | boolean {
+interface ReplRuntimeState {
+  paths: ProjectSessionPaths;
+  provider: LlmProvider;
+  snapshots: FileVersionSnapshot[];
+  leafId: string | null;
+  autoApprove: boolean;
+  homeBaseDir?: string;
+  customProvider?: LlmProvider;
+}
+
+function switchProjectWorkspace(targetArg: string, state: ReplRuntimeState): void {
+  const expanded = targetArg.startsWith("~/") ? path.join(os.homedir(), targetArg.slice(2)) : targetArg;
+  const candidate = path.resolve(state.paths.workspaceRoot, expanded);
+  if (!fs.existsSync(candidate) || !fs.statSync(candidate).isDirectory()) {
+    console.log(`⚠️ 目录不存在: ${candidate}`);
+    return;
+  }
+  state.paths = resolveProjectSessionPaths(candidate, state.homeBaseDir);
+  const existing = fs.existsSync(state.paths.sessionFile) ? loadJsonlEntries(state.paths.sessionFile) : [];
+  state.leafId = existing.length > 0 ? existing[existing.length - 1]!.id : null;
+  state.provider = state.customProvider ?? createRouterProvider(state.paths.wireLogFile, existing.length > 0);
+  state.snapshots = [];
+  console.log(`\n📂 [已切换工作区]: ${state.paths.workspaceRoot}`);
+  console.log(`🗂️  [会话存档位置]: ${state.paths.sessionFile} (共 ${existing.length} 条历史记录)`);
+}
+
+function handleSlashCommand(cmd: string, state: ReplRuntimeState): Promise<boolean> | boolean {
+  const { paths, snapshots } = state;
+  if (cmd.startsWith("/cd ")) {
+    switchProjectWorkspace(cmd.slice("/cd ".length).trim(), state);
+    return true;
+  }
   if (cmd === "/xray" || cmd === "/tree") {
     const costText = loadAndFormatWireCost(paths.wireLogFile);
     if (costText) console.log(costText);
@@ -140,17 +166,23 @@ export async function startInteractiveRepl(options: {
   provider?: LlmProvider;
 } = {}): Promise<void> {
   const paths = resolveProjectSessionPaths(options.workspaceRoot, options.homeBaseDir);
-  const snapshots: FileVersionSnapshot[] = [];
   const existing = fs.existsSync(paths.sessionFile) ? loadJsonlEntries(paths.sessionFile) : [];
-  const provider = options.provider ?? createRouterProvider(paths.wireLogFile, existing.length > 0);
-  const state = { leafId: existing.length > 0 ? existing[existing.length - 1]!.id : null, autoApprove: false };
+  const state: ReplRuntimeState = {
+    paths,
+    provider: options.provider ?? createRouterProvider(paths.wireLogFile, existing.length > 0),
+    snapshots: [],
+    leafId: existing.length > 0 ? existing[existing.length - 1]!.id : null,
+    autoApprove: false,
+    homeBaseDir: options.homeBaseDir,
+    customProvider: options.provider,
+  };
 
-  console.log(`\n🚀 [Duo-Harness 交互终端] 当前工作区: ${paths.workspaceRoot}`);
-  console.log(`🗂️  [会话存档位置 (零污染项目 Git)]: ${paths.sessionFile}`);
+  console.log(`\n🚀 [Duo-Harness 交互终端] 当前工作区: ${state.paths.workspaceRoot}`);
+  console.log(`🗂️  [会话存档位置 (零污染项目 Git)]: ${state.paths.sessionFile}`);
   if (state.leafId) {
     console.log(`🔗 [已自动接续上次对话]: 共 ${existing.length} 条记录，当前节点 ${state.leafId}`);
   }
-  console.log(`💡 快捷命令: /xray (看账单与明细) | /tree (看节点) | /branch <id> (分叉) | /undo (撤回修改) | /projects (多项目列表) | /clear (清空重开) | /exit (退出)\n`);
+  console.log(`💡 快捷命令: /cd <路径> (切换项目) | /projects (项目列表) | /xray (看账单与明细) | /tree (看节点) | /branch <id> (分叉) | /undo (撤回) | /clear (清空) | /exit\n`);
 
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   const askApproval = async (toolCalls: ToolCall[]) => {
@@ -184,15 +216,15 @@ export async function startInteractiveRepl(options: {
       const line = (await rl.question("\n👤 你 > ")).trim();
       if (!line) continue;
       if (line === "/exit" || line === "/quit") break;
-      if (await handleSlashCommand(line, paths, snapshots, state)) continue;
+      if (await handleSlashCommand(line, state)) continue;
 
       const res = await runAgentSession(line, {
-        workspaceRoot: paths.workspaceRoot,
-        sessionFile: paths.sessionFile,
-        wireLogFile: paths.wireLogFile,
+        workspaceRoot: state.paths.workspaceRoot,
+        sessionFile: state.paths.sessionFile,
+        wireLogFile: state.paths.wireLogFile,
         leafId: state.leafId ?? undefined,
-        provider,
-        snapshots,
+        provider: state.provider,
+        snapshots: state.snapshots,
         enableWriteTools: true,
         showCostReport: true,
         suppressFinalEcho: true,
@@ -207,7 +239,8 @@ export async function startInteractiveRepl(options: {
 
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
 if (isMain) {
-  startInteractiveRepl().catch((err) => {
+  const argDir = process.argv[2] && !process.argv[2].startsWith("-") ? process.argv[2] : undefined;
+  startInteractiveRepl({ workspaceRoot: argDir }).catch((err) => {
     console.error("终端运行异常:", err instanceof Error ? err.message : err);
     process.exit(1);
   });
