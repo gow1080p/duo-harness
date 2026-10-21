@@ -23,6 +23,7 @@ export interface RunSessionOptions {
   replayFromFile?: string;
   wireLogFile?: string;
   showCostReport?: boolean;
+  suppressFinalEcho?: boolean;
   leafId?: string;
   onApprovalRequest?: (
     toolCalls: ToolCall[],
@@ -52,6 +53,24 @@ function syncNewMessagesToDisk(
   cursor.persistedCount = allMessages.length;
   cursor.leafId = newEntries[newEntries.length - 1]!.id;
   if (sessionFile) appendJsonlEntries(sessionFile, newEntries, isFirstWrite);
+}
+
+export function isReadonlyBashCommand(cmd: string): boolean {
+  const trimmed = cmd.trim();
+  if (!trimmed || /[><`;\n\r]|\$\(|(?:^|\s)-(delete|exec|execdir|ok|okdir|fprint|fprint0|fprintf|fls)\b/.test(trimmed)) {
+    return false;
+  }
+  const segments = trimmed.split(/\s*(?:\|\||&&|\|)\s*/);
+  const safePrefix = /^(ls|find|wc|head|tail|cat|pwd|which|stat|file|grep|rg|git\s+(status|diff|log|show|rev-parse))\b/;
+  return segments.every((seg) => safePrefix.test(seg.trim()) && !/(^|\s)&(\s|$)/.test(seg));
+}
+
+function filterCallsNeedingApproval(calls: readonly ToolCall[], readonlyMap: Map<string, boolean>): ToolCall[] {
+  return calls.filter((c) => {
+    if (readonlyMap.get(c.name) !== false) return false;
+    if (c.name === "run_bash" && isReadonlyBashCommand(String(c.arguments?.command ?? ""))) return false;
+    return true;
+  });
 }
 
 async function runSingleEffectStep(
@@ -87,17 +106,17 @@ async function runSingleEffectStep(
       const summary = calls.map((c) => `${c.name}(${JSON.stringify(c.arguments)})`).join(", ");
       console.log(`-> [大模型调用工具] ${summary}`);
     }
-    const hasWriteCall = calls.some((c) => readonlyMap.get(c.name) === false);
-    const requiresApproval = hasWriteCall && Boolean(options.onApprovalRequest);
+    const writeCalls = filterCallsNeedingApproval(calls, readonlyMap);
+    const requiresApproval = writeCalls.length > 0 && Boolean(options.onApprovalRequest);
     return stepAgentLoop(state, { type: "LLM_REPLIED", message: reply, requiresApproval });
   }
 
   if (effect.type === "AWAIT_APPROVAL") {
-    console.log(`[暂停等待审批] 检测到写操作工具调用: ${effect.toolCalls.map((c) => c.name).join(", ")}`);
+    const writeCalls = filterCallsNeedingApproval(effect.toolCalls, readonlyMap);
     const decision = options.onApprovalRequest
-      ? await options.onApprovalRequest(effect.toolCalls)
+      ? await options.onApprovalRequest(writeCalls.length > 0 ? writeCalls : effect.toolCalls)
       : { approved: false, reason: "未配置审批回调，默认拒绝写操作" };
-    console.log(decision.approved ? `🟢 [审批通过，允许执行]` : `🔴 [审批拒绝]: ${decision.reason}`);
+    console.log(decision.approved ? `🟢 [已允许执行]` : `🔴 [已拒绝执行]: ${decision.reason}`);
     return stepAgentLoop(state, { type: "APPROVAL_RESOLVED", approved: decision.approved, reason: decision.reason });
   }
 
@@ -205,7 +224,11 @@ export async function runAgentSession(
 
   if (options.sessionFile) console.log(`💾 [已保存会话记录] ${options.sessionFile} (共 ${recordedEntries.length} 行 JSON)`);
   printCostIfEnabled(options, wireLogFile, isReplay);
-  console.log(`\n✅ [最终回答 (共执行 ${stepRes.state.step} 步)]:\n${stepRes.effect.finalAnswer}`);
+  if (!options.suppressFinalEcho) {
+    console.log(`\n✅ [最终回答 (共执行 ${stepRes.state.step} 步)]:\n${stepRes.effect.finalAnswer}`);
+  } else {
+    console.log(`\n✅ [本轮完成 (共调用工具 ${stepRes.state.step} 步)]`);
+  }
   return { finalAnswer: stepRes.effect.finalAnswer, stepsUsed: stepRes.state.step, entries: recordedEntries, leafId: cursor.leafId };
 }
 

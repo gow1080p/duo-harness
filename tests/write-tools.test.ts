@@ -205,4 +205,18 @@ describe("Stage 3: 写工具 (edit_file/run_bash/rollback_version)、暂停审�
     expect(fs.existsSync(path.join(tmpRoot, "temp-junk.ts"))).toBe(false);
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   });
+
+  it("5. 纯只读查询类 run_bash (如 find ... | head -100, git status) 自动放行不打扰用户，危险命令正常拦截", async () => {
+    const { isReadonlyBashCommand } = await import("../src/adapters/cli.js");
+    expect(
+      isReadonlyBashCommand(
+        'find . -type f -not -path "*/node_modules/*" -not -path "*/.git/*" | head -100',
+      ),
+    ).toBe(true);
+    expect(isReadonlyBashCommand("git status && git diff")).toBe(true);
+    expect(isReadonlyBashCommand("find . -name '*.tmp' -delete")).toBe(false);
+    expect(isReadonlyBashCommand("git branch -D feature")).toBe(false);
+    expect(isReadonlyBashCommand("ls > out.txt")).toBe(false);
+    expect(isReadonlyBashCommand("rm -rf dist")).toBe(false);
+  });
 });

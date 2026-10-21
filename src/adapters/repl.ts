@@ -155,13 +155,28 @@ export async function startInteractiveRepl(options: {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   const askApproval = async (toolCalls: ToolCall[]) => {
     if (state.autoApprove) return { approved: true };
-    const summary = toolCalls.map((c) => `${c.name}(${JSON.stringify(c.arguments)})`).join(", ");
-    const ans = (await rl.question(`⚠️  允许执行写操作 ${summary} 吗？[y=允许 / a=本轮全自动允许 / n=拒绝] > `)).trim().toLowerCase();
+    console.log(`\n┌─ ⚠️  需要你确认以下修改操作 ──────────────────────────────────`);
+    for (const c of toolCalls) {
+      if (c.name === "run_bash") {
+        console.log(`│ 💻 执行命令: ${String(c.arguments?.command ?? "")}`);
+      } else if (c.name === "edit_file") {
+        console.log(`│ 📝 修改文件: ${String(c.arguments?.path ?? "")}`);
+      } else {
+        console.log(`│ 🔧 调用工具: ${c.name} ${JSON.stringify(c.arguments)}`);
+      }
+    }
+    const ans = (
+      await rl.question(`└─ 是否允许执行？[直接回车/y=允许本次 | a=本轮全自动放行 | n=拒绝] > `)
+    )
+      .trim()
+      .toLowerCase();
     if (ans === "a") {
       state.autoApprove = true;
       return { approved: true };
     }
-    return ans === "y" || ans === "yes" ? { approved: true } : { approved: false, reason: "用户在终端拒绝了该操作" };
+    return ans === "" || ans === "y" || ans === "yes"
+      ? { approved: true }
+      : { approved: false, reason: "用户在终端拒绝了该操作" };
   };
 
   try {
@@ -180,6 +195,7 @@ export async function startInteractiveRepl(options: {
         snapshots,
         enableWriteTools: true,
         showCostReport: true,
+        suppressFinalEcho: true,
         onApprovalRequest: askApproval,
       });
       state.leafId = res.leafId;
