@@ -21,8 +21,8 @@ flowchart LR
 | **Core** | `src/core/session-tree.ts` | Reconstruct branch `messages[]` via `parentId` & assert 1:1 `toolCall` pairing (会话树派生与配对检查) | ✅ No I/O | ✅ 105 LOC |
 | **Core** | `src/core/compactor.ts` | Prefix-locked context compaction folding stale tool outputs (锁死头部前缀、按需折叠旧工具超长输出) | ✅ No I/O | ✅ 88 LOC |
 | **Adapter** | `src/adapters/router.ts`, `sse-stream.ts` & `cost-tracker.ts` | Multi-model router, reasoning pass-through, SSE wire capture & cost/cache tracker (路由、流解析与成本账单) | ❌ Network | ✅ 248/154/241 |
-| **Adapter** | `src/adapters/store.ts` & `project-store.ts` | `.jsonl` store, 0ms `ReplayProvider` & `~/.duo-harness/projects` isolation (离线回放与多项目中心化存储) | ❌ Disk I/O | ✅ 87/155 LOC |
-| **Adapter** | `src/adapters/tools.ts` & `write-tools.ts` | Sandboxed `read_file/list_dir/grep` + batch `edit_file`, `run_bash` & snapshot rollback (读写工具与快照回滚) | ❌ FS/Proc | ✅ 223/227 LOC |
+| **Adapter** | `src/adapters/store.ts` & `project-store.ts` | `.jsonl` store, 0ms `ReplayProvider` & `~/.duo-harness/projects` isolation (离线回放与多项目中心化存储) | ❌ Disk I/O | ✅ 87/119 LOC |
+| **Adapter** | `src/adapters/tools.ts` & `write-tools.ts` | Sandboxed `read_file/list_dir/grep` + batch `edit_file`, `run_bash` & snapshot rollback (读写工具与快照回滚) | ❌ FS/Proc | ✅ 224/227 LOC |
 | **Adapter** | `src/adapters/mcp-client.ts` | Standard `stdio` JSON-RPC 2.0 MCP client bridging external tools (标准 MCP 客户端子进程通信) | ❌ Stdio | ✅ 170 LOC |
 | **Adapter** | `src/adapters/reviewer.ts` & `xray.ts` | `RepoMap` symbol skeleton, read-only code reviewer & `/xray` payload inspector (自主探路审查与账单透视) | ❌ Review | ✅ 227/219 LOC |
-| **Adapter** | `src/adapters/cli.ts`, `repl.ts` & `rpc-server.ts` | Multi-turn runner, interactive REPL (`/` live dropdown + `Tab` completion) & HTTP/SSE server (终端与服务入口) | ❌ CLI/HTTP | ✅ 242/196/174 |
+| **Adapter** | `src/adapters/cli.ts`, `repl.ts`, `dropdown.ts` & `rpc-server.ts` | Multi-turn runner, interactive REPL (`↑/↓` arrow menu + project picker) & HTTP/SSE server (终端与服务入口) | ❌ CLI/HTTP | ✅ 242/226/135/174 |

@@ -2,7 +2,6 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { padCols } from "./cost-tracker.js";
 import { loadJsonlEntries } from "./store.js";
 
 export interface ProjectSessionPaths {
@@ -23,10 +22,10 @@ export interface ManagedProjectSummary {
 }
 
 export const SLASH_COMMANDS = [
-  { cmd: "/cd ", label: "/cd <路径>", desc: "切换到其他项目目录" },
-  { cmd: "/projects", label: "/projects", desc: "查看本机已管理的所有项目" },
-  { cmd: "/xray", label: "/xray", desc: "查看每步账单与消息明细" },
-  { cmd: "/tree", label: "/tree", desc: "查看历史节点树 ID" },
+  { cmd: "/cd ", label: "/cd <项目>", desc: "切换项目工作区 (按回车直接展开项目列表)" },
+  { cmd: "/projects", label: "/projects", desc: "查看本机已管理的所有项目列表" },
+  { cmd: "/xray", label: "/xray", desc: "查看每步耗时、缓存命中与费用账单" },
+  { cmd: "/tree", label: "/tree", desc: "查看对话历史节点树 ID" },
   { cmd: "/branch ", label: "/branch <id>", desc: "从指定历史节点分叉重聊" },
   { cmd: "/undo", label: "/undo", desc: "撤回最近 1 次文件修改" },
   { cmd: "/clear", label: "/clear", desc: "清空当前对话重新开始" },
@@ -83,7 +82,7 @@ export function listManagedProjects(
       continue;
     }
   }
-  return list.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  return list.sort((a, b) => a.projectKey.localeCompare(b.projectKey));
 }
 
 export function createReplCompleter(getWorkspaceRoot: () => string, getSessionFile: () => string) {
@@ -121,39 +120,4 @@ export function createReplCompleter(getWorkspaceRoot: () => string, getSessionFi
     }
     return [[], line];
   };
-}
-
-export function attachLiveSlashDropdown(rl: any, isActivePrompt: () => boolean, promptCols = 8): () => void {
-  if (!process.stdin.isTTY || !process.stdout.isTTY) return () => {};
-  let menuShown = false;
-  const onKeypress = (_str: string, key?: { name?: string }) => {
-    if (key?.name === "return" || key?.name === "enter") {
-      if (menuShown) {
-        process.stdout.write("\r\x1b[2K\x1b[J");
-        menuShown = false;
-      }
-      return;
-    }
-    setImmediate(() => {
-      if (!isActivePrompt()) return;
-      const line: string = typeof rl.line === "string" ? rl.line : "";
-      const cursor: number = typeof rl.cursor === "number" ? rl.cursor : line.length;
-      if (line.startsWith("/") && !line.includes(" ")) {
-        const matches = SLASH_COMMANDS.filter((c) => c.cmd.trim().startsWith(line.trim()));
-        if (matches.length > 0) {
-          const rows = matches.map((m) => `  \x1b[36m${padCols(m.label, 14)}\x1b[0m \x1b[90m${m.desc}\x1b[0m`);
-          const down = rows.map((r) => `\r\n\x1b[2K${r}`).join("");
-          process.stdout.write(`${down}\x1b[J\x1b[${rows.length}A\r\x1b[${promptCols + cursor}C`);
-          menuShown = true;
-          return;
-        }
-      }
-      if (menuShown) {
-        process.stdout.write(`\r\n\x1b[J\x1b[1A\r\x1b[${promptCols + cursor}C`);
-        menuShown = false;
-      }
-    });
-  };
-  process.stdin.on("keypress", onKeypress);
-  return () => process.stdin.off("keypress", onKeypress);
 }

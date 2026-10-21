@@ -6,8 +6,8 @@ import { fileURLToPath } from "node:url";
 import type { LlmProvider, ToolCall } from "../core/contracts.js";
 import { runAgentSession } from "./cli.js";
 import { loadAndFormatWireCost, padCols } from "./cost-tracker.js";
+import { attachLiveSlashDropdown, getPromptVisualCols } from "./dropdown.js";
 import {
-  attachLiveSlashDropdown,
   createReplCompleter,
   listManagedProjects,
   type ManagedProjectSummary,
@@ -40,6 +40,12 @@ interface ReplRuntimeState {
   customProvider?: LlmProvider;
 }
 
+function formatPrompt(workspaceRoot: string): string {
+  const name = path.basename(workspaceRoot) || "root";
+  const short = name.length > 18 ? `${name.slice(0, 15)}...` : name;
+  return `\n📂 ${short} > `;
+}
+
 function resolveTargetWorkspace(targetArg: string, state: ReplRuntimeState): string | null {
   const projects = listManagedProjects(path.dirname(state.paths.projectDir));
   const idx = Number(targetArg);
@@ -65,22 +71,26 @@ function resolveTargetWorkspace(targetArg: string, state: ReplRuntimeState): str
 function switchProjectWorkspace(targetArg: string, state: ReplRuntimeState): void {
   const candidate = resolveTargetWorkspace(targetArg, state);
   if (!candidate) {
-    console.log(`⚠️ 未找到项目或目录 "${targetArg}"（可输入 /projects 查看序号，用 /cd 2 或 /cd <路径> 切换）`);
+    console.log(`⚠️ 未找到项目或目录 "${targetArg}"（输入 / 然后回车即可用 ↑/↓ 方向键选择项目）`);
     return;
   }
-  state.paths = resolveProjectSessionPaths(candidate, state.homeBaseDir);
+  const realCandidate = fs.realpathSync(candidate);
+  if (realCandidate === state.paths.workspaceRoot) {
+    console.log(`ℹ️ 当前已经在 [${path.basename(realCandidate)}] 工作区中，无需重复切换。`);
+    return;
+  }
+  state.paths = resolveProjectSessionPaths(realCandidate, state.homeBaseDir);
   const existing = fs.existsSync(state.paths.sessionFile) ? loadJsonlEntries(state.paths.sessionFile) : [];
   state.leafId = existing.length > 0 ? existing[existing.length - 1]!.id : null;
   state.provider = state.customProvider ?? createRouterProvider(state.paths.wireLogFile, existing.length > 0);
   state.snapshots = [];
-  console.log(`\n📂 [已切换工作区]: ${state.paths.workspaceRoot}`);
-  console.log(`🗂️  [会话存档位置]: ${state.paths.sessionFile} (共 ${existing.length} 条历史记录)`);
+  console.log(`✅ 已切换到 [${path.basename(realCandidate)}] (${state.paths.workspaceRoot} · 历史记录 ${existing.length} 条)`);
 }
 
 function handleSlashCommand(rawCmd: string, state: ReplRuntimeState): Promise<boolean> | boolean {
   const { paths, snapshots } = state;
   if (rawCmd === "/" || rawCmd === "/help" || rawCmd === "?") {
-    console.log("\n💡 [快捷命令菜单 (输入 / 时下方会自动弹出提示，按 Tab 可自动补全路径)]:");
+    console.log("\n💡 [快捷指令 (输入 / 后可直接用 ↑/↓ 方向键选择并回车执行)]:");
     for (const m of SLASH_COMMANDS) console.log(`  ${padCols(m.label, 14)} - ${m.desc}`);
     return true;
   }
@@ -118,12 +128,12 @@ function handleSlashCommand(rawCmd: string, state: ReplRuntimeState): Promise<bo
   }
   if (cmd === "/projects" || cmd === "/cd") {
     const projects = listManagedProjects(path.dirname(paths.projectDir));
-    console.log(`\n📁 [本机已管理的项目列表 (共 ${projects.length} 个)]:`);
+    console.log(`\n📁 [已管理项目列表 (共 ${projects.length} 个 · 敲 /cd 后可按 ↑/↓ 键直接选项目)]:`);
     projects.forEach((p, i) => {
-      const tag = p.projectKey === paths.projectKey ? " (当前项目)" : "";
-      console.log(`  [${i + 1}] ${p.projectKey}${tag}: ${p.entryCount} 条记录 | 路径: ${p.workspaceRoot}`);
+      const name = path.basename(p.workspaceRoot);
+      const tag = p.workspaceRoot === paths.workspaceRoot ? " ●当前项目" : "";
+      console.log(`  [${i + 1}] ${padCols(name, 16)} (${p.entryCount} 条记录)${tag}  ${p.workspaceRoot}`);
     });
-    console.log(`👉 切换方式: 直接输入 /cd 2 或 /cd my-ai-kb 或 /cd <任意目录路径>`);
     return true;
   }
   if (cmd === "/clear" || cmd === "/new") {
@@ -154,17 +164,21 @@ export async function startInteractiveRepl(options: {
     customProvider: options.provider,
   };
 
-  console.log(`\n🚀 [Duo-Harness 交互终端] 当前工作区: ${state.paths.workspaceRoot}`);
-  console.log(`🗂️  [会话存档位置 (零污染项目 Git)]: ${state.paths.sessionFile}`);
-  if (state.leafId) console.log(`🔗 [已自动接续上次对话]: 共 ${existing.length} 条记录，当前节点 ${state.leafId}`);
-  console.log(`💡 输入 / 自动弹出命令菜单，按 Tab 自动补全指令与路径 (/cd, /projects, /xray, /tree, /branch, /undo, /clear, /exit)\n`);
+  console.log(`\n🚀 Duo-Harness | 当前项目: ${path.basename(state.paths.workspaceRoot)} (${state.paths.workspaceRoot})`);
+  console.log(`💡 输入 / 用 ↑/↓ 方向键选择命令或切换项目 | 历史记录: ${existing.length} 条`);
 
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
     completer: createReplCompleter(() => state.paths.workspaceRoot, () => state.paths.sessionFile),
   });
-  const detachDropdown = attachLiveSlashDropdown(rl, () => state.inMainPrompt, 8);
+  const detachDropdown = attachLiveSlashDropdown(
+    rl,
+    () => state.inMainPrompt,
+    () => getPromptVisualCols(formatPrompt(state.paths.workspaceRoot)),
+    () => state.paths.workspaceRoot,
+    state.homeBaseDir,
+  );
   const askApproval = async (toolCalls: ToolCall[]) => {
     if (state.autoApprove) return { approved: true };
     state.inMainPrompt = false;
@@ -185,7 +199,7 @@ export async function startInteractiveRepl(options: {
       state.inMainPrompt = true;
       let line = "";
       try {
-        line = (await rl.question("\n👤 你 > ")).trim();
+        line = (await rl.question(formatPrompt(state.paths.workspaceRoot))).trim();
       } catch (err) {
         if (err instanceof Error && (err.name === "AbortError" || err.message.includes("Ctrl+C"))) {
           process.stdout.write("\r\n\x1b[J👋 已退出 Duo-Harness。\n");
