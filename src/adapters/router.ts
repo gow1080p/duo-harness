@@ -215,7 +215,7 @@ export function createRouterProvider(wireLogFile = ".sessions/http-wire.json", a
       let printedHeader = false;
       const { message, rawSseLines } = await readOpenAiSseStream(res, (chunk) => {
         if (!printedHeader) {
-          process.stdout.write("   🌊 [实时流输出]: ");
+          process.stdout.write("\n💬 ");
           printedHeader = true;
         }
         process.stdout.write(chunk);

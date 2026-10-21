@@ -15,8 +15,9 @@ import {
   resolveProjectSessionPaths,
   SLASH_COMMANDS,
 } from "./project-store.js";
-import { createRouterProvider } from "./router.js";
+import { createRouterProvider, resolveRouteTier } from "./router.js";
 import { loadJsonlEntries } from "./store.js";
+import { formatApprovalBox } from "./ui-logger.js";
 import { type FileVersionSnapshot, rollbackFileSnapshots } from "./write-tools.js";
 import { analyzeSessionXray, formatXrayReport } from "./xray.js";
 
@@ -165,6 +166,7 @@ export async function startInteractiveRepl(options: {
   };
 
   console.log(`\n🚀 Duo-Harness | 当前项目: ${path.basename(state.paths.workspaceRoot)} (${state.paths.workspaceRoot})`);
+  console.log(`⚡ 模型路由: ${resolveRouteTier(Date.now()).reason}`);
   console.log(`💡 输入 / 用 ↑/↓ 方向键选择命令或切换项目 | 历史记录: ${existing.length} 条`);
 
   const rl = readline.createInterface({
@@ -182,11 +184,7 @@ export async function startInteractiveRepl(options: {
   const askApproval = async (toolCalls: ToolCall[]) => {
     if (state.autoApprove) return { approved: true };
     state.inMainPrompt = false;
-    console.log(`\n┌─ ⚠️  需要你确认以下修改操作 ──────────────────────────────────`);
-    for (const c of toolCalls) {
-      const detail = c.name === "run_bash" ? `💻 执行命令: ${c.arguments?.command}` : `📝 修改文件: ${c.arguments?.path ?? c.name}`;
-      console.log(`│ ${detail}`);
-    }
+    console.log(formatApprovalBox(toolCalls));
     const ans = (await rl.question(`└─ 是否允许执行？[直接回车/y=允许本次 | a=本轮全自动放行 | n=拒绝] > `)).trim().toLowerCase();
     if (ans === "a") state.autoApprove = true;
     return ans === "" || ans === "y" || ans === "yes" || ans === "a"

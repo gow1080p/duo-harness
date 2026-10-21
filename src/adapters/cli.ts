@@ -8,6 +8,15 @@ import { loadAndFormatWireCost } from "./cost-tracker.js";
 import { appendJsonlEntries, createReplayProvider, loadJsonlEntries } from "./store.js";
 import { createBuiltinTools, executeToolCalls } from "./tools.js";
 import { createWriteTools, type FileVersionSnapshot, rollbackFileSnapshots } from "./write-tools.js";
+import {
+  buildDefaultSystemPrompt,
+  formatCompactTurnFooter,
+  formatStepToolCalls,
+  formatToolResultLine,
+  isReadonlyBashCommand,
+} from "./ui-logger.js";
+
+export { buildDefaultSystemPrompt, isReadonlyBashCommand };
 
 export interface RunSessionOptions {
   provider?: LlmProvider;
@@ -55,16 +64,6 @@ function syncNewMessagesToDisk(
   if (sessionFile) appendJsonlEntries(sessionFile, newEntries, isFirstWrite);
 }
 
-export function isReadonlyBashCommand(cmd: string): boolean {
-  const trimmed = cmd.trim();
-  if (!trimmed || /[><`;\n\r]|\$\(|(?:^|\s)-(delete|exec|execdir|ok|okdir|fprint|fprint0|fprintf|fls)\b/.test(trimmed)) {
-    return false;
-  }
-  const segments = trimmed.split(/\s*(?:\|\||&&|\|)\s*/);
-  const safePrefix = /^(ls|find|wc|head|tail|cat|pwd|which|stat|file|grep|rg|git\s+(status|diff|log|show|rev-parse))\b/;
-  return segments.every((seg) => safePrefix.test(seg.trim()) && !/(^|\s)&(\s|$)/.test(seg));
-}
-
 function filterCallsNeedingApproval(calls: readonly ToolCall[], readonlyMap: Map<string, boolean>): ToolCall[] {
   return calls.filter((c) => {
     if (readonlyMap.get(c.name) !== false) return false;
@@ -87,7 +86,6 @@ async function runSingleEffectStep(
     const rawMessages = projectToMessages(recordedEntries, cursor.leafId ?? undefined);
     const messagesToSend = compactMessages(rawMessages, options.compactor);
     assertSessionInvariant(messagesToSend);
-    console.log(`🤖 [请求大模型] 正在发送 ${messagesToSend.length} 条上下文消息...`);
     let reply;
     try {
       reply = await provider.chat(messagesToSend, tools, { signal: options.signal });
@@ -103,8 +101,7 @@ async function runSingleEffectStep(
 
     const calls = reply.toolCalls ?? [];
     if (calls.length > 0) {
-      const summary = calls.map((c) => `${c.name}(${JSON.stringify(c.arguments)})`).join(", ");
-      console.log(`-> [大模型调用工具] ${summary}`);
+      console.log(formatStepToolCalls(state.step + 1, calls, readonlyMap));
     }
     const writeCalls = filterCallsNeedingApproval(calls, readonlyMap);
     const requiresApproval = writeCalls.length > 0 && Boolean(options.onApprovalRequest);
@@ -116,15 +113,14 @@ async function runSingleEffectStep(
     const decision = options.onApprovalRequest
       ? await options.onApprovalRequest(writeCalls.length > 0 ? writeCalls : effect.toolCalls)
       : { approved: false, reason: "未配置审批回调，默认拒绝写操作" };
-    console.log(decision.approved ? `🟢 [已允许执行]` : `🔴 [已拒绝执行]: ${decision.reason}`);
+    console.log(decision.approved ? `  🟢 已确认允许执行` : `  🔴 已拒绝执行: ${decision.reason}`);
     return stepAgentLoop(state, { type: "APPROVAL_RESOLVED", approved: decision.approved, reason: decision.reason });
   }
 
   if (effect.type === "EXECUTE_TOOLS") {
     const results = await executeToolCalls(effect.toolCalls, tools);
     for (const r of results) {
-      const preview = r.content.replace(/\n/g, " ").slice(0, 80);
-      console.log(`   ↳ [本地工具结果] ${r.name} (isError=${r.isError}): ${preview}${r.content.length > 80 ? "..." : ""}`);
+      console.log(formatToolResultLine(r));
     }
     return stepAgentLoop(state, { type: "TOOLS_FINISHED", results });
   }
@@ -138,10 +134,8 @@ function printCostIfEnabled(options: RunSessionOptions, wireLogFile: string, isR
   if (report) console.log(report);
 }
 
-function initSessionContext(userPrompt: string, options: RunSessionOptions) {
-  const systemPrompt =
-    options.systemPrompt ??
-    "你是一个运行在本地代码库中的智能体。请调用工具读取或修改真实文件后再回答，回答请简明扼要。";
+function initSessionContext(userPrompt: string, workspaceRoot: string, options: RunSessionOptions) {
+  const systemPrompt = options.systemPrompt ?? buildDefaultSystemPrompt(workspaceRoot);
   let existingEntries: SessionEntry[] = [];
   if (options.leafId && options.sessionFile) {
     try {
@@ -182,10 +176,12 @@ export async function runAgentSession(
   ];
   const tools = options.tools ?? defaultTools;
   const readonlyMap = new Map(tools.map((t) => [t.name, t.readonly]));
-  console.log(`\n⚡ [路由决策] ${resolveRouteTier(Date.now(), { isReplay }).reason}`);
-  console.log(`👤 [用户提问] ${userPrompt}\n`);
+  if (!options.suppressFinalEcho) {
+    console.log(`\n⚡ [路由决策] ${resolveRouteTier(Date.now(), { isReplay }).reason}`);
+    console.log(`👤 [用户提问] ${userPrompt}\n`);
+  }
 
-  let { stepRes, recordedEntries, cursor } = initSessionContext(userPrompt, options);
+  let { stepRes, recordedEntries, cursor } = initSessionContext(userPrompt, workspaceRoot, options);
 
   while (true) {
     if (options.signal?.aborted) {
@@ -222,12 +218,12 @@ export async function runAgentSession(
     syncNewMessagesToDisk(options.sessionFile, recordedEntries, stepRes.state.messages, cursor, false);
   }
 
-  if (options.sessionFile) console.log(`💾 [已保存会话记录] ${options.sessionFile} (共 ${recordedEntries.length} 行 JSON)`);
-  printCostIfEnabled(options, wireLogFile, isReplay);
   if (!options.suppressFinalEcho) {
+    if (options.sessionFile) console.log(`💾 [已保存会话记录] ${options.sessionFile} (共 ${recordedEntries.length} 行 JSON)`);
+    printCostIfEnabled(options, wireLogFile, isReplay);
     console.log(`\n✅ [最终回答 (共执行 ${stepRes.state.step} 步)]:\n${stepRes.effect.finalAnswer}`);
   } else {
-    console.log(`\n✅ [本轮完成 (共调用工具 ${stepRes.state.step} 步)]`);
+    console.log(formatCompactTurnFooter(wireLogFile, stepRes.state.step, isReplay));
   }
   return { finalAnswer: stepRes.effect.finalAnswer, stepsUsed: stepRes.state.step, entries: recordedEntries, leafId: cursor.leafId };
 }
