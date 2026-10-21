@@ -217,7 +217,8 @@ describe("Stage 3: 写工具 (edit_file/run_bash/rollback_version)、暂停审�
     expect(isReadonlyBashCommand('wc -l backend/*.py 2>/dev/null; echo "---"; cat backend/requirements.txt')).toBe(true);
     expect(isReadonlyBashCommand('find . -name "*.py" -o -name "*.ts" | wc -l')).toBe(true);
     expect(isReadonlyBashCommand("git status && git diff && git branch --show-current")).toBe(true);
-    expect(isReadonlyBashCommand("node -v && python3 --version")).toBe(true);
+    expect(isReadonlyBashCommand("git remote -v && git branch -a && git tag -l </dev/null")).toBe(true);
+    expect(isReadonlyBashCommand("uname -a && realpath . && node -v && python3 --version")).toBe(true);
 
     // 严防绕过测试
     expect(isReadonlyBashCommand("find . -name '*.tmp' -delete")).toBe(false);
@@ -227,6 +228,7 @@ describe("Stage 3: 写工具 (edit_file/run_bash/rollback_version)、暂停审�
     expect(isReadonlyBashCommand("env rm -rf dist")).toBe(false);
     expect(isReadonlyBashCommand('node -e "console.log(1)"')).toBe(false);
     expect(isReadonlyBashCommand("git branch -D feature")).toBe(false);
+    expect(isReadonlyBashCommand("git remote remove origin")).toBe(false);
     expect(isReadonlyBashCommand("ls > out.txt")).toBe(false);
     expect(isReadonlyBashCommand("rm -rf dist")).toBe(false);
 
