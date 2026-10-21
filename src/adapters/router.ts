@@ -159,23 +159,34 @@ function loadApiKey(envName: string, dotFileName: string): string {
   return readKeyFromFile(path.join(os.homedir(), ".gemini", "antigravity", dotFileName), envName, true);
 }
 
-/** 5. 创建真实 HTTP 大模型调用器（支持按时段路由小米 MiMo 2.6 / DeepSeek） */
+/** 5. 创建真实 HTTP 大模型调用器（原生支持 OpenAI / Codex、DeepSeek 与小米 MiMo 2.6） */
 export function createRouterProvider(wireLogFile = ".sessions/http-wire.json", appendExistingWire = false): LlmProvider {
   let roundCount = 0;
   return {
     async chat(messages: Message[], tools: ToolContract<any>[] = [], options: { signal?: AbortSignal } = {}): Promise<AssistantMessage> {
       const decision = resolveRouteTier(Date.now());
+      const openaiKey = loadApiKey("OPENAI_API_KEY", ".openai_key");
       const mimoKey = loadApiKey("MIMO_API_KEY", ".mimo_key");
       const deepseekKey = loadApiKey("DEEPSEEK_API_KEY", ".deepseek_key");
-      const useMimo = decision.tier === "tier1_mimo_peak" && mimoKey.length > 0;
+      const useOpenAi = openaiKey.length > 0 && (!mimoKey && !deepseekKey || process.env.LLM_PROVIDER === "openai");
+      const useMimo = !useOpenAi && decision.tier === "tier1_mimo_peak" && mimoKey.length > 0;
       const isTokenPlan = mimoKey.startsWith("tp-") || mimoKey.startsWith("ttp-");
+      const openaiBaseUrl = (process.env.OPENAI_BASE_URL?.trim() || "https://api.openai.com/v1").replace(/\/$/, "");
       const mimoBaseUrl =
         process.env.MIMO_BASE_URL?.trim() ||
         (isTokenPlan ? "https://token-plan-cn.xiaomimimo.com/v1" : "https://api.xiaomimimo.com/v1");
-      const apiUrl = useMimo ? `${mimoBaseUrl.replace(/\/$/, "")}/chat/completions` : "https://api.deepseek.com/chat/completions";
-      const model = useMimo ? process.env.MIMO_MODEL?.trim() || "mimo-v2.6-pro" : "deepseek-chat";
-      const apiKey = useMimo ? mimoKey : deepseekKey;
-      if (!apiKey) throw new Error("未检测到 MIMO_API_KEY (.mimo_key) 或 DEEPSEEK_API_KEY (.deepseek_key)");
+      const apiUrl = useOpenAi
+        ? `${openaiBaseUrl}/chat/completions`
+        : useMimo
+          ? `${mimoBaseUrl.replace(/\/$/, "")}/chat/completions`
+          : "https://api.deepseek.com/chat/completions";
+      const model = useOpenAi
+        ? process.env.OPENAI_MODEL?.trim() || "gpt-5-codex"
+        : useMimo
+          ? process.env.MIMO_MODEL?.trim() || "mimo-v2.6-pro"
+          : "deepseek-chat";
+      const apiKey = useOpenAi ? openaiKey : useMimo ? mimoKey : deepseekKey;
+      if (!apiKey) throw new Error("未检测到 OPENAI_API_KEY、DEEPSEEK_API_KEY 或 MIMO_API_KEY");
 
       const openAiTools = tools.map((t) => ({
         type: "function",

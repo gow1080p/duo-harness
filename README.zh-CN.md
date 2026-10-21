@@ -56,9 +56,10 @@ pnpm verify
 
 ### 2. 配置 API Key（`.env.local` 或环境变量）
 
-在项目根目录创建 `.env.local`（已被 `.gitignore` 忽略），填入任一或两个模型的 API Key：
+在项目根目录创建 `.env.local`（已被 `.gitignore` 忽略），填入任一支持的大模型 API Key（原生支持 OpenAI / Codex、DeepSeek 与小米 MiMo 2.6）：
 
 ```ini
+OPENAI_API_KEY=sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxx
 DEEPSEEK_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 MIMO_API_KEY=tp-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ```

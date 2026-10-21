@@ -94,16 +94,17 @@ pnpm verify
 
 #### 2. Configure API Keys (`.env.local` or Environment Variables)
 
-Create a `.env.local` file in the project root (gitignored by default) and provide either or both API keys:
+Create a `.env.local` file in the project root (gitignored by default) and provide any of the supported OpenAI-compatible API keys:
 
 ```ini
+OPENAI_API_KEY=sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxx
 DEEPSEEK_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 MIMO_API_KEY=tp-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
-> 💡 **Time-Aware Routing (`src/adapters/router.ts`)**:
-> - If both keys are configured, weekday peak hours (`09:00–12:00`, `14:00–18:00` UTC+8) route to `MiMo 2.6`, while off-peak hours and weekends route to `DeepSeek` with 64-token prefix caching.
-> - If only `DEEPSEEK_API_KEY` is set, all requests route to `DeepSeek` 24/7.
+> 💡 **Multi-Model Routing (`src/adapters/router.ts`)**:
+> - Supports official **OpenAI API** (`OPENAI_API_KEY` / `OPENAI_MODEL`, defaulting to `gpt-5-codex` and compatible with `gpt-5.6` / `gpt-5`), **DeepSeek**, and **MiMo 2.6**.
+> - When both `MIMO_API_KEY` and `DEEPSEEK_API_KEY` are configured, weekday peak hours automatically route to `MiMo 2.6` and off-peak/weekends route to `DeepSeek` with 64-token prefix caching; set `LLM_PROVIDER=openai` or provide `OPENAI_API_KEY` to route directly to OpenAI.
 
 #### 3. Launch Interactive Multi-Project CLI (`pnpm chat` or Global `duo`)
 
