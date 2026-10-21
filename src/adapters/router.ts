@@ -82,14 +82,17 @@ export function zodObjectToJsonSchema(schema: z.ZodTypeAny): Record<string, unkn
 }
 
 export function toOpenAiMessages(messages: Message[]): Record<string, unknown>[] {
-  return messages.map((msg) => {
+  const lastUserIdx = messages.map((m) => m.role).lastIndexOf("user");
+  return messages.map((msg, idx) => {
     if (msg.role === "assistant") {
       const hasTools = Boolean(msg.toolCalls && msg.toolCalls.length > 0);
       const out: Record<string, unknown> = {
         role: "assistant",
         content: msg.content || (hasTools ? null : ""),
       };
-      if (msg.reasoningContent !== undefined) out.reasoning_content = msg.reasoningContent;
+      if (idx > lastUserIdx && msg.reasoningContent !== undefined) {
+        out.reasoning_content = msg.reasoningContent;
+      }
       if (msg.toolCalls && msg.toolCalls.length > 0) {
         out.tool_calls = msg.toolCalls.map((tc) => ({
           id: tc.id,
@@ -156,13 +159,15 @@ function loadApiKey(envName: string, dotFileName: string): string {
   return readKeyFromFile(path.join(os.homedir(), ".gemini", "antigravity", dotFileName), envName, true);
 }
 
-/**
- * 5. 创建真实 HTTP 大模型调用器（支持按时段路由小米 MiMo 2.6 / DeepSeek）
- */
+/** 5. 创建真实 HTTP 大模型调用器（支持按时段路由小米 MiMo 2.6 / DeepSeek） */
 export function createRouterProvider(wireLogFile = ".sessions/http-wire.json"): LlmProvider {
   let roundCount = 0;
   return {
-    async chat(messages: Message[], tools: ToolContract<any>[] = []): Promise<AssistantMessage> {
+    async chat(
+      messages: Message[],
+      tools: ToolContract<any>[] = [],
+      options: { signal?: AbortSignal } = {},
+    ): Promise<AssistantMessage> {
       const decision = resolveRouteTier(Date.now());
       const mimoKey = loadApiKey("MIMO_API_KEY", ".mimo_key");
       const deepseekKey = loadApiKey("DEEPSEEK_API_KEY", ".deepseek_key");
@@ -178,7 +183,6 @@ export function createRouterProvider(wireLogFile = ".sessions/http-wire.json"): 
         : "https://api.deepseek.com/chat/completions";
       const model = useMimo ? process.env.MIMO_MODEL?.trim() || "mimo-v2.6-pro" : "deepseek-chat";
       const apiKey = useMimo ? mimoKey : deepseekKey;
-
       if (!apiKey) {
         throw new Error("未检测到 MIMO_API_KEY (.mimo_key) 或 DEEPSEEK_API_KEY (.deepseek_key)");
       }
@@ -188,7 +192,7 @@ export function createRouterProvider(wireLogFile = ".sessions/http-wire.json"): 
         function: {
           name: t.name,
           description: t.description,
-          parameters: zodObjectToJsonSchema(t.parameters),
+          parameters: t.inputSchema ?? zodObjectToJsonSchema(t.parameters),
         },
       }));
       const requestBody: Record<string, unknown> = {
@@ -198,12 +202,14 @@ export function createRouterProvider(wireLogFile = ".sessions/http-wire.json"): 
         temperature: 0,
         stream: true,
       };
+      const timeoutSig = AbortSignal.timeout(60_000);
+      const signal = options.signal ? AbortSignal.any([options.signal, timeoutSig]) : timeoutSig;
 
       const res = await fetch(apiUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
         body: JSON.stringify(requestBody),
-        signal: AbortSignal.timeout(60_000),
+        signal,
       });
 
       if (!res.ok) {

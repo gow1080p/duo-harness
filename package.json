@@ -15,6 +15,7 @@
     "ask": "tsx src/adapters/cli.ts",
     "review": "tsx src/adapters/reviewer.ts",
     "serve": "tsx src/adapters/rpc-server.ts",
+    "xray": "tsx src/adapters/xray.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",

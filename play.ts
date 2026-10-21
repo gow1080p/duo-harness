@@ -4,6 +4,7 @@ import {
   createReplayProvider,
   loadJsonlEntries,
 } from "./src/adapters/store.js";
+import { analyzeSessionXray, formatXrayReport, writeXrayMarkdownReport } from "./src/adapters/xray.js";
 
 const sessionFile = ".sessions/play.jsonl";
 const wireLogFile = ".sessions/http-wire.json";
@@ -57,8 +58,11 @@ async function main() {
     enableWriteTools: true,
   });
   const costMs = (performance.now() - startMs).toFixed(1);
+  const xray = analyzeSessionXray(sessionFile, wireLogFile);
+  console.log(formatXrayReport(xray));
+  writeXrayMarkdownReport(xray);
   console.log(
-    `\n⚡ [回放完成] 耗时仅 ${costMs} 毫秒！你可以直接点开 ${sessionFile} 查看硬盘上保存的每一行 JSON。`,
+    `\n⚡ [回放与 X-Ray 透视完成] 耗时仅 ${costMs} 毫秒！已同步生成 .sessions/xray-report.md 全链路时序图。`,
   );
 }
 

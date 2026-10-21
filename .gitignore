@@ -7,3 +7,4 @@ references/
 .DS_Store
 .sessions/ask-latest.jsonl
 .sessions/wire-*.json
+.sessions/xray-report.md

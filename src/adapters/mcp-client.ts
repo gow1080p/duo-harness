@@ -6,6 +6,7 @@ import { killProcessGroup } from "./write-tools.js";
 export interface McpToolInfo {
   name: string;
   description?: string;
+  inputSchema?: Record<string, unknown>;
 }
 
 export interface StdioMcpClient {
@@ -156,6 +157,7 @@ export function createStdioMcpClient(
         name: info.name,
         description: info.description ?? `MCP 外部工具: ${info.name}`,
         parameters: z.object({}).passthrough(),
+        inputSchema: info.inputSchema,
         readonly: options.readonly ?? true,
         execute: (validatedArgs) => this.callTool(info.name, validatedArgs),
       }));

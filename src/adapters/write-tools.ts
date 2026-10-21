@@ -6,10 +6,16 @@ import { z } from "zod";
 import type { ToolContract } from "../core/contracts.js";
 import { resolveSafePath } from "./tools.js";
 
-const EditFileArgsSchema = z.object({
-  path: z.string().min(1),
+const SingleEditItemSchema = z.object({
   oldText: z.string(),
   newText: z.string(),
+});
+
+const EditFileArgsSchema = z.object({
+  path: z.string().min(1),
+  oldText: z.string().optional(),
+  newText: z.string().optional(),
+  edits: z.array(SingleEditItemSchema).optional(),
 });
 
 const RunBashArgsSchema = z.object({
@@ -77,6 +83,7 @@ export function runCommandInSandbox(
   command: string,
   cwd: string,
   timeoutMs = 10_000,
+  signal?: AbortSignal,
 ): Promise<{ exitCode: number; output: string }> {
   return new Promise((resolve) => {
     const shellBin = fsSync.existsSync("/bin/zsh") ? "/bin/zsh" : "/bin/sh";
@@ -88,9 +95,7 @@ export function runCommandInSandbox(
 
     let combined = "";
     const appendChunk = (chunk: Buffer) => {
-      if (combined.length < 16_000) {
-        combined += chunk.toString("utf-8");
-      }
+      if (combined.length < 16_000) combined += chunk.toString("utf-8");
     };
 
     child.stdout.on("error", () => {});
@@ -108,6 +113,18 @@ export function runCommandInSandbox(
       const text = (prefix + combined).trim().slice(0, 8_000);
       resolve({ exitCode, output: text || "(无输出)" });
     };
+
+    if (signal) {
+      if (signal.aborted) {
+        killProcessGroup(child.pid);
+        finish(130, "[收到取消信号已终止进程组]\n");
+        return;
+      }
+      signal.addEventListener("abort", () => {
+        killProcessGroup(child.pid);
+        finish(130, "[收到取消信号已终止进程组]\n");
+      }, { once: true });
+    }
 
     const timer = setTimeout(() => {
       killProcessGroup(child.pid);
@@ -129,33 +146,41 @@ async function applyFileEdit(
   const beforeContent = existed ? await fs.readFile(fullPath, "utf-8") : null;
   await fs.mkdir(path.dirname(fullPath), { recursive: true });
 
-  let afterContent: string;
-  if (args.oldText === "") {
-    afterContent = args.newText;
-  } else {
-    if (beforeContent === null) {
-      throw new Error(`文件不存在，无法替换 oldText: ${args.path}`);
+  const hasBatch = Array.isArray(args.edits) && args.edits.length > 0;
+  if (!hasBatch && (args.oldText === undefined || args.newText === undefined)) {
+    throw new Error(`edit_file 参数缺失：必须提供 oldText/newText 或非空 edits 数组`);
+  }
+  const editList = hasBatch ? args.edits! : [{ oldText: args.oldText!, newText: args.newText! }];
+
+  let workingContent = beforeContent ?? "";
+  for (const item of editList) {
+    if (item.oldText === "") {
+      workingContent = item.newText;
+    } else {
+      if (beforeContent === null && workingContent === "") {
+        throw new Error(`文件不存在，无法替换 oldText: ${args.path}`);
+      }
+      const occurrences = workingContent.split(item.oldText).length - 1;
+      if (occurrences === 0) {
+        throw new Error(`在 ${args.path} 中未找到匹配的 oldText，请先用 read_file 确认原文件内容`);
+      }
+      if (occurrences > 1) {
+        throw new Error(`oldText 在 ${args.path} 中出现了 ${occurrences} 次，请补充前后几行保证唯一匹配`);
+      }
+      workingContent = workingContent.replace(item.oldText, () => item.newText);
     }
-    const occurrences = beforeContent.split(args.oldText).length - 1;
-    if (occurrences === 0) {
-      throw new Error(`在 ${args.path} 中未找到匹配的 oldText，请先用 read_file 确认原文件内容`);
-    }
-    if (occurrences > 1) {
-      throw new Error(`oldText 在 ${args.path} 中出现了 ${occurrences} 次，请补充前后几行代码保证唯一匹配`);
-    }
-    afterContent = beforeContent.replace(args.oldText, () => args.newText);
   }
 
-  await fs.writeFile(fullPath, afterContent, "utf-8");
+  await fs.writeFile(fullPath, workingContent, "utf-8");
   const version = snapshots.length + 1;
   snapshots.push({
     version,
     path: args.path,
     beforeContent,
-    afterContent,
+    afterContent: workingContent,
     timestamp: Date.now(),
   });
-  return `已写入文件: ${args.path} (当前版本 v${version})`;
+  return `已写入文件: ${args.path} (共应用 ${editList.length} 处修改，当前版本 v${version})`;
 }
 
 /**
@@ -164,6 +189,7 @@ async function applyFileEdit(
 export function createWriteTools(
   workspaceRoot: string = process.cwd(),
   snapshots: FileVersionSnapshot[] = [],
+  signal?: AbortSignal,
 ): ToolContract<any>[] {
   const editFileTool: ToolContract<z.infer<typeof EditFileArgsSchema>> = {
     name: "edit_file",
@@ -191,7 +217,7 @@ export function createWriteTools(
     parameters: RunBashArgsSchema,
     readonly: false,
     async execute(args) {
-      const res = await runCommandInSandbox(args.command, workspaceRoot, args.timeoutMs ?? 10_000);
+      const res = await runCommandInSandbox(args.command, workspaceRoot, args.timeoutMs ?? 10_000, signal);
       if (res.exitCode !== 0) throw new Error(`命令退出码 ${res.exitCode}:\n${res.output}`);
       return res.output;
     },

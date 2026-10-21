@@ -13,6 +13,8 @@ import {
 } from "../src/adapters/reviewer.js";
 import { createHarnessRpcServer } from "../src/adapters/rpc-server.js";
 import { formatCostReport, summarizeWireCost } from "../src/adapters/cost-tracker.js";
+import { toOpenAiMessages } from "../src/adapters/router.js";
+import { analyzeSessionXray, formatXrayReport } from "../src/adapters/xray.js";
 import type { HttpWireLogEntry } from "../src/adapters/sse-stream.js";
 
 describe("Stage 5: 自主探路代码审查特工 (reviewer.ts)、RepoMap 与轻量 RPC/SSE 接口 (rpc-server.ts)", () => {
@@ -220,17 +222,28 @@ describe("Stage 5: 自主探路代码审查特工 (reviewer.ts)、RepoMap 与轻
 
     const summary = summarizeWireCost(mockWireEntries);
     expect(summary.rounds).toHaveLength(3);
-    // 第 1 轮：500 in (¥2/M) + 60 out (¥6/M, 已含10思考不重复加) = (1000 + 360) / 1e6 = 0.00136
     expect(summary.rounds[0]!.costCny).toBeCloseTo(0.00136, 6);
     expect(summary.rounds[0]!.diagnosis).toContain("首轮建库");
-    // 第 2 轮：上一轮累计 500 + (60 - 10) = 550 < 1024 -> 识别为未达起缓线
     expect(summary.rounds[1]!.diagnosis).toContain("未达起缓线 (<1024)");
-    // 第 3 轮：上一轮累计 3900 + (150 - 20) = 4030 -> 对齐 64 为 3968，命中 3840 -> 96.8% 高复用
     expect(summary.rounds[2]!.prefixRetentionPct).toBeCloseTo((3840 / 3968) * 100, 1);
     expect(summary.rounds[2]!.diagnosis).toContain("🟢 前缀复用");
 
     const replaySummary = summarizeWireCost(mockWireEntries, { isReplay: true });
     expect(replaySummary.totalCostCny).toBe(0);
     expect(formatCostReport(replaySummary)).toContain("离线回放模式");
+
+    // 5. 同回合保留 reasoning_content、跨旧回合自动剥离 + X-Ray 零黑盒透视校验
+    const openAiPayload = toOpenAiMessages([
+      { role: "user", content: "第1轮问题" },
+      { role: "assistant", content: "第1轮回答", reasoningContent: "旧回合思考应被剥离" },
+      { role: "user", content: "第2轮问题" },
+      { role: "assistant", content: "", reasoningContent: "当前回合工具步思考应保留", toolCalls: [{ id: "t1", name: "list_dir", arguments: {} }] },
+      { role: "tool", toolCallId: "t1", name: "list_dir", content: "src", isError: false },
+    ]);
+    expect(openAiPayload[1]!.reasoning_content).toBeUndefined();
+    expect(openAiPayload[3]!.reasoning_content).toBe("当前回合工具步思考应保留");
+
+    const xray = analyzeSessionXray(".sessions/play.jsonl", ".sessions/http-wire.json");
+    expect(formatXrayReport(xray)).toContain("Duo-Harness X-Ray 零黑盒物理透视台");
   });
 });
