@@ -206,9 +206,10 @@ describe("Stage 3: 写工具 (edit_file/run_bash/rollback_version)、暂停审�
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   });
 
-  it("5. 纯只读查询类 run_bash (含 2>/dev/null、; 复合统计、find -o) 自动放行，所有写/注入命令严格拦截", async () => {
-    const { isReadonlyBashCommand, buildDefaultSystemPrompt, formatApprovalBox, formatStepToolCalls } =
+  it("5. 纯只读查询类 run_bash (含 2>/dev/null、; 复合统计、git ls-files) 自动放行且剥离前置 cd，所有写/注入命令及 Seatbelt 沙箱严格拦截", async () => {
+    const { isReadonlyBashCommand, buildDefaultSystemPrompt, formatApprovalBox, formatStepToolCalls, shortenWorkspaceText } =
       await import("../src/adapters/ui-logger.js");
+    const { runCommandInSandbox } = await import("../src/adapters/write-tools.js");
     expect(
       isReadonlyBashCommand(
         'find . -type f -not -path "*/node_modules/*" -not -path "*/.git/*" | head -100',
@@ -226,9 +227,15 @@ describe("Stage 3: 写工具 (edit_file/run_bash/rollback_version)、暂停审�
     ).toBe(true);
     expect(
       isReadonlyBashCommand(
-        'cd "/Volumes/T7 Shield/code/kids-essay-copilot" && find . -not -path "*/venv/*" -not -path "*/node_modules/*" -not -path "*/.git/*" -not -path "*/dist/*" -not -path "*/__pycache__/*" | sort | sed -e \'s/[^-][^\\/]*\\//  /g\' -e \'s/\\/\\///\'',
+        'cd "/Volumes/T7 Shield/code/kids-essay-copilot" && wc -l main.py app/services/*.py 2>/dev/null; echo \'--- git tracked? ---\'; git ls-files | grep -E \'\\.env$|^venv/|web-ui/dist/\' | head; echo \'--- gitignore ---\'; cat .gitignore',
       ),
     ).toBe(true);
+    expect(
+      shortenWorkspaceText(
+        'cd "/Volumes/T7 Shield/code/kids-essay-copilot" && wc -l "/Volumes/T7 Shield/code/kids-essay-copilot/main.py"',
+        "/Volumes/T7 Shield/code/kids-essay-copilot",
+      ),
+    ).toBe('wc -l "main.py"');
 
     // 严防绕过测试
     expect(isReadonlyBashCommand("sed -i 's/a/b/g' app.ts")).toBe(false);
@@ -245,6 +252,24 @@ describe("Stage 3: 写工具 (edit_file/run_bash/rollback_version)、暂停审�
     expect(isReadonlyBashCommand("git remote remove origin")).toBe(false);
     expect(isReadonlyBashCommand("ls > out.txt")).toBe(false);
     expect(isReadonlyBashCommand("rm -rf dist")).toBe(false);
+    expect(isReadonlyBashCommand("git status", false)).toBe(false);
+
+    // 验证 macOS Seatbelt 只读沙箱物理阻断文件写入，而正常只读查询通过
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "duo-seatbelt-"));
+    fs.writeFileSync(path.join(tmpRoot, "a.py"), "print(1)\nprint(2)\n", "utf-8");
+    fs.mkdirSync(path.join(tmpRoot, "venv"));
+    const roOk = await runCommandInSandbox("wc -l a.py 2>/dev/null", tmpRoot, 5_000, undefined, true);
+    expect(roOk.exitCode).toBe(0);
+    if (process.platform === "darwin" && fs.existsSync("/usr/bin/sandbox-exec")) {
+      const roBlocked = await runCommandInSandbox("touch hacked.txt", tmpRoot, 5_000, undefined, true);
+      expect(roBlocked.exitCode).not.toBe(0);
+      expect(fs.existsSync(path.join(tmpRoot, "hacked.txt"))).toBe(false);
+    }
+    const [ , listDirTool] = createBuiltinTools(tmpRoot);
+    const dirTree = await listDirTool!.execute({ path: "." });
+    expect(dirTree).toContain("a.py (3 lines)");
+    expect(dirTree).toContain("[已过滤忽略目录: venv/]");
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
 
     // 验证 System Prompt 注入工作区路径且审批框严格区分修改文件与运行命令
     expect(buildDefaultSystemPrompt("/tmp/my-ai-kb")).toContain("/tmp/my-ai-kb");

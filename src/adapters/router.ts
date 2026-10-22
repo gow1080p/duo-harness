@@ -11,7 +11,7 @@ import {
   type ToolCall,
   type ToolContract,
 } from "../core/contracts.js";
-import { readOpenAiSseStream, recordHttpWireLog } from "./sse-stream.js";
+import { createStreamRenderer, readOpenAiSseStream, recordHttpWireLog } from "./sse-stream.js";
 
 export type RouteTier = "tier0_replay" | "tier1_mimo_peak" | "tier2_deepseek_offpeak" | "tier3_gemini_cli";
 
@@ -212,15 +212,9 @@ export function createRouterProvider(wireLogFile = ".sessions/http-wire.json", a
       });
       if (!res.ok) throw new Error(`LLM HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
 
-      let printedHeader = false;
-      const { message, rawSseLines } = await readOpenAiSseStream(res, (chunk) => {
-        if (!printedHeader) {
-          process.stdout.write("\n💬 ");
-          printedHeader = true;
-        }
-        process.stdout.write(chunk);
-      });
-      if (printedHeader) process.stdout.write("\n");
+      const renderer = createStreamRenderer();
+      const { message, rawSseLines } = await readOpenAiSseStream(res, renderer.onContent, renderer.onReasoning);
+      renderer.flush();
 
       const entry = { roundTimestamp: new Date().toISOString(), apiUrl, requestBody, rawSseLines, assembledMessage: message };
       recordHttpWireLog(entry, wireLogFile, roundCount === 0 && !appendExistingWire);

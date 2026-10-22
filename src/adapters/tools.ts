@@ -128,6 +128,19 @@ async function runGrepSearch(
   return matches.length > 0 ? matches.slice(0, 50).join("\n") : "未找到匹配内容";
 }
 
+function formatFileWithLineCount(fullFilePath: string, displayName: string): string {
+  if (BINARY_EXT_RE.test(displayName)) return displayName;
+  try {
+    const stat = fsSync.statSync(fullFilePath);
+    if (!stat.isFile() || stat.size > 512_000) return displayName;
+    const raw = fsSync.readFileSync(fullFilePath, "utf-8");
+    if (raw.includes("\u0000")) return displayName;
+    return `${displayName} (${raw.split("\n").length} lines)`;
+  } catch {
+    return displayName;
+  }
+}
+
 export function createBuiltinTools(workspaceRoot: string = process.cwd()): ToolContract<any>[] {
   const readFileTool: ToolContract<z.infer<typeof ReadFileArgsSchema>> = {
     name: "read_file",
@@ -136,42 +149,44 @@ export function createBuiltinTools(workspaceRoot: string = process.cwd()): ToolC
     readonly: true,
     async execute(args) {
       const fullPath = resolveSafePath(workspaceRoot, args.path, "read");
-      const raw = await fs.readFile(fullPath, "utf-8");
-      const lines = raw.split("\n");
+      const lines = (await fs.readFile(fullPath, "utf-8")).split("\n");
       const startIdx = Math.max(0, (args.startLine ?? 1) - 1);
-      const maxCount = args.maxLines ?? lines.length;
-      const endIdx = args.endLine ? Math.min(lines.length, args.endLine) : startIdx + maxCount;
-      return lines
-        .slice(startIdx, endIdx)
-        .map((line, i) => `${startIdx + i + 1}: ${line}`)
-        .join("\n");
+      const endIdx = args.endLine ? Math.min(lines.length, args.endLine) : startIdx + (args.maxLines ?? lines.length);
+      return lines.slice(startIdx, endIdx).map((line, i) => `${startIdx + i + 1}: ${line}`).join("\n");
     },
   };
 
   const listDirTool: ToolContract<z.infer<typeof ListDirArgsSchema>> = {
     name: "list_dir",
     description:
-      "列出指定目录的项目结构树（自动展开 2 层子目录并过滤 node_modules/.git/venv，看项目结构请直接调本工具，勿调 find）",
+      "列出指定目录的项目结构树（自动展开 2 层子目录、附带每个代码文件的行数并提示已过滤目录，看项目结构或评估文件规模请直接调本工具）",
     parameters: ListDirArgsSchema,
     readonly: true,
     async execute(args) {
       const fullPath = resolveSafePath(workspaceRoot, args.path, "read");
       const entries = await fs.readdir(fullPath, { withFileTypes: true });
       const lines: string[] = [];
+      const ignoredFound: string[] = [];
       for (const e of entries) {
-        if (IGNORED_DIRS.has(e.name)) continue;
+        if (IGNORED_DIRS.has(e.name)) {
+          if (e.isDirectory() && e.name !== ".git" && e.name !== ".sessions") ignoredFound.push(`${e.name}/`);
+          continue;
+        }
         if (e.isDirectory()) {
           lines.push(`${e.name}/`);
-          const subEntries = await fs.readdir(path.join(fullPath, e.name), { withFileTypes: true }).catch(() => []);
+          const subPath = path.join(fullPath, e.name);
+          const subEntries = await fs.readdir(subPath, { withFileTypes: true }).catch(() => []);
           for (const sub of subEntries.slice(0, 25)) {
             if (!IGNORED_DIRS.has(sub.name)) {
-              lines.push(`  ${e.name}/${sub.name}${sub.isDirectory() ? "/" : ""}`);
+              const relSub = `${e.name}/${sub.name}`;
+              lines.push(`  ${sub.isDirectory() ? `${relSub}/` : formatFileWithLineCount(path.join(subPath, sub.name), relSub)}`);
             }
           }
         } else {
-          lines.push(e.name);
+          lines.push(formatFileWithLineCount(path.join(fullPath, e.name), e.name));
         }
       }
+      if (ignoredFound.length > 0) lines.push(`[已过滤忽略目录: ${ignoredFound.join(", ")}]`);
       return lines.join("\n");
     },
   };
@@ -193,33 +208,14 @@ async function executeSingleToolCall(
 ): Promise<ToolResultMessage> {
   const tool = toolMap.get(call.name);
   if (!tool) {
-    return {
-      role: "tool",
-      toolCallId: call.id,
-      name: call.name,
-      content: `未知工具: ${call.name}`,
-      isError: true,
-    };
+    return { role: "tool", toolCallId: call.id, name: call.name, content: `未知工具: ${call.name}`, isError: true };
   }
   try {
-    const validatedArgs = tool.parameters.parse(call.arguments);
-    const output = await tool.execute(validatedArgs);
-    return {
-      role: "tool",
-      toolCallId: call.id,
-      name: call.name,
-      content: String(output),
-      isError: false,
-    };
+    const output = await tool.execute(tool.parameters.parse(call.arguments));
+    return { role: "tool", toolCallId: call.id, name: call.name, content: String(output), isError: false };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    return {
-      role: "tool",
-      toolCallId: call.id,
-      name: call.name,
-      content: `执行异常：${msg}`,
-      isError: true,
-    };
+    return { role: "tool", toolCallId: call.id, name: call.name, content: `执行异常：${msg}`, isError: true };
   }
 }
 

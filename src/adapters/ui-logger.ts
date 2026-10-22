@@ -3,18 +3,22 @@ import type { ToolCall, ToolResultMessage } from "../core/contracts.js";
 import { summarizeWireCost } from "./cost-tracker.js";
 import type { HttpWireLogEntry } from "./sse-stream.js";
 
-const SAFE_CMD_PREFIX =
-  /^(ls|find|wc|head|tail|cat|pwd|which|stat|file|grep|rg|tree|du|df|echo|cd|sort|uniq|uname|realpath|basename|dirname|nl|cut|tr|sed|column|paste|comm|diff|xargs\s+(wc|head|tail|cat|grep|rg|file|stat)|git\s+(status|diff|log|show|rev-parse|remote\s+-v|tag\s+(-l|--list)|branch\s+(--show-current|-a|-r|--list))|node\s+(-v|--version)|python3?\s+(-V|--version))\b/;
+const WRITE_VERBS_RE =
+  /^(?:rm|mv|cp|mkdir|rmdir|touch|chmod|chown|chgrp|ln|unlink|tee|dd|install|truncate|shred|mkfs|mount|umount|kill|pkill|killall|sudo|su|doas|patch|tar|unzip|zip|gzip|gunzip|bzip2|xz|curl|wget|scp|rsync|ssh|sftp|nc|netcat|socat|apt|apt-get|yum|dnf|pacman|brew|npm|pnpm|yarn|bun|pip3?|poetry|uv|cargo|go|make|cmake|gradle|mvn|pytest|vitest|jest|docker|kubectl|systemctl|launchctl|service|crontab|at|eval|exec|source|\.)\b/;
+
+const GIT_WRITE_SUBCMD_RE =
+  /^git\s+(?:add|commit|push|pull|fetch|merge|rebase|cherry-pick|revert|reset|checkout|switch|restore|clean|stash|init|clone|am|apply|mv|rm|bisect|submodule|worktree|gc|prune|filter-branch|notes|replace|tag\s+-(?:d|-delete|a|s|f)|branch\s+(?:-[dDmM]|--(?:delete|move|copy))|remote\s+(?:add|remove|rm|rename|set-url|prune)|config\s+(?!--(?:get|get-all|list)\b)(?!-l\b))/;
 
 export function shortenWorkspaceText(raw: string, workspaceRoot?: string): string {
-  if (!raw || !workspaceRoot) return raw;
-  const cleanRoot = workspaceRoot.replace(/\/$/, "");
-  if (!cleanRoot) return raw;
-  return raw
-    .split(`${cleanRoot}/`)
-    .join("")
-    .split(cleanRoot)
-    .join(".");
+  if (!raw) return raw;
+  let res = raw;
+  if (workspaceRoot) {
+    const cleanRoot = workspaceRoot.replace(/\/$/, "");
+    if (cleanRoot) {
+      res = res.split(`${cleanRoot}/`).join("").split(cleanRoot).join(".");
+    }
+  }
+  return res.replace(/^\s*cd\s+(?:"\."|'\.'|\.)\s*(?:&&|;)\s*/, "");
 }
 
 export function buildDefaultSystemPrompt(workspaceRoot: string): string {
@@ -22,14 +26,15 @@ export function buildDefaultSystemPrompt(workspaceRoot: string): string {
     `你是一个运行在本地代码库中的专业编程智能体。`,
     `- 当前工作区根目录 (workspaceRoot): ${workspaceRoot} (操作系统: ${process.platform})`,
     `- 工具使用纪律（必须严格遵守）：`,
-    `  1. 查看目录必须优先调用 list_dir，读取文件必须优先调用 read_file，搜索代码必须优先调用 grep；严禁在可用内置只读工具时调用 run_bash 执行 cat/find/grep/ls，也严禁盲猜 /home/user 等路径。`,
+    `  1. 查看目录与文件行数分布必须直接调用 list_dir（已自带 2 层目录树、每个代码文件的行数及忽略目录提示），读取文件内容调用 read_file，搜索代码调用 grep；严禁在可用内置只读工具时调用 run_bash 执行 cat/find/grep/ls/wc。`,
     `  2. 调用工具时 path 参数请直接传相对于工作区根目录的简短相对路径（如 "."、"README.md"、"src/index.ts"），不要重复拼接长绝对路径。`,
-    `  3. 仅在需要统计行数 (wc -l)、运行测试、构建或执行 Git 命令时才调用 run_bash。`,
+    `  3. run_bash 默认已在工作区根目录 (${workspaceRoot}) 下启动，严禁在命令开头拼接 cd "${workspaceRoot}" &&。`,
     `  4. 回答请基于真实读取到的文件内容，直接给出清晰结论，简明扼要。`,
   ].join("\n");
 }
 
-export function isReadonlyBashCommand(cmd: string): boolean {
+export function isReadonlyBashCommand(cmd: string, explicitReadonly?: boolean): boolean {
+  if (explicitReadonly === false) return false;
   const raw = cmd.trim();
   if (!raw || /`|\$\(|[\n\r]/.test(raw)) return false;
   if (/\bsed\b/.test(raw) && /\/[gIimM]*[ew](?:\s|$|['";])/.test(raw)) return false;
@@ -51,11 +56,18 @@ export function isReadonlyBashCommand(cmd: string): boolean {
   }
   const segments = cleaned.split(/\s*(?:\|\||&&|;|\|)\s*/);
   return segments.every((seg) => {
-    const s = seg.trim();
-    if (!s || /(^|\s)&(\s|$)/.test(s)) return false;
-    if (/^(?:sort|tree)\b/.test(s) && /(?:^|\s)-o\b/.test(s)) return false;
-    if (/^sed\b/.test(s) && /(?:^|\s)-[a-zA-Z]*[if]/.test(s)) return false;
-    return SAFE_CMD_PREFIX.test(s);
+    const core = seg.trim().replace(/^(?:(?:cd\s+\S+|env|command|nice|time|nohup|xargs)\s+)*/, "");
+    if (!core || /(^|\s)&(\s|$)/.test(core) || /^(?:\.\.?\/|\/|~\/)/.test(core)) return false;
+    if (/^(?:sort|tree)\b/.test(core) && /(?:^|\s)-o\b/.test(core)) return false;
+    if (/^sed\b/.test(core) && /(?:^|\s)-[a-zA-Z]*[if]/.test(core)) return false;
+    if (WRITE_VERBS_RE.test(core) || GIT_WRITE_SUBCMD_RE.test(core)) return false;
+    if (
+      /^(?:node|nodejs|deno|tsx|ts-node|python3?|ruby|perl|php|lua|sh|bash|zsh|fish|dash|ksh)\b/.test(core) &&
+      !/^(?:node|python3?)\s+(?:-v|--version|-V)\s*$/.test(core)
+    ) {
+      return false;
+    }
+    return true;
   });
 }
 
@@ -86,7 +98,7 @@ function describeSingleToolCall(
   }
   if (call.name === "run_bash") {
     const rawCmd = String(args.command ?? "").trim();
-    const isRo = isReadonlyBashCommand(rawCmd);
+    const isRo = isReadonlyBashCommand(rawCmd, args.readonly as boolean | undefined);
     const displayCmd = shortenWorkspaceText(rawCmd, workspaceRoot);
     const shortCmd = displayCmd.length > 76 ? `${displayCmd.slice(0, 73)}...` : displayCmd;
     return { isWrite: !isRo, text: `${isRo ? "📊 统计/查询命令" : "💻 运行终端命令"}: ${shortCmd}` };

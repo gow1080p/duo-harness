@@ -51,7 +51,12 @@ function syncNewMessagesToDisk(sessionFile: string | undefined, recordedEntries:
 function filterCallsNeedingApproval(calls: readonly ToolCall[], readonlyMap: Map<string, boolean>): ToolCall[] {
   return calls.filter((c) => {
     if (readonlyMap.get(c.name) !== false) return false;
-    if (c.name === "run_bash" && isReadonlyBashCommand(String(c.arguments?.command ?? ""))) return false;
+    if (
+      c.name === "run_bash" &&
+      isReadonlyBashCommand(String(c.arguments?.command ?? ""), c.arguments?.readonly as boolean | undefined)
+    ) {
+      return false;
+    }
     return true;
   });
 }

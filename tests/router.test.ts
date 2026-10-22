@@ -5,7 +5,7 @@ import {
   toOpenAiMessages,
   zodObjectToJsonSchema,
 } from "../src/adapters/router.js";
-import { assembleSsePayloads } from "../src/adapters/sse-stream.js";
+import { assembleSsePayloads, createStreamRenderer, formatMarkdownLine } from "../src/adapters/sse-stream.js";
 import { z } from "zod";
 
 describe("Step 1.4: src/adapters/router.ts 协议转换与分时路由测试", () => {
@@ -99,5 +99,18 @@ describe("Step 1.4: src/adapters/router.ts 协议转换与分时路由测试", (
     expect(sseAssembled.toolCalls).toEqual([
       { id: "call_1", name: "read_file", arguments: { path: "AGENTS.md" } },
     ]);
+
+    // 5. 验证流式思考 (reasoning) 与行级 ANSI Markdown 渲染器
+    const chunks: string[] = [];
+    const renderer = createStreamRenderer({ write: (s) => chunks.push(s), columns: 100 });
+    renderer.onReasoning("Let me think\nabout this");
+    renderer.onContent("## 标题\n- **重点**: `main.py`\n```py\napp()\n```\n");
+    renderer.flush();
+    const out = chunks.join("");
+    expect(out).toContain("💭 \x1b[2m\x1b[3mLet me think about this");
+    expect(out).toContain("▍ 标题");
+    expect(out).toContain("\x1b[1;97m重点\x1b[0m");
+    expect(out).toContain("\x1b[36mmain.py\x1b[0m");
+    expect(formatMarkdownLine("### 1. `.gitignore` 问题", false).text).toContain("▍ 1.");
   });
 });

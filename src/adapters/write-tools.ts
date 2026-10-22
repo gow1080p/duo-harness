@@ -5,6 +5,10 @@ import * as path from "node:path";
 import { z } from "zod";
 import type { ToolContract } from "../core/contracts.js";
 import { resolveSafePath } from "./tools.js";
+import { isReadonlyBashCommand } from "./ui-logger.js";
+
+const SEATBELT_READONLY_PROFILE =
+  '(version 1)(allow default)(deny file-write*)(allow file-write* (literal "/dev/null") (literal "/private/dev/null") (subpath "/dev/fd"))';
 
 const SingleEditItemSchema = z.object({
   oldText: z.string(),
@@ -21,6 +25,7 @@ const EditFileArgsSchema = z.object({
 const RunBashArgsSchema = z.object({
   command: z.string().min(1),
   timeoutMs: z.number().int().positive().max(30_000).optional(),
+  readonly: z.boolean().optional(),
 });
 
 const RollbackVersionArgsSchema = z.object({
@@ -84,10 +89,14 @@ export function runCommandInSandbox(
   cwd: string,
   timeoutMs = 10_000,
   signal?: AbortSignal,
+  readonly = false,
 ): Promise<{ exitCode: number; output: string }> {
   return new Promise((resolve) => {
     const shellBin = fsSync.existsSync("/bin/zsh") ? "/bin/zsh" : "/bin/sh";
-    const child = spawn(shellBin, ["-c", command], {
+    const useSeatbelt = readonly && process.platform === "darwin" && fsSync.existsSync("/usr/bin/sandbox-exec");
+    const spawnBin = useSeatbelt ? "/usr/bin/sandbox-exec" : shellBin;
+    const spawnArgs = useSeatbelt ? ["-p", SEATBELT_READONLY_PROFILE, shellBin, "-c", command] : ["-c", command];
+    const child = spawn(spawnBin, spawnArgs, {
       cwd,
       detached: true,
       stdio: ["ignore", "pipe", "pipe"],
@@ -213,11 +222,12 @@ export function createWriteTools(
 
   const runBashTool: ToolContract<z.infer<typeof RunBashArgsSchema>> = {
     name: "run_bash",
-    description: "在工作区目录下执行终端命令并返回输出",
+    description: "在工作区根目录下执行终端命令并返回输出（默认已在工作区启动，请勿前置拼接 cd）",
     parameters: RunBashArgsSchema,
     readonly: false,
     async execute(args) {
-      const res = await runCommandInSandbox(args.command, workspaceRoot, args.timeoutMs ?? 10_000, signal);
+      const isRo = isReadonlyBashCommand(args.command, args.readonly);
+      const res = await runCommandInSandbox(args.command, workspaceRoot, args.timeoutMs ?? 10_000, signal, isRo);
       if (res.exitCode !== 0) throw new Error(`命令退出码 ${res.exitCode}:\n${res.output}`);
       return res.output;
     },
