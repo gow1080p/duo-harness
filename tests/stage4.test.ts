@@ -61,6 +61,15 @@ describe("Stage 4: KV 前缀缓存保护压缩器 (compactor.ts) 与标准 MCP �
     });
     expect(noSystemCompacted[0]?.role).toBe("user");
     expect(() => assertSessionInvariant(noSystemCompacted)).not.toThrow();
+
+    // 5) 默认高水位阈值下：16_000 ~ 100_000 字符的中大型多文件上下文 100% 不折叠（防同轮失忆重读）
+    const mediumHistory: Message[] = [
+      ...history,
+      { role: "user", content: "继续细读整个项目" },
+      { role: "assistant", content: "", toolCalls: [{ id: "call_cur_1", name: "read_file", arguments: { path: "d.ts" } }] },
+      { role: "tool", toolCallId: "call_cur_1", name: "read_file", content: "B".repeat(20_000), isError: false },
+    ];
+    expect(compactMessages(mediumHistory)).toEqual(mediumHistory);
   });
 
   it("2. 标准 stdio MCP 客户端支持握手、列出外部工具、处理分片 JSON-RPC 并接入 Agent Loop 执行", async () => {

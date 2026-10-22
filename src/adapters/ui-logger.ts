@@ -29,7 +29,7 @@ export function buildDefaultSystemPrompt(workspaceRoot: string): string {
     `  1. 查看目录与文件行数分布必须直接调用 list_dir（已自带 2 层目录树、每个代码文件的行数及忽略目录提示），读取文件内容调用 read_file，搜索代码调用 grep；严禁在可用内置只读工具时调用 run_bash 执行 cat/find/grep/ls/wc。`,
     `  2. 调用工具时 path 参数请直接传相对于工作区根目录的简短相对路径（如 "."、"README.md"、"src/index.ts"），不要重复拼接长绝对路径。`,
     `  3. run_bash 默认已在工作区根目录 (${workspaceRoot}) 下启动，严禁在命令开头拼接 cd "${workspaceRoot}" &&。`,
-    `  4. 回答请基于真实读取到的文件内容，直接给出清晰结论，简明扼要。`,
+    `  4. 思考过程（reasoning）请统一使用简明中文，调工具取证阶段思考控制在 150 字以内，聚焦下一步动作，不要长篇英文独白；最终回答请基于真实读取到的文件内容，直接给出清晰结论。`,
   ].join("\n");
 }
 

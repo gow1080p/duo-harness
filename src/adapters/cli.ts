@@ -145,9 +145,10 @@ function initSessionContext(userPrompt: string, workspaceRoot: string, options: 
   const wasHealed =
     existingEntries.length > 0 &&
     (priorMessages.length !== rawPrior.length || priorMessages.some((m, i) => m !== rawPrior[i]));
+  if (priorMessages[0]?.role === "system") priorMessages[0] = { role: "system", content: systemPrompt };
   const recordedEntries: SessionEntry[] = wasHealed
     ? buildSessionEntries([], priorMessages, Date.now(), null)
-    : [...existingEntries];
+    : existingEntries.map((e) => (e.parentId === null && e.message.role === "system" ? { ...e, message: { role: "system", content: systemPrompt } } : e));
   if (wasHealed && options.sessionFile) appendJsonlEntries(options.sessionFile, recordedEntries, true);
   const cursor: SessionCursor = {
     persistedCount: existingEntries.length > 0 && options.leafId ? priorMessages.length : 0,

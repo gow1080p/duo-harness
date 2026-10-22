@@ -48,8 +48,8 @@ export function compactMessages(
   messages: readonly Message[],
   options: CompactorOptions = {},
 ): Message[] {
-  const maxTotalChars = options.maxTotalChars ?? 16_000;
-  const keepRecentMessages = options.keepRecentMessages ?? 4;
+  const maxTotalChars = options.maxTotalChars ?? 128_000;
+  const keepRecentMessages = options.keepRecentMessages ?? 16;
   const maxToolOutputChars = options.maxToolOutputChars ?? 200;
 
   if (estimateMessagesChars(messages) <= maxTotalChars) {
@@ -57,7 +57,12 @@ export function compactMessages(
   }
 
   const headCount = messages[0]?.role === "system" && messages[1]?.role === "user" ? 2 : 1;
-  const cutoffIndex = Math.max(headCount, messages.length - keepRecentMessages);
+  const lastUserIdx = messages.map((m) => m.role).lastIndexOf("user");
+  const baseCutoff = Math.max(headCount, messages.length - keepRecentMessages);
+  const cutoffIndex =
+    options.maxTotalChars === undefined && lastUserIdx > headCount
+      ? Math.min(baseCutoff, lastUserIdx)
+      : baseCutoff;
   const folded: Message[] = [...messages];
   let currentChars = estimateMessagesChars(folded);
 

@@ -122,6 +122,20 @@ function getVisualCols(s: string): number {
   return w;
 }
 
+function sliceTailByVisualCols(text: string, maxCols: number): string {
+  const chars = Array.from(text.trim());
+  let tail = "";
+  let cols = 0;
+  for (let i = chars.length - 1; i >= 0; i--) {
+    const ch = chars[i]!;
+    const w = (ch.codePointAt(0) ?? 0) > 0xff ? 2 : 1;
+    if (cols + w > maxCols) break;
+    tail = ch + tail;
+    cols += w;
+  }
+  return tail.length < chars.length ? `...${tail}` : tail;
+}
+
 function formatInlineMarkdown(line: string): string {
   return line.replace(/`([^`]+)`/g, "\x1b[36m$1\x1b[0m").replace(/\*\*([^*]+)\*\*/g, "\x1b[1;97m$1\x1b[0m");
 }
@@ -134,19 +148,36 @@ export function formatMarkdownLine(rawLine: string, inCodeBlock: boolean): { tex
       : { text: `\x1b[90m  ╭── ${fenceMatch[1] || "code"} ────────────────\x1b[0m`, nextInCodeBlock: true };
   }
   if (inCodeBlock) return { text: `\x1b[90m  │ \x1b[0m\x1b[32m${rawLine}\x1b[0m`, nextInCodeBlock: true };
+  if (/^\s*(?:---+|\*\*\*+)\s*$/.test(rawLine)) {
+    return { text: "\x1b[90m  ────────────────────────────────────────\x1b[0m", nextInCodeBlock: false };
+  }
   const headingMatch = rawLine.match(/^(#{1,6})\s+(.*)$/);
-  if (headingMatch) return { text: `\x1b[1;36m▍ ${formatInlineMarkdown(headingMatch[2]!)}\x1b[0m`, nextInCodeBlock: false };
+  if (headingMatch) {
+    const isTop = headingMatch[1]!.length <= 2;
+    const body = formatInlineMarkdown(headingMatch[2]!);
+    return { text: isTop ? `\x1b[1;36m▍ ${body}\x1b[0m` : `\x1b[1;97m• ${body}\x1b[0m`, nextInCodeBlock: false };
+  }
   const bulletMatch = rawLine.match(/^(\s*)[-*]\s+(.*)$/);
   if (bulletMatch) return { text: `${bulletMatch[1]!}\x1b[36m•\x1b[0m ${formatInlineMarkdown(bulletMatch[2]!)}`, nextInCodeBlock: false };
+  const numMatch = rawLine.match(/^(\s*)(\d+\.)\s+(.*)$/);
+  if (numMatch) return { text: `${numMatch[1]!}\x1b[36m${numMatch[2]!}\x1b[0m ${formatInlineMarkdown(numMatch[3]!)}`, nextInCodeBlock: false };
   return { text: formatInlineMarkdown(rawLine), nextInCodeBlock: false };
 }
 
 export function createStreamRenderer(stream: { write: (s: string) => unknown; columns?: number } = process.stdout) {
   let inReasoning = false;
+  let reasoningBuf = "";
   let hasStartedContent = false;
   let inCodeBlock = false;
   let currentLine = "";
   let linePrefix = "";
+
+  const finishReasoning = () => {
+    if (!inReasoning) return;
+    stream.write(`\r\x1b[K\x1b[2m💭 思考完成 (${reasoningBuf.length} 字)\x1b[0m\n`);
+    inReasoning = false;
+    reasoningBuf = "";
+  };
 
   const commitCurrentLine = (withNewline: boolean) => {
     const { text: formatted, nextInCodeBlock } = formatMarkdownLine(currentLine, inCodeBlock);
@@ -164,16 +195,16 @@ export function createStreamRenderer(stream: { write: (s: string) => unknown; co
   return {
     onReasoning(chunk: string) {
       if (!inReasoning) {
-        stream.write("\n💭 \x1b[2m\x1b[3m");
+        stream.write("\n");
         inReasoning = true;
       }
-      stream.write(chunk.replace(/\r?\n+/g, " "));
+      reasoningBuf += chunk.replace(/\s+/g, " ");
+      const prefix = `💭 [思考中 · ${reasoningBuf.length}字] `;
+      const maxTailCols = Math.max(12, (stream.columns ?? 80) - getVisualCols(prefix) - 6);
+      stream.write(`\r\x1b[K\x1b[2m\x1b[3m${prefix}${sliceTailByVisualCols(reasoningBuf, maxTailCols)}\x1b[0m`);
     },
     onContent(chunk: string) {
-      if (inReasoning) {
-        stream.write("\x1b[0m\n");
-        inReasoning = false;
-      }
+      finishReasoning();
       if (!hasStartedContent) {
         linePrefix = "💬 ";
         stream.write(`\n${linePrefix}`);
@@ -181,42 +212,29 @@ export function createStreamRenderer(stream: { write: (s: string) => unknown; co
       }
       const parts = chunk.split("\n");
       for (let i = 0; i < parts.length; i++) {
-        const part = parts[i]!;
-        if (part) {
-          stream.write(part);
-          currentLine += part;
+        if (parts[i]) {
+          stream.write(parts[i]!);
+          currentLine += parts[i]!;
         }
         if (i < parts.length - 1) commitCurrentLine(true);
       }
     },
     flush() {
-      if (inReasoning) {
-        stream.write("\x1b[0m\n");
-        inReasoning = false;
-      }
+      finishReasoning();
       if (currentLine.length > 0) commitCurrentLine(false);
       if (hasStartedContent) stream.write("\x1b[0m\n");
     },
   };
 }
 
-/**
- * 3. 将每次请求体、SSE 原始碎片流和拼接结果写入 .sessions/http-wire.json 供编辑器直观查看
- */
-export function recordHttpWireLog(
-  entry: HttpWireLogEntry,
-  wireFilePath = ".sessions/http-wire.json",
-  resetFile = false,
-): void {
+export function recordHttpWireLog(entry: HttpWireLogEntry, wireFilePath = ".sessions/http-wire.json", resetFile = false): void {
   fs.mkdirSync(path.dirname(wireFilePath), { recursive: true });
   let existing: HttpWireLogEntry[] = [];
   if (!resetFile && fs.existsSync(wireFilePath)) {
     try {
-      existing = JSON.parse(fs.readFileSync(wireFilePath, "utf-8"));
-      if (!Array.isArray(existing)) existing = [];
-    } catch {
-      existing = [];
-    }
+      const parsed = JSON.parse(fs.readFileSync(wireFilePath, "utf-8"));
+      if (Array.isArray(parsed)) existing = parsed;
+    } catch {}
   }
   existing.push(entry);
   fs.writeFileSync(wireFilePath, JSON.stringify(existing, null, 2), "utf-8");
