@@ -30,7 +30,7 @@ interface ReplRuntimeState {
 function formatPrompt(workspaceRoot: string): string {
   const name = path.basename(workspaceRoot) || "root";
   const short = name.length > 18 ? `${name.slice(0, 15)}...` : name;
-  return `\n📂 ${short} > `;
+  return `📂 ${short} > `;
 }
 
 function resolveTargetWorkspace(targetArg: string, state: ReplRuntimeState): string | null {
@@ -187,6 +187,7 @@ export async function startInteractiveRepl(options: {
       state.inMainPrompt = true;
       let line = "";
       try {
+        process.stdout.write("\n");
         line = (await rl.question(formatPrompt(state.paths.workspaceRoot))).trim();
       } catch (err) {
         if (err instanceof Error && (err.name === "AbortError" || err.message.includes("Ctrl+C"))) {

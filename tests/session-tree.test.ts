@@ -158,6 +158,16 @@ describe("Stage 2: .jsonl 会话树与断网录像回放测试", () => {
     expect(foundA?.entryCount).toBe(5);
     expect(foundA?.lastLeafId).toBe("msg_5");
 
+    // 验证 node:readline/promises 下 Symbol(_ttyWrite) 与下拉项目切换列表正常生效
+    const readline = await import("node:readline/promises");
+    const { findMethodKey, buildDropdownItems } = await import("../src/adapters/dropdown.js");
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    expect(findMethodKey(rl, "_ttyWrite")).not.toBeNull();
+    expect(findMethodKey(rl, "_refreshLine")).not.toBeNull();
+    rl.close();
+    const cdItems = buildDropdownItems("/cd ", pathsA.workspaceRoot, tmpBase);
+    expect(cdItems[0]?.fillText).toBe("/cd app-beta");
+
     fs.rmSync(tmpBase, { recursive: true, force: true });
   });
 
