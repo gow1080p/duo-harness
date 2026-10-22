@@ -131,22 +131,23 @@ function printCostIfEnabled(options: RunSessionOptions, wireLogFile: string, isR
 }
 
 function initSessionContext(userPrompt: string, workspaceRoot: string, options: RunSessionOptions) {
-  const systemPrompt = options.systemPrompt ?? buildDefaultSystemPrompt(workspaceRoot);
   let existingEntries: SessionEntry[] = [];
   if (options.leafId && options.sessionFile) {
     try {
       existingEntries = loadJsonlEntries(options.sessionFile);
     } catch {}
   }
+  const rawPrior = existingEntries.length > 0 && options.leafId ? projectToMessages(existingEntries, options.leafId) : [];
+  const existingSystem = rawPrior[0]?.role === "system" ? rawPrior[0].content : undefined;
+  const systemPrompt = options.systemPrompt ?? existingSystem ?? buildDefaultSystemPrompt(workspaceRoot);
   const baseState = createInitialState({ systemPrompt, maxSteps: options.maxSteps ?? 20 });
-  const rawPrior = existingEntries.length > 0 && options.leafId ? projectToMessages(existingEntries, options.leafId) : baseState.messages;
-  const priorMessages = repairDanglingToolCalls(rawPrior);
+  const priorMessages = repairDanglingToolCalls(rawPrior.length > 0 ? rawPrior : baseState.messages);
   while (priorMessages.length > 0 && priorMessages[priorMessages.length - 1]!.role === "user") priorMessages.pop();
   const wasHealed = existingEntries.length > 0 && (priorMessages.length !== rawPrior.length || priorMessages.some((m, i) => m !== rawPrior[i]));
-  if (priorMessages[0]?.role === "system") priorMessages[0] = { role: "system", content: systemPrompt };
+  if (options.systemPrompt && priorMessages[0]?.role === "system") priorMessages[0] = { role: "system", content: systemPrompt };
   const recordedEntries: SessionEntry[] = wasHealed
     ? buildSessionEntries([], priorMessages, Date.now(), null)
-    : existingEntries.map((e) => (e.parentId === null && e.message.role === "system" ? { ...e, message: { role: "system", content: systemPrompt } } : e));
+    : existingEntries;
   if (wasHealed && options.sessionFile) appendJsonlEntries(options.sessionFile, recordedEntries, true);
   const cursor: SessionCursor = {
     persistedCount: existingEntries.length > 0 && options.leafId ? priorMessages.length : 0,

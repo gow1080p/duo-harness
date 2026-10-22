@@ -60,8 +60,13 @@ export function extractUsageFromSseLines(
       const cacheHitTokens = Math.min(promptTokens, Math.max(0, rawHit));
       const completionTokens = Math.max(0, Number(u.completion_tokens ?? 0));
       const rawReasoning = Number(u.completion_tokens_details?.reasoning_tokens ?? u.reasoning_tokens ?? 0);
+      const respModel = String(parsed.model || fallbackModel);
+      const displayModel =
+        fallbackModel && fallbackModel !== "unknown" && respModel !== fallbackModel
+          ? `${fallbackModel} (${respModel})`
+          : respModel;
       return {
-        model: String(parsed.model || fallbackModel),
+        model: displayModel,
         promptTokens,
         cacheHitTokens,
         cacheMissTokens: Math.max(0, promptTokens - cacheHitTokens),

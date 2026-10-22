@@ -33,7 +33,11 @@ describe("Stage 5: 自主探路代码审查特工 (reviewer.ts)、RepoMap 与轻
     expect(round1[3]?.content).toContain("[已折叠历史工具输出");
     expect(round1[5]?.content).toBe("Y".repeat(400));
 
-    const nextHistory: Message[] = [...baseHistory, { role: "user", content: "继续追问" }, { role: "assistant", content: "补充回答" }];
+    const nextHistory: Message[] = [
+      ...baseHistory,
+      { role: "user", content: "继续追问" },
+      { role: "assistant", content: "Z".repeat(450) },
+    ];
     const round2 = compactMessages(nextHistory, opts);
     expect(round2.slice(0, 7)).toEqual(round1.slice(0, 7));
 
