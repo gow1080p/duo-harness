@@ -10,7 +10,7 @@
 [![Runtime Deps](https://img.shields.io/badge/Dependencies-1_(zod)-brightgreen)](#)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-**[🇬🇧 English](#english)** · **[🇨🇳 简体中文](#简体中文)** ([独立中文文档](./README.zh-CN.md)) · **[🗺️ Architecture](./ARCH.md)** · **[🛣️ Roadmap](./ROADMAP.md)**
+**[🇬🇧 English](#english)** · **[🇨🇳 简体中文](#简体中文)** ([独立中文文档](./README.zh-CN.md)) · **[🗺️ Architecture](#architecture--module-budget)**
 
 </div>
 

@@ -8,3 +8,6 @@ references/
 .sessions/ask-latest.jsonl
 .sessions/wire-*.json
 .sessions/xray-report.md
+/AGENTS.md
+/ROADMAP.md
+/ARCH.md

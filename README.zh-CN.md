@@ -5,7 +5,7 @@
 **零宿主绑定的轻量级 TypeScript Coding Agent 运行时与跨项目交互式 CLI**  
 *470 行纯函数内核 (Functional Core) + 可插拔 I/O 外壳 (Imperative Shell) · `.jsonl` 分支会话树 · 0ms 离线回放 · KV 前缀缓存锁 · MCP 客户端*
 
-**[🇬🇧 English](./README.md)** · **[🇨🇳 简体中文](./README.zh-CN.md)** · **[🗺️ 架构图 (ARCH.md)](./ARCH.md)** · **[🛣️ 路线图 (ROADMAP.md)](./ROADMAP.md)**
+**[🇬🇧 English](./README.md)** · **[🇨🇳 简体中文](./README.zh-CN.md)** · **[🗺️ 架构与模块预算](#架构与模块体积预算)**
 
 </div>
 
