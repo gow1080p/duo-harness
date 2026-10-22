@@ -133,8 +133,8 @@ export function parseOpenAiAssistantMessage(rawMsg: Record<string, any>): Assist
     role: "assistant",
     content: rawMsg.content ?? "",
     ...(toolCalls.length > 0 ? { toolCalls } : {}),
-    ...(typeof rawMsg.reasoning_content === "string"
-      ? { reasoningContent: rawMsg.reasoning_content }
+    ...(typeof (rawMsg.reasoning_content ?? rawMsg.reasoning) === "string"
+      ? { reasoningContent: rawMsg.reasoning_content ?? rawMsg.reasoning }
       : {}),
   });
 }

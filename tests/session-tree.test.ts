@@ -167,6 +167,10 @@ describe("Stage 2: .jsonl 会话树与断网录像回放测试", () => {
     rl.close();
     const cdItems = buildDropdownItems("/cd ", pathsA.workspaceRoot, tmpBase);
     expect(cdItems[0]?.fillText).toBe("/cd app-beta");
+    const resumeItems = buildDropdownItems("/resume ", pathsA.workspaceRoot, tmpBase, turn2.leafId);
+    expect(resumeItems[0]?.fillText).toBe("/resume #2");
+    expect(resumeItems[0]?.desc).toContain("●当前续接");
+    expect(resumeItems[resumeItems.length - 1]?.fillText).toBe("/new");
 
     fs.rmSync(tmpBase, { recursive: true, force: true });
   });

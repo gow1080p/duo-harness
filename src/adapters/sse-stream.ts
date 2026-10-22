@@ -37,9 +37,10 @@ export function assembleSsePayloads(dataPayloads: readonly string[]): AssistantM
     }
     const delta = parsed.choices?.[0]?.delta;
     if (!delta) continue;
-    if (typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0) {
+    const rChunk = typeof delta.reasoning_content === "string" ? delta.reasoning_content : delta.reasoning;
+    if (typeof rChunk === "string" && rChunk.length > 0) {
       hasReasoning = true;
-      reasoning += delta.reasoning_content;
+      reasoning += rChunk;
     }
     if (typeof delta.content === "string" && delta.content.length > 0) content += delta.content;
     if (Array.isArray(delta.tool_calls)) {

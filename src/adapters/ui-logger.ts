@@ -39,9 +39,8 @@ export function isReadonlyBashCommand(cmd: string, explicitReadonly?: boolean): 
   const raw = cmd.trim();
   if (!raw || /`|\$\(|[\n\r]/.test(raw)) return false;
   if (/\bsed\b/.test(raw) && /\/[gIimM]*[ew](?:\s|$|['";])/.test(raw)) return false;
-  const maskedQuotes = raw
-    .replace(/'[^']*'/g, '"__STR__"')
-    .replace(/"(?:[^"\\]|\\.)*"/g, '"__STR__"');
+  const maskedQuotes = raw.replace(/(?:'[^']*'|"(?:[^"\\]|\\.)*")/g, '"__STR__"');
+  if (/['"]/.test(maskedQuotes.replace(/"__STR__"/g, ""))) return false;
   const cleaned = maskedQuotes
     .replace(/\b2>\s*\/dev\/null\b/g, "")
     .replace(/<\s*\/dev\/null\b/g, "")
@@ -57,7 +56,7 @@ export function isReadonlyBashCommand(cmd: string, explicitReadonly?: boolean): 
   }
   const segments = cleaned.split(/\s*(?:\|\||&&|;|\|)\s*/);
   return segments.every((seg) => {
-    const core = seg.trim().replace(/^(?:(?:cd\s+\S+|env|command|nice|time|nohup|xargs)\s+)*/, "");
+    const core = seg.trim().replace(/^(?:(?:[A-Za-z_]\w*=\S+|cd\s+\S+|(?:env|command|nice|time|nohup|xargs)(?:\s+-\S+)*)\s+)*/, "");
     if (!core || /(^|\s)&(\s|$)/.test(core) || /^(?:\.\.?\/|\/|~\/)/.test(core)) return false;
     if (/^(?:sort|tree)\b/.test(core) && /(?:^|\s)-o\b/.test(core)) return false;
     if (/^sed\b/.test(core) && /(?:^|\s)-[a-zA-Z]*[if]/.test(core)) return false;

@@ -109,8 +109,10 @@ async function runGrepSearch(
   const ctx = args.contextLines ?? 0;
   const matches: string[] = [];
   for (const file of files) {
+    const stat = await fs.stat(file).catch(() => null);
+    if (!stat || !stat.isFile() || stat.size > 512_000) continue;
     const raw = await fs.readFile(file, "utf-8").catch(() => "");
-    if (!raw || raw.length > 512_000 || raw.includes("\u0000")) continue;
+    if (!raw || raw.includes("\u0000")) continue;
     const lines = raw.split("\n");
     const rel = path.relative(realRoot, file);
     lines.forEach((line, idx) => {

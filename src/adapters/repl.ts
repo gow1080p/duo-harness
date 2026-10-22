@@ -6,7 +6,7 @@ import type { LlmProvider, ToolCall } from "../core/contracts.js";
 import { runAgentSession } from "./cli.js";
 import { loadAndFormatWireCost, padCols } from "./cost-tracker.js";
 import { attachLiveSlashDropdown, getPromptVisualCols } from "./dropdown.js";
-import { createReplCompleter, formatRecentHistoryRecap, formatSnapshotsDiff, listManagedProjects, loadProjectSnapshots, type ManagedProjectSummary, type ProjectSessionPaths, resolveProjectSessionPaths, resolveTargetWorkspace, saveProjectSnapshots, SLASH_COMMANDS } from "./project-store.js";
+import { createReplCompleter, extractConversationTurns, formatRecentHistoryRecap, formatSnapshotsDiff, listManagedProjects, loadProjectSnapshots, type ManagedProjectSummary, type ProjectSessionPaths, resolveProjectSessionPaths, resolveTargetWorkspace, saveProjectSnapshots, SLASH_COMMANDS } from "./project-store.js";
 import { createRouterProvider, resolveRouteTier } from "./router.js";
 import { loadJsonlEntries } from "./store.js";
 import { formatApprovalBox } from "./ui-logger.js";
@@ -26,10 +26,15 @@ interface ReplRuntimeState {
   customProvider?: LlmProvider;
 }
 
-function formatPrompt(workspaceRoot: string): string {
-  const name = path.basename(workspaceRoot) || "root";
+function formatPrompt(state: ReplRuntimeState): string {
+  const name = path.basename(state.paths.workspaceRoot) || "root";
   const short = name.length > 18 ? `${name.slice(0, 15)}...` : name;
-  return `📂 ${short} > `;
+  const entries = fs.existsSync(state.paths.sessionFile) ? loadJsonlEntries(state.paths.sessionFile) : [];
+  const rootId = entries[0]?.id ?? null;
+  if (!state.leafId || state.leafId === rootId || entries.length <= 1) return `📂 ${short} [新对话] > `;
+  const turns = extractConversationTurns(entries, state.leafId);
+  const cur = turns.find((t) => t.isCurrentLeaf) ?? turns[turns.length - 1];
+  return `📂 ${short} [${cur ? `续#${cur.turnIndex}` : "续聊"}] > `;
 }
 
 function switchProjectWorkspace(targetArg: string, state: ReplRuntimeState): void {
@@ -49,7 +54,7 @@ function switchProjectWorkspace(targetArg: string, state: ReplRuntimeState): voi
   state.provider = state.customProvider ?? createRouterProvider(state.paths.wireLogFile, existing.length > 0);
   state.snapshots = loadProjectSnapshots(state.paths.snapshotsFile);
   console.log(`✅ 已切换到 [${path.basename(realCandidate)}] (${state.paths.workspaceRoot} · 历史记录 ${existing.length} 条)`);
-  const recap = formatRecentHistoryRecap(existing, 2);
+  const recap = formatRecentHistoryRecap(existing, 1, state.leafId);
   if (recap) console.log(recap);
 }
 
@@ -60,71 +65,61 @@ function handleSlashCommand(rawCmd: string, state: ReplRuntimeState): Promise<bo
     for (const m of SLASH_COMMANDS) console.log(`  ${padCols(m.label, 14)} - ${m.desc}`);
     return true;
   }
-  const exactOrUnique = !rawCmd.includes(" ")
-    ? SLASH_COMMANDS.filter((c) => c.cmd.trim().startsWith(rawCmd))
-    : [];
+  const exactOrUnique = !rawCmd.includes(" ") ? SLASH_COMMANDS.filter((c) => c.cmd.trim().startsWith(rawCmd)) : [];
   const cmd = exactOrUnique.length === 1 ? exactOrUnique[0]!.cmd.trim() : rawCmd;
+  const loadEntries = () => (fs.existsSync(paths.sessionFile) ? loadJsonlEntries(paths.sessionFile) : []);
 
-  if (cmd.startsWith("/cd ")) {
-    switchProjectWorkspace(cmd.slice("/cd ".length).trim(), state);
-    return true;
-  }
+  if (cmd.startsWith("/cd ")) { switchProjectWorkspace(cmd.slice("/cd ".length).trim(), state); return true; }
   if (cmd === "/xray" || cmd === "/tree") {
     const costText = loadAndFormatWireCost(paths.wireLogFile);
     if (costText) console.log(costText);
     console.log(formatXrayReport(analyzeSessionXray(paths.sessionFile, paths.wireLogFile)));
     return true;
   }
-  if (cmd.startsWith("/branch ")) {
-    const targetId = cmd.slice("/branch ".length).trim();
-    const entries = fs.existsSync(paths.sessionFile) ? loadJsonlEntries(paths.sessionFile) : [];
-    if (!entries.some((e) => e.id === targetId)) {
-      console.log(`⚠️ 未找到节点 ${targetId}，可先输入 /tree 查看现有节点 ID。`);
+  if (cmd.startsWith("/branch ") || cmd.startsWith("/resume ") || cmd === "/resume" || cmd === "/history") {
+    const rawTarget = cmd === "/history" ? "" : cmd.replace(/^\/(?:branch|resume)\s*/, "").trim();
+    const entries = loadEntries();
+    if (!rawTarget) {
+      console.log(formatRecentHistoryRecap(entries, 12, state.leafId) || "ℹ️ 当前项目暂无历史对话记录。");
       return true;
     }
-    state.leafId = targetId;
-    console.log(`🌿 已将当前对话节点切回 ${targetId}，你的下一句提问将从该节点分叉！`);
+    const turns = extractConversationTurns(entries, state.leafId);
+    const byTurn = turns.find((t) => `#${t.turnIndex}` === rawTarget || String(t.turnIndex) === rawTarget);
+    const resolvedId = byTurn ? byTurn.leafEntryId : rawTarget;
+    if (!entries.some((e) => e.id === resolvedId)) {
+      console.log(`⚠️ 未找到轮次或节点 ${rawTarget}，可输入 /resume 用 ↑/↓ 方向键选择。`);
+      return true;
+    }
+    state.leafId = resolvedId;
+    console.log(formatRecentHistoryRecap(entries, 1, state.leafId));
     return true;
   }
-  if (cmd === "/history") {
-    const entries = fs.existsSync(paths.sessionFile) ? loadJsonlEntries(paths.sessionFile) : [];
-    console.log(formatRecentHistoryRecap(entries, 12) || "ℹ️ 当前项目暂无历史对话记录。");
-    return true;
-  }
-  if (cmd === "/diff") {
-    console.log(formatSnapshotsDiff(snapshots, paths.workspaceRoot));
-    return true;
-  }
+  if (cmd === "/diff") { console.log(formatSnapshotsDiff(snapshots, paths.workspaceRoot)); return true; }
   if (cmd === "/undo" || cmd.startsWith("/undo ")) {
     const arg = cmd.slice("/undo".length).trim();
     const stepsBack = arg === "all" ? snapshots.length : Math.max(1, Number(arg) || 1);
     return rollbackFileSnapshots(paths.workspaceRoot, snapshots, stepsBack).then((rb) => {
       saveProjectSnapshots(paths.snapshotsFile, snapshots);
-      console.log(
-        rb.rolledBackCount > 0
-          ? `🔄 已撤回 ${rb.rolledBackCount} 步修改 (剩余可撤回 ${rb.currentVersion} 步): ${[...new Set(rb.touchedPaths)].join(", ")}`
-          : "ℹ️ 当前没有可撤回的修改。",
-      );
+      console.log(rb.rolledBackCount > 0 ? `🔄 已撤回 ${rb.rolledBackCount} 步修改 (剩余可撤回 ${rb.currentVersion} 步): ${[...new Set(rb.touchedPaths)].join(", ")}` : "ℹ️ 当前没有可撤回的修改。");
       return true;
     });
   }
   if (cmd === "/projects" || cmd === "/cd") {
     const projects = listManagedProjects(path.dirname(paths.projectDir));
     console.log(`\n📁 [已管理项目列表 (共 ${projects.length} 个 · 敲 /cd 后可按 ↑/↓ 键直接选项目)]:`);
-    projects.forEach((p, i) => {
-      const name = path.basename(p.workspaceRoot);
-      const tag = p.workspaceRoot === paths.workspaceRoot ? " ●当前项目" : "";
-      console.log(`  [${i + 1}] ${padCols(name, 16)} (${p.entryCount} 条记录)${tag}  ${p.workspaceRoot}`);
-    });
+    projects.forEach((p, i) => console.log(`  [${i + 1}] ${padCols(path.basename(p.workspaceRoot), 16)} (${p.entryCount} 条记录)${p.workspaceRoot === paths.workspaceRoot ? " ●当前项目" : ""}  ${p.workspaceRoot}`));
     return true;
   }
-  if (cmd === "/clear" || cmd === "/new") {
-    for (const f of [paths.sessionFile, paths.wireLogFile, paths.snapshotsFile]) {
-      if (fs.existsSync(f)) fs.unlinkSync(f);
-    }
+  if (cmd === "/new") {
+    state.leafId = loadEntries()[0]?.id ?? null;
+    console.log("✨ 已开启全新对话（之前的历史对话已安全保留，随时可输入 /resume 用 ↑/↓ 方向键切回）。");
+    return true;
+  }
+  if (cmd === "/clear") {
+    for (const f of [paths.sessionFile, paths.wireLogFile, paths.snapshotsFile]) if (fs.existsSync(f)) fs.unlinkSync(f);
     state.leafId = null;
     state.snapshots = [];
-    console.log("🧹 已清空当前项目对话记录，下一句将开启全新会话。");
+    console.log("🧹 已彻底清空当前项目所有历史记录。");
     return true;
   }
   return false;
@@ -162,8 +157,8 @@ export async function startInteractiveRepl(options: { workspaceRoot?: string; ho
   };
   console.log(`\n🚀 Duo-Harness | 当前项目: ${path.basename(paths.workspaceRoot)} (${paths.workspaceRoot})`);
   console.log(`⚡ 模型路由: ${resolveRouteTier(Date.now()).reason}`);
-  console.log(`💡 输入 / 用 ↑/↓ 方向键选择命令或切换项目 | 历史记录: ${existing.length} 条 | 可撤回快照: ${state.snapshots.length} 个`);
-  const recap = formatRecentHistoryRecap(existing, 2);
+  console.log(`💡 输入 / 用 ↑/↓ 方向键选择命令或切换历史 (/resume 选轮次 | /new 新对话 | /diff 看修改 | /undo 撤回)`);
+  const recap = formatRecentHistoryRecap(existing, 1, state.leafId);
   if (recap) console.log(recap);
 
   const rl = readline.createInterface({
@@ -171,7 +166,7 @@ export async function startInteractiveRepl(options: { workspaceRoot?: string; ho
     output: process.stdout,
     completer: createReplCompleter(() => state.paths.workspaceRoot, () => state.paths.sessionFile),
   });
-  const detachDropdown = attachLiveSlashDropdown(rl, () => state.inMainPrompt, () => getPromptVisualCols(formatPrompt(state.paths.workspaceRoot)), () => state.paths.workspaceRoot, state.homeBaseDir);
+  const detachDropdown = attachLiveSlashDropdown(rl, () => state.inMainPrompt, () => getPromptVisualCols(formatPrompt(state)), () => state.paths.workspaceRoot, state.homeBaseDir, () => state.leafId);
   const askApproval = createApprovalHandler(rl, state);
 
   try {
@@ -180,7 +175,7 @@ export async function startInteractiveRepl(options: { workspaceRoot?: string; ho
       let line = "";
       try {
         process.stdout.write("\n");
-        line = (await rl.question(formatPrompt(state.paths.workspaceRoot))).trim();
+        line = (await rl.question(formatPrompt(state))).trim();
       } catch (err) {
         if (err instanceof Error && (err.name === "AbortError" || err.message.includes("Ctrl+C"))) {
           process.stdout.write("\r\n\x1b[J👋 已退出 Duo-Harness。\n");

@@ -1,6 +1,8 @@
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { padCols, truncateCols } from "./cost-tracker.js";
-import { listManagedProjects, SLASH_COMMANDS } from "./project-store.js";
+import { extractConversationTurns, listManagedProjects, resolveProjectSessionPaths, SLASH_COMMANDS } from "./project-store.js";
+import { loadJsonlEntries } from "./store.js";
 
 export interface DropdownItem {
   label: string;
@@ -22,7 +24,30 @@ export function buildDropdownItems(
   line: string,
   currentWorkspaceRoot: string,
   homeBaseDir?: string,
+  activeLeafId?: string | null,
 ): DropdownItem[] {
+  if (line.startsWith("/resume ") || line.startsWith("/branch ")) {
+    const filter = line.replace(/^\/(?:resume|branch)\s+/, "").trim().toLowerCase();
+    const sFile = resolveProjectSessionPaths(currentWorkspaceRoot, homeBaseDir).sessionFile;
+    const entries = fs.existsSync(sFile) ? loadJsonlEntries(sFile) : [];
+    const turns = extractConversationTurns(entries, activeLeafId).reverse();
+    const items: DropdownItem[] = turns
+      .filter((t) => !filter || `#${t.turnIndex}`.includes(filter) || t.userText.toLowerCase().includes(filter) || t.leafEntryId.includes(filter))
+      .slice(0, 7)
+      .map((t) => ({
+        label: `/resume #${t.turnIndex}`,
+        desc: `${t.isCurrentLeaf ? "[●当前续接] " : `[${t.toolSteps}步] `}👤 ${t.userText.slice(0, 22)} -> 🤖 ${(t.replyText || "未完成").slice(0, 26)}`,
+        fillText: `/resume #${t.turnIndex}`,
+        expandOnly: false,
+      }));
+    items.push({
+      label: "/new",
+      desc: "✨ 开启全新空白对话 (保留旧对话记录，随时可 /resume 切回)",
+      fillText: "/new",
+      expandOnly: false,
+    });
+    return items;
+  }
   if (line.startsWith("/cd ")) {
     const filter = line.slice(4).trim().toLowerCase();
     const projects = listManagedProjects(homeBaseDir);
@@ -53,7 +78,7 @@ export function buildDropdownItems(
       label: c.label,
       desc: c.desc,
       fillText: c.cmd === "/projects" ? "/cd " : c.cmd,
-      expandOnly: c.cmd === "/cd " || c.cmd === "/projects",
+      expandOnly: c.cmd === "/cd " || c.cmd === "/resume " || c.cmd === "/branch " || c.cmd === "/projects",
     }));
   }
   return [];
@@ -71,25 +96,35 @@ export function findMethodKey(rl: any, name: string): string | symbol | null {
   return null;
 }
 
+function formatDropdownRows(items: DropdownItem[], selectedIdx: number, line: string): string {
+  const maxCols = Math.max(60, (process.stdout.columns || 100) - 4);
+  const labelWidth = line.startsWith("/cd ") ? 24 : line.startsWith("/resume ") ? 13 : 16;
+  return items
+    .map((item, idx) => {
+      const active = idx === selectedIdx;
+      const plain = `${active ? "❯ " : "  "}${padCols(item.label, labelWidth)} ${item.desc}`;
+      const clipped = truncateCols(plain, maxCols);
+      return `\r\n\x1b[2K${active ? `\x1b[36;1m${clipped}\x1b[0m` : `\x1b[90m${clipped}\x1b[0m`}`;
+    })
+    .join("");
+}
+
 export function attachLiveSlashDropdown(
   rl: any,
   isActivePrompt: () => boolean,
   getPromptCols: () => number,
   getWorkspaceRoot: () => string,
   homeBaseDir?: string,
+  getActiveLeafId?: () => string | null,
 ): () => void {
   const ttyKey = findMethodKey(rl, "_ttyWrite");
   const refreshKey = findMethodKey(rl, "_refreshLine");
-  if (!process.stdin.isTTY || !process.stdout.isTTY || !ttyKey) {
-    return () => {};
-  }
+  if (!process.stdin.isTTY || !process.stdout.isTTY || !ttyKey) return () => {};
   const origTtyWrite = rl[ttyKey].bind(rl);
   const refreshLine = () => {
     if (refreshKey && typeof rl[refreshKey] === "function") rl[refreshKey]();
   };
-  let menuShown = false;
-  let selectedIdx = 0;
-  let lastLine = "";
+  let menuShown = false, selectedIdx = 0, lastLine = "";
 
   const clearMenu = (cursorCols: number) => {
     if (!menuShown) return;
@@ -102,39 +137,22 @@ export function attachLiveSlashDropdown(
     const line: string = typeof rl.line === "string" ? rl.line : "";
     const cursor: number = typeof rl.cursor === "number" ? rl.cursor : line.length;
     const cursorCols = getPromptCols() + getPromptVisualCols(line.slice(0, cursor));
-    if (line !== lastLine) {
-      selectedIdx = 0;
-      lastLine = line;
-    }
-    const items = buildDropdownItems(line, getWorkspaceRoot(), homeBaseDir);
-    if (items.length === 0) {
-      clearMenu(cursorCols);
-      return;
-    }
+    if (line !== lastLine) { selectedIdx = 0; lastLine = line; }
+    const items = buildDropdownItems(line, getWorkspaceRoot(), homeBaseDir, getActiveLeafId?.());
+    if (items.length === 0) return clearMenu(cursorCols);
     selectedIdx = Math.max(0, Math.min(selectedIdx, items.length - 1));
-    const maxCols = Math.max(60, (process.stdout.columns || 100) - 4);
-    const labelWidth = line.startsWith("/cd ") ? 24 : 16;
-    const rows = items.map((item, idx) => {
-      const active = idx === selectedIdx;
-      const prefix = active ? "❯ " : "  ";
-      const plain = `${prefix}${padCols(item.label, labelWidth)} ${item.desc}`;
-      const clipped = truncateCols(plain, maxCols);
-      return active ? `\x1b[36;1m${clipped}\x1b[0m` : `\x1b[90m${clipped}\x1b[0m`;
-    });
-    const down = rows.map((r) => `\r\n\x1b[2K${r}`).join("");
-    process.stdout.write(`${down}\x1b[J\x1b[${rows.length}A\r\x1b[${cursorCols}C`);
+    const down = formatDropdownRows(items, selectedIdx, line);
+    process.stdout.write(`${down}\x1b[J\x1b[${items.length}A\r\x1b[${cursorCols}C`);
     menuShown = true;
   };
 
   rl[ttyKey] = function (s: string, key?: { name?: string; ctrl?: boolean; meta?: boolean }) {
     if (!isActivePrompt()) return origTtyWrite(s, key);
     const line: string = typeof rl.line === "string" ? rl.line : "";
-    const items = menuShown ? buildDropdownItems(line, getWorkspaceRoot(), homeBaseDir) : [];
-
+    const items = menuShown ? buildDropdownItems(line, getWorkspaceRoot(), homeBaseDir, getActiveLeafId?.()) : [];
     if (items.length > 0 && (key?.name === "up" || key?.name === "down")) {
       selectedIdx = key.name === "down" ? (selectedIdx + 1) % items.length : (selectedIdx - 1 + items.length) % items.length;
-      renderMenu();
-      return;
+      return renderMenu();
     }
     if (items.length > 0 && (key?.name === "tab" || key?.name === "right" || key?.name === "return" || key?.name === "enter")) {
       const chosen = items[selectedIdx] ?? items[0]!;
@@ -142,28 +160,21 @@ export function attachLiveSlashDropdown(
         rl.line = chosen.fillText;
         rl.cursor = rl.line.length;
         refreshLine();
-        renderMenu();
-        return;
+        return renderMenu();
       }
       rl.line = chosen.fillText.trim();
       rl.cursor = rl.line.length;
       refreshLine();
-      process.stdout.write(`\r\n\x1b[J\x1b[1A\r\x1b[${getPromptCols() + getPromptVisualCols(rl.line)}C`);
-      menuShown = false;
+      clearMenu(getPromptCols() + getPromptVisualCols(rl.line));
       return origTtyWrite(s, key);
     }
     if (key?.name === "return" || key?.name === "enter") {
-      if (menuShown) {
-        process.stdout.write(`\r\n\x1b[J\x1b[1A\r\x1b[${getPromptCols() + getPromptVisualCols(line)}C`);
-        menuShown = false;
-      }
+      clearMenu(getPromptCols() + getPromptVisualCols(line));
       return origTtyWrite(s, key);
     }
     origTtyWrite(s, key);
     setImmediate(renderMenu);
   };
 
-  return () => {
-    rl[ttyKey] = origTtyWrite;
-  };
+  return () => { rl[ttyKey] = origTtyWrite; };
 }
