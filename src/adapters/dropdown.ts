@@ -26,6 +26,15 @@ export function buildDropdownItems(
   homeBaseDir?: string,
   activeLeafId?: string | null,
 ): DropdownItem[] {
+  if (line.startsWith("/model ")) {
+    const filter = line.slice(7).trim().toLowerCase();
+    const modes: DropdownItem[] = [
+      { label: "/model auto", desc: "⚡ 智能模式 (新对话按高峰MiMo/低谷DS路由，续聊自动保持原模型防缓存失效)", fillText: "/model auto" },
+      { label: "/model deepseek", desc: "🧠 锁定 DeepSeek (deepseek-reasoner · 深度中文推理)", fillText: "/model deepseek" },
+      { label: "/model mimo", desc: "🚀 锁定 小米 MiMo (mimo-v2.6-pro · 高速主力模型)", fillText: "/model mimo" },
+    ];
+    return modes.filter((m) => !filter || m.label.includes(filter));
+  }
   if (line.startsWith("/resume ") || line.startsWith("/branch ")) {
     const filter = line.replace(/^\/(?:resume|branch)\s+/, "").trim().toLowerCase();
     const sFile = resolveProjectSessionPaths(currentWorkspaceRoot, homeBaseDir).sessionFile;
@@ -78,7 +87,7 @@ export function buildDropdownItems(
       label: c.label,
       desc: c.desc,
       fillText: c.cmd === "/projects" ? "/cd " : c.cmd,
-      expandOnly: c.cmd === "/cd " || c.cmd === "/resume " || c.cmd === "/branch " || c.cmd === "/projects",
+      expandOnly: c.cmd === "/cd " || c.cmd === "/resume " || c.cmd === "/branch " || c.cmd === "/model " || c.cmd === "/projects",
     }));
   }
   return [];

@@ -38,6 +38,7 @@ export interface ConversationTurnSummary {
 export const SLASH_COMMANDS = [
   { cmd: "/resume ", label: "/resume", desc: "用 ↑/↓ 方向键选择历史轮次或切换会话" },
   { cmd: "/new", label: "/new", desc: "开启全新对话 (保留旧历史，可随时 /resume 切回)" },
+  { cmd: "/model ", label: "/model", desc: "用 ↑/↓ 方向键切换模型 (auto/deepseek/mimo)" },
   { cmd: "/history", label: "/history", desc: "查看当前项目所有历史问答列表" },
   { cmd: "/diff", label: "/diff", desc: "查看文件修改对比 (-删除 / +新增)" },
   { cmd: "/undo", label: "/undo", desc: "撤回修改 (/undo 撤1步 | /undo all 全部撤回)" },
@@ -49,10 +50,7 @@ export const SLASH_COMMANDS = [
   { cmd: "/exit", label: "/exit", desc: "退出交互终端" },
 ] as const;
 
-export function resolveProjectSessionPaths(
-  workspaceRoot = process.cwd(),
-  homeBaseDir = path.join(os.homedir(), ".duo-harness", "projects"),
-): ProjectSessionPaths {
+export function resolveProjectSessionPaths(workspaceRoot = process.cwd(), homeBaseDir = path.join(os.homedir(), ".duo-harness", "projects")): ProjectSessionPaths {
   const resolved = path.resolve(workspaceRoot);
   const realRoot = fs.existsSync(resolved) ? fs.realpathSync(resolved) : resolved;
   const baseName = path.basename(realRoot).replace(/[^a-zA-Z0-9_-]/g, "_") || "root";
@@ -61,17 +59,8 @@ export function resolveProjectSessionPaths(
   const projectDir = path.join(homeBaseDir, projectKey);
   fs.mkdirSync(projectDir, { recursive: true });
   const metaFile = path.join(projectDir, "meta.json");
-  const metaJson = JSON.stringify({ projectKey, workspaceRoot: realRoot, updatedAt: new Date().toISOString() }, null, 2);
-  fs.writeFileSync(metaFile, metaJson, "utf-8");
-  return {
-    projectKey,
-    workspaceRoot: realRoot,
-    projectDir,
-    sessionFile: path.join(projectDir, "chat.jsonl"),
-    wireLogFile: path.join(projectDir, "http-wire.json"),
-    snapshotsFile: path.join(projectDir, "snapshots.json"),
-    metaFile,
-  };
+  fs.writeFileSync(metaFile, JSON.stringify({ projectKey, workspaceRoot: realRoot, updatedAt: new Date().toISOString() }, null, 2), "utf-8");
+  return { projectKey, workspaceRoot: realRoot, projectDir, sessionFile: path.join(projectDir, "chat.jsonl"), wireLogFile: path.join(projectDir, "http-wire.json"), snapshotsFile: path.join(projectDir, "snapshots.json"), metaFile };
 }
 
 export function listManagedProjects(homeBaseDir = path.join(os.homedir(), ".duo-harness", "projects")): ManagedProjectSummary[] {

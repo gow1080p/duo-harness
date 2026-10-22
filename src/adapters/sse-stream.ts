@@ -2,9 +2,42 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AssistantMessage, LlmStreamEvent } from "../core/contracts.js";
 import { parseOpenAiAssistantMessage } from "./router.js";
-import { formatMarkdownLine, getVisualCols } from "./ui-logger.js";
 
-export { formatMarkdownLine };
+export function getVisualCols(s: string): number {
+  let w = 0;
+  for (const ch of s.replace(/\x1b\[[0-9;]*m/g, "")) w += (ch.codePointAt(0) ?? 0) > 0xff ? 2 : 1;
+  return w;
+}
+
+function formatInlineMarkdown(line: string): string {
+  return line.replace(/`([^`]+)`/g, "\x1b[36m$1\x1b[0m").replace(/\*\*([^*]+)\*\*/g, "\x1b[1;97m$1\x1b[0m").replace(/(^|[^*])\*([^*]+)\*(?!\*)/g, "$1\x1b[3m$2\x1b[0m");
+}
+
+export function formatMarkdownLine(rawLine: string, inCodeBlock: boolean): { text: string; nextInCodeBlock: boolean } {
+  const fenceMatch = rawLine.match(/^\s*```(\w*)\s*$/);
+  if (fenceMatch) {
+    return inCodeBlock ? { text: "\x1b[90m  ╰────────────────────────\x1b[0m", nextInCodeBlock: false } : { text: `\x1b[90m  ╭── ${fenceMatch[1] || "code"} ────────────────\x1b[0m`, nextInCodeBlock: true };
+  }
+  if (inCodeBlock) return { text: `\x1b[90m  │ \x1b[0m\x1b[32m${rawLine}\x1b[0m`, nextInCodeBlock: true };
+  if (/^\s*(?:---+|\*\*\*+)\s*$/.test(rawLine)) return { text: "\x1b[90m  ────────────────────────────────────────\x1b[0m", nextInCodeBlock: false };
+  if (/^\s*\|[\s:|-]+\|\s*$/.test(rawLine)) return { text: "\x1b[90m  ├────────────────────────────────────────┤\x1b[0m", nextInCodeBlock: false };
+  if (/^\s*\|.*\|\s*$/.test(rawLine)) {
+    const cells = rawLine.trim().replace(/^\||\|$/g, "").split("|").map((c) => formatInlineMarkdown(c.trim()));
+    return { text: `  \x1b[90m│\x1b[0m ${cells.join(" \x1b[90m│\x1b[0m ")} \x1b[90m│\x1b[0m`, nextInCodeBlock: false };
+  }
+  const headingMatch = rawLine.match(/^(#{1,6})\s+(.*)$/);
+  if (headingMatch) {
+    const body = formatInlineMarkdown(headingMatch[2]!);
+    return { text: headingMatch[1]!.length <= 2 ? `\x1b[1;36m▍ ${body}\x1b[0m` : `\x1b[1;33m▸ ${body}\x1b[0m`, nextInCodeBlock: false };
+  }
+  const quoteMatch = rawLine.match(/^(\s*)>\s?(.*)$/);
+  if (quoteMatch) return { text: `${quoteMatch[1]!}\x1b[90m▎\x1b[0m \x1b[3m${formatInlineMarkdown(quoteMatch[2]!)}\x1b[0m`, nextInCodeBlock: false };
+  const bulletMatch = rawLine.match(/^(\s*)[-*]\s+(.*)$/);
+  if (bulletMatch) return { text: `${bulletMatch[1]!}\x1b[36m•\x1b[0m ${formatInlineMarkdown(bulletMatch[2]!)}`, nextInCodeBlock: false };
+  const numMatch = rawLine.match(/^(\s*)(\d+\.)\s+(.*)$/);
+  if (numMatch) return { text: `${numMatch[1]!}\x1b[36m${numMatch[2]!}\x1b[0m ${formatInlineMarkdown(numMatch[3]!)}`, nextInCodeBlock: false };
+  return { text: formatInlineMarkdown(rawLine), nextInCodeBlock: false };
+}
 
 export interface HttpWireLogEntry {
   roundTimestamp: string;
@@ -14,34 +47,19 @@ export interface HttpWireLogEntry {
   assembledMessage: AssistantMessage;
 }
 
-interface ToolCallAccumulator {
-  id: string;
-  name: string;
-  argsRaw: string;
-}
-
 export function assembleSsePayloads(dataPayloads: readonly string[]): AssistantMessage {
-  let content = "";
-  let reasoning = "";
-  let hasReasoning = false;
-  const toolMap = new Map<number, ToolCallAccumulator>();
+  let content = "", reasoning = "", hasReasoning = false;
+  const toolMap = new Map<number, { id: string; name: string; argsRaw: string }>();
 
   for (const payload of dataPayloads) {
     const trimmed = payload.trim();
     if (!trimmed || trimmed === "[DONE]") continue;
     let parsed: Record<string, any>;
-    try {
-      parsed = JSON.parse(trimmed) as Record<string, any>;
-    } catch {
-      continue;
-    }
+    try { parsed = JSON.parse(trimmed) as Record<string, any>; } catch { continue; }
     const delta = parsed.choices?.[0]?.delta;
     if (!delta) continue;
     const rChunk = typeof delta.reasoning_content === "string" ? delta.reasoning_content : delta.reasoning;
-    if (typeof rChunk === "string" && rChunk.length > 0) {
-      hasReasoning = true;
-      reasoning += rChunk;
-    }
+    if (typeof rChunk === "string" && rChunk.length > 0) { hasReasoning = true; reasoning += rChunk; }
     if (typeof delta.content === "string" && delta.content.length > 0) content += delta.content;
     if (Array.isArray(delta.tool_calls)) {
       for (const tc of delta.tool_calls) {
@@ -54,20 +72,12 @@ export function assembleSsePayloads(dataPayloads: readonly string[]): AssistantM
       }
     }
   }
-
-  const rawToolCalls = Array.from(toolMap.entries())
-    .sort(([a], [b]) => a - b)
-    .map(([idx, acc]) => ({
-      id: acc.id || `call_${idx}`,
-      type: "function",
-      function: { name: acc.name || "unknown", arguments: acc.argsRaw || "{}" },
-    }));
-
-  return parseOpenAiAssistantMessage({
-    content,
-    ...(hasReasoning ? { reasoning_content: reasoning } : {}),
-    ...(rawToolCalls.length > 0 ? { tool_calls: rawToolCalls } : {}),
-  });
+  const rawToolCalls = Array.from(toolMap.entries()).sort(([a], [b]) => a - b).map(([idx, acc]) => ({
+    id: acc.id || `call_${idx}`,
+    type: "function",
+    function: { name: acc.name || "unknown", arguments: acc.argsRaw || "{}" },
+  }));
+  return parseOpenAiAssistantMessage({ content, ...(hasReasoning ? { reasoning_content: reasoning } : {}), ...(rawToolCalls.length > 0 ? { tool_calls: rawToolCalls } : {}) });
 }
 
 export async function readOpenAiSseStream(
@@ -139,9 +149,8 @@ export async function readOpenAiSseStream(
 }
 
 export function createStreamRenderer(stream: { write: (s: string) => unknown; columns?: number } = process.stdout) {
-  let inReasoning = false;
-  let hasStartedContent = false, inCodeBlock = false, currentLine = "", linePrefix = "";
-  let toolName = "", toolChars = 0;
+  let inReasoning = false, hasStartedContent = false, inCodeBlock = false;
+  let currentLine = "", linePrefix = "", previewCols = 0, toolName = "", toolChars = 0;
 
   const clearToolProgress = () => {
     if (!toolChars && !toolName) return;
@@ -154,22 +163,30 @@ export function createStreamRenderer(stream: { write: (s: string) => unknown; co
     stream.write("\x1b[0m\n");
     inReasoning = false;
   };
+  const writePreviewSlice = (text: string) => {
+    const maxCols = Math.max(20, (stream.columns ?? 80) - 8);
+    if (previewCols >= maxCols) return;
+    let out = "";
+    for (const ch of text) {
+      const w = (ch.codePointAt(0) ?? 0) > 0xff ? 2 : 1;
+      if (previewCols + w > maxCols) break;
+      out += ch;
+      previewCols += w;
+    }
+    if (out) stream.write(out);
+  };
   const commitCurrentLine = (withNewline: boolean) => {
     const { text: formatted, nextInCodeBlock } = formatMarkdownLine(currentLine, inCodeBlock);
     inCodeBlock = nextInCodeBlock;
-    if (formatted !== currentLine && getVisualCols(linePrefix + currentLine) < (stream.columns ?? 80) - 4) {
-      stream.write(`\r\x1b[K${linePrefix}${formatted}${withNewline ? "\n" : ""}`);
-    } else if (withNewline) stream.write("\n");
+    stream.write(`\r\x1b[K${linePrefix}${formatted}${withNewline ? "\n" : ""}`);
     currentLine = linePrefix = "";
+    previewCols = 0;
   };
 
   return {
     onReasoning(chunk: string) {
       clearToolProgress();
-      if (!inReasoning) {
-        stream.write("\n💭 \x1b[2m\x1b[3m");
-        inReasoning = true;
-      }
+      if (!inReasoning) { stream.write("\n💭 \x1b[2m\x1b[3m"); inReasoning = true; }
       stream.write(chunk.replace(/\r?\n/g, "\n   "));
     },
     onToolCall(name?: string, argsDelta = "") {
@@ -181,10 +198,18 @@ export function createStreamRenderer(stream: { write: (s: string) => unknown; co
     onContent(chunk: string) {
       finishReasoning();
       clearToolProgress();
-      if (!hasStartedContent) { linePrefix = "💬 "; stream.write(`\n${linePrefix}`); hasStartedContent = true; }
+      if (!hasStartedContent) {
+        linePrefix = "💬 ";
+        previewCols = getVisualCols(linePrefix);
+        stream.write(`\n${linePrefix}`);
+        hasStartedContent = true;
+      }
       const parts = chunk.split("\n");
       for (let i = 0; i < parts.length; i++) {
-        if (parts[i]) { stream.write(parts[i]!); currentLine += parts[i]!; }
+        if (parts[i]) {
+          writePreviewSlice(parts[i]!);
+          currentLine += parts[i]!;
+        }
         if (i < parts.length - 1) commitCurrentLine(true);
       }
     },

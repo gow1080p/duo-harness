@@ -1,12 +1,16 @@
 import { describe, expect, it } from "vitest";
 import {
   parseOpenAiAssistantMessage,
+  resolveActiveModelTarget,
   resolveRouteTier,
   toOpenAiMessages,
   zodObjectToJsonSchema,
 } from "../src/adapters/router.js";
 import { assembleSsePayloads, createStreamRenderer, formatMarkdownLine } from "../src/adapters/sse-stream.js";
 import { z } from "zod";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 
 describe("Step 1.4: src/adapters/router.ts 协议转换与分时路由测试", () => {
   it("1. 按北京时间 (UTC+8) 精准切换工作日白天高峰与低谷半价窗", () => {
@@ -100,20 +104,52 @@ describe("Step 1.4: src/adapters/router.ts 协议转换与分时路由测试", (
       { id: "call_1", name: "read_file", arguments: { path: "AGENTS.md" } },
     ]);
 
-    // 5. 验证思考流前段留屏、工具生成进度与行级 ANSI Markdown 渲染器
+    // 5. 验证思考流多行展开、工具生成进度与超宽折行表格/段落 ANSI Markdown 渲染器
     const chunks: string[] = [];
-    const renderer = createStreamRenderer({ write: (s) => chunks.push(s), columns: 100 });
+    const renderer = createStreamRenderer({ write: (s) => chunks.push(s), columns: 60 });
     renderer.onEvent({ type: "reasoning_delta", text: "Let me think\nabout this" });
     renderer.onEvent({ type: "tool_call_delta", index: 0, name: "read_file", argsDelta: '{"path":"a.ts"}' });
-    renderer.onEvent({ type: "content_delta", text: "## 标题\n- **重点**: `main.py`\n---\n1. 第一项\n```py\napp()\n```\n" });
+    renderer.onEvent({
+      type: "content_delta",
+      text: "## 标题\n| 文件 | 说明 |\n|---|---|\n| `main.py` | **改动最大**的超长表格行测试超越60列宽度依然完整格式化不裸露符号 |\n---\n1. 第一项\n```py\napp()\n```\n4 个**过时文件未动**（末尾无换行自动 flush 格式化）",
+    });
     renderer.flush();
     const out = chunks.join("");
     expect(out).toContain("💭 \x1b[2m\x1b[3mLet me think\n   about this");
     expect(out).toContain("⏳ 正在生成工具调用 read_file");
     expect(out).toContain("▍ 标题");
-    expect(out).toContain("\x1b[1;97m重点\x1b[0m");
+    expect(out).toContain("├────────────────────────────────────────┤");
+    expect(out).toContain("\x1b[1;97m改动最大\x1b[0m");
+    expect(out).toContain("\x1b[1;97m过时文件未动\x1b[0m");
     expect(out).toContain("\x1b[36mmain.py\x1b[0m");
     expect(out).toContain("────────────────────────────────────────");
-    expect(formatMarkdownLine("### 1. `.gitignore` 问题", false).text).toContain("• 1.");
+    expect(formatMarkdownLine("### 1. `.gitignore` 问题", false).text).toContain("▸ 1.");
+  });
+
+  it("5. 同会话模型粘性保缓存路由 (auto 续聊锁定上一轮模型，/new 或 /model 显式切换)", () => {
+    const prevDs = process.env.DEEPSEEK_API_KEY;
+    const prevMimo = process.env.MIMO_API_KEY;
+    process.env.DEEPSEEK_API_KEY = "sk-test-ds";
+    process.env.MIMO_API_KEY = "tp-test-mimo";
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "duo-sticky-"));
+    const wireFile = path.join(tmpDir, "http-wire.json");
+    fs.writeFileSync(wireFile, JSON.stringify([{ requestBody: { model: "deepseek-reasoner" } }]), "utf-8");
+
+    // 续聊且 mode="auto"：即使在工作日 14:10 高峰期，也粘性保持 deepseek-reasoner 防 KV 缓存失效
+    const monPeakUtc = Date.UTC(2026, 9, 19, 6, 10, 0);
+    const sticky = resolveActiveModelTarget(wireFile, true, "auto", monPeakUtc);
+    expect(sticky.model).toBe("deepseek-reasoner");
+    expect(sticky.shortLabel).toContain("保缓存");
+
+    // /new 新对话 (hasPriorAssistant=false)：按当前时段切换为 MiMo-2.6
+    const fresh = resolveActiveModelTarget(wireFile, false, "auto", monPeakUtc);
+    expect(fresh.model).toBe("mimo-v2.6-pro");
+
+    // 显式指定 /model mimo：无视历史强制切换
+    const forced = resolveActiveModelTarget(wireFile, true, "mimo", monPeakUtc);
+    expect(forced.model).toBe("mimo-v2.6-pro");
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    if (prevDs === undefined) delete process.env.DEEPSEEK_API_KEY; else process.env.DEEPSEEK_API_KEY = prevDs;
+    if (prevMimo === undefined) delete process.env.MIMO_API_KEY; else process.env.MIMO_API_KEY = prevMimo;
   });
 });

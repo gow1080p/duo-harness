@@ -7,7 +7,7 @@ import { runAgentSession } from "./cli.js";
 import { loadAndFormatWireCost, padCols } from "./cost-tracker.js";
 import { attachLiveSlashDropdown, getPromptVisualCols } from "./dropdown.js";
 import { createReplCompleter, extractConversationTurns, formatRecentHistoryRecap, formatSnapshotsDiff, listManagedProjects, loadProjectSnapshots, type ManagedProjectSummary, type ProjectSessionPaths, resolveProjectSessionPaths, resolveTargetWorkspace, saveProjectSnapshots, SLASH_COMMANDS } from "./project-store.js";
-import { createRouterProvider, resolveRouteTier } from "./router.js";
+import { createRouterProvider, type ModelMode, resolveActiveModelTarget, resolveRouteTier } from "./router.js";
 import { loadJsonlEntries } from "./store.js";
 import { formatApprovalBox } from "./ui-logger.js";
 import { type FileVersionSnapshot, rollbackFileSnapshots } from "./write-tools.js";
@@ -20,6 +20,7 @@ interface ReplRuntimeState {
   provider: LlmProvider;
   snapshots: FileVersionSnapshot[];
   leafId: string | null;
+  modelMode: ModelMode;
   autoApprove: boolean;
   inMainPrompt: boolean;
   homeBaseDir?: string;
@@ -31,10 +32,12 @@ function formatPrompt(state: ReplRuntimeState): string {
   const short = name.length > 18 ? `${name.slice(0, 15)}...` : name;
   const entries = fs.existsSync(state.paths.sessionFile) ? loadJsonlEntries(state.paths.sessionFile) : [];
   const rootId = entries[0]?.id ?? null;
-  if (!state.leafId || state.leafId === rootId || entries.length <= 1) return `📂 ${short} [新对话] > `;
+  const isNew = !state.leafId || state.leafId === rootId || entries.length <= 1;
+  const modelTag = resolveActiveModelTarget(state.paths.wireLogFile, !isNew, state.modelMode).shortLabel;
+  if (isNew) return `📂 ${short} [新对话 · ${modelTag}] > `;
   const turns = extractConversationTurns(entries, state.leafId);
   const cur = turns.find((t) => t.isCurrentLeaf) ?? turns[turns.length - 1];
-  return `📂 ${short} [${cur ? `续#${cur.turnIndex}` : "续聊"}] > `;
+  return `📂 ${short} [${cur ? `续#${cur.turnIndex}` : "续聊"} · ${modelTag}] > `;
 }
 
 function switchProjectWorkspace(targetArg: string, state: ReplRuntimeState): void {
@@ -51,7 +54,7 @@ function switchProjectWorkspace(targetArg: string, state: ReplRuntimeState): voi
   state.paths = resolveProjectSessionPaths(realCandidate, state.homeBaseDir);
   const existing = fs.existsSync(state.paths.sessionFile) ? loadJsonlEntries(state.paths.sessionFile) : [];
   state.leafId = existing.length > 0 ? existing[existing.length - 1]!.id : null;
-  state.provider = state.customProvider ?? createRouterProvider(state.paths.wireLogFile, existing.length > 0);
+  state.provider = state.customProvider ?? createRouterProvider(state.paths.wireLogFile, existing.length > 0, () => state.modelMode);
   state.snapshots = loadProjectSnapshots(state.paths.snapshotsFile);
   console.log(`✅ 已切换到 [${path.basename(realCandidate)}] (${state.paths.workspaceRoot} · 历史记录 ${existing.length} 条)`);
   const recap = formatRecentHistoryRecap(existing, 1, state.leafId);
@@ -70,6 +73,16 @@ function handleSlashCommand(rawCmd: string, state: ReplRuntimeState): Promise<bo
   const loadEntries = () => (fs.existsSync(paths.sessionFile) ? loadJsonlEntries(paths.sessionFile) : []);
 
   if (cmd.startsWith("/cd ")) { switchProjectWorkspace(cmd.slice("/cd ".length).trim(), state); return true; }
+  if (cmd === "/model" || cmd.startsWith("/model ")) {
+    const arg = cmd.slice("/model".length).trim().toLowerCase();
+    if (arg === "auto" || arg === "deepseek" || arg === "mimo" || arg === "openai") {
+      state.modelMode = arg;
+      const entries = loadEntries();
+      const hasPrior = Boolean(state.leafId && state.leafId !== entries[0]?.id && entries.length > 1);
+      console.log(`🤖 已切换模型策略为 [${arg}] (当前生效: ${resolveActiveModelTarget(paths.wireLogFile, hasPrior, state.modelMode).model})`);
+    } else console.log(`💡 用法: /model auto | /model deepseek | /model mimo (当前: ${state.modelMode})`);
+    return true;
+  }
   if (cmd === "/xray" || cmd === "/tree") {
     const costText = loadAndFormatWireCost(paths.wireLogFile);
     if (costText) console.log(costText);
@@ -147,17 +160,18 @@ export async function startInteractiveRepl(options: { workspaceRoot?: string; ho
   const existing = fs.existsSync(paths.sessionFile) ? loadJsonlEntries(paths.sessionFile) : [];
   const state: ReplRuntimeState = {
     paths,
-    provider: options.provider ?? createRouterProvider(paths.wireLogFile, existing.length > 0),
+    provider: options.provider ?? createRouterProvider(paths.wireLogFile, existing.length > 0, () => state.modelMode),
     snapshots: loadProjectSnapshots(paths.snapshotsFile),
     leafId: existing.length > 0 ? existing[existing.length - 1]!.id : null,
+    modelMode: "auto",
     autoApprove: false,
     inMainPrompt: false,
     homeBaseDir: options.homeBaseDir,
     customProvider: options.provider,
   };
   console.log(`\n🚀 Duo-Harness | 当前项目: ${path.basename(paths.workspaceRoot)} (${paths.workspaceRoot})`);
-  console.log(`⚡ 模型路由: ${resolveRouteTier(Date.now()).reason}`);
-  console.log(`💡 输入 / 用 ↑/↓ 方向键选择命令或切换历史 (/resume 选轮次 | /new 新对话 | /diff 看修改 | /undo 撤回)`);
+  console.log(`⚡ 模型路由: ${resolveRouteTier(Date.now()).reason} (同会话自动锁定原模型防缓存失效 · 输入 /model 可手动切换)`);
+  console.log(`💡 输入 / 用 ↑/↓ 方向键选择命令或切换历史 (/resume 选轮次 | /new 新对话 | /model 切模型 | /diff 看修改 | /undo 撤回)`);
   const recap = formatRecentHistoryRecap(existing, 1, state.leafId);
   if (recap) console.log(recap);
 

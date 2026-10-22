@@ -1,7 +1,9 @@
 import * as fs from "node:fs";
 import type { ToolCall, ToolResultMessage } from "../core/contracts.js";
 import { summarizeWireCost } from "./cost-tracker.js";
-import type { HttpWireLogEntry } from "./sse-stream.js";
+import { formatMarkdownLine, getVisualCols, type HttpWireLogEntry } from "./sse-stream.js";
+
+export { formatMarkdownLine, getVisualCols };
 
 const WRITE_VERBS_RE =
   /^(?:rm|mv|cp|mkdir|rmdir|touch|chmod|chown|chgrp|ln|unlink|tee|dd|install|truncate|shred|mkfs|mount|umount|kill|pkill|killall|sudo|su|doas|patch|tar|unzip|zip|gzip|gunzip|bzip2|xz|curl|wget|scp|rsync|ssh|sftp|nc|netcat|socat|apt|apt-get|yum|dnf|pacman|brew|npm|pnpm|yarn|bun|pip3?|poetry|uv|cargo|go|make|cmake|gradle|mvn|pytest|vitest|jest|docker|kubectl|systemctl|launchctl|service|crontab|at|eval|exec|source|\.)\b/;
@@ -206,43 +208,17 @@ export function formatCompactTurnFooter(
       if (Array.isArray(entries) && entries.length > 0) {
         const s = summarizeWireCost(entries, { isReplay });
         if (s.rounds.length > 0) {
-          return `${modPrefix}✅ 本轮完成 (共 ${stepsUsed} 步 · 💰 累计实付 ¥${s.totalCostCny.toFixed(4)} · 缓存命中 ${s.overallCacheRatePct.toFixed(0)}% · 输入 /xray 查账单)`;
+          const turnCount = Math.max(1, (stepsUsed ?? 0) + 1);
+          const turnRounds = s.rounds.slice(-turnCount);
+          const turnCost = turnRounds.reduce((acc, r) => acc + r.costCny, 0);
+          const turnIn = turnRounds.reduce((acc, r) => acc + r.promptTokens, 0);
+          const turnHit = turnRounds.reduce((acc, r) => acc + r.cacheHitTokens, 0);
+          const turnCachePct = turnIn > 0 ? (turnHit / turnIn) * 100 : s.overallCacheRatePct;
+          const lastModel = turnRounds[turnRounds.length - 1]?.model || "unknown";
+          return `${modPrefix}✅ 本轮完成 (🤖 ${lastModel} · 共 ${stepsUsed} 步 · 💰 本轮 ¥${turnCost.toFixed(4)} / 累计 ¥${s.totalCostCny.toFixed(4)} · 缓存命中 ${turnCachePct.toFixed(0)}% · 输入 /xray 查账单)`;
         }
       }
     }
   } catch {}
   return `${modPrefix}✅ 本轮完成 (共 ${stepsUsed} 步)`;
-}
-
-export function getVisualCols(s: string): number {
-  let w = 0;
-  for (const ch of s.replace(/\x1b\[[0-9;]*m/g, "")) w += (ch.codePointAt(0) ?? 0) > 0xff ? 2 : 1;
-  return w;
-}
-
-function formatInlineMarkdown(line: string): string {
-  return line.replace(/`([^`]+)`/g, "\x1b[36m$1\x1b[0m").replace(/\*\*([^*]+)\*\*/g, "\x1b[1;97m$1\x1b[0m");
-}
-
-export function formatMarkdownLine(rawLine: string, inCodeBlock: boolean): { text: string; nextInCodeBlock: boolean } {
-  const fenceMatch = rawLine.match(/^\s*```(\w*)\s*$/);
-  if (fenceMatch) {
-    return inCodeBlock
-      ? { text: "\x1b[90m  ╰────────────────────────\x1b[0m", nextInCodeBlock: false }
-      : { text: `\x1b[90m  ╭── ${fenceMatch[1] || "code"} ────────────────\x1b[0m`, nextInCodeBlock: true };
-  }
-  if (inCodeBlock) return { text: `\x1b[90m  │ \x1b[0m\x1b[32m${rawLine}\x1b[0m`, nextInCodeBlock: true };
-  if (/^\s*(?:---+|\*\*\*+)\s*$/.test(rawLine)) {
-    return { text: "\x1b[90m  ────────────────────────────────────────\x1b[0m", nextInCodeBlock: false };
-  }
-  const headingMatch = rawLine.match(/^(#{1,6})\s+(.*)$/);
-  if (headingMatch) {
-    const body = formatInlineMarkdown(headingMatch[2]!);
-    return { text: headingMatch[1]!.length <= 2 ? `\x1b[1;36m▍ ${body}\x1b[0m` : `\x1b[1;97m• ${body}\x1b[0m`, nextInCodeBlock: false };
-  }
-  const bulletMatch = rawLine.match(/^(\s*)[-*]\s+(.*)$/);
-  if (bulletMatch) return { text: `${bulletMatch[1]!}\x1b[36m•\x1b[0m ${formatInlineMarkdown(bulletMatch[2]!)}`, nextInCodeBlock: false };
-  const numMatch = rawLine.match(/^(\s*)(\d+\.)\s+(.*)$/);
-  if (numMatch) return { text: `${numMatch[1]!}\x1b[36m${numMatch[2]!}\x1b[0m ${formatInlineMarkdown(numMatch[3]!)}`, nextInCodeBlock: false };
-  return { text: formatInlineMarkdown(rawLine), nextInCodeBlock: false };
 }

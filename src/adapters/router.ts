@@ -163,8 +163,42 @@ function loadApiKey(envName: string, dotFileName: string): string {
   return readKeyFromFile(path.join(os.homedir(), ".gemini", "antigravity", dotFileName), envName, true);
 }
 
-/** 5. 创建真实 HTTP 大模型调用器（原生支持 OpenAI / Codex、DeepSeek 与小米 MiMo 2.6） */
-export function createRouterProvider(wireLogFile = ".sessions/http-wire.json", appendExistingWire = false): LlmProvider {
+export type ModelMode = "auto" | "deepseek" | "mimo" | "openai";
+
+export function resolveActiveModelTarget(wireLogFile?: string, hasPriorAssistant = false, mode: ModelMode = "auto", nowUtcMs = Date.now()): { apiUrl: string; model: string; apiKey: string; shortLabel: string } {
+  const openaiKey = loadApiKey("OPENAI_API_KEY", ".openai_key");
+  const mimoKey = loadApiKey("MIMO_API_KEY", ".mimo_key");
+  const deepseekKey = loadApiKey("DEEPSEEK_API_KEY", ".deepseek_key");
+  let stickyProvider: "mimo" | "deepseek" | null = null;
+  if (mode === "auto" && hasPriorAssistant && wireLogFile && fs.existsSync(wireLogFile)) {
+    try {
+      const arr = JSON.parse(fs.readFileSync(wireLogFile, "utf-8"));
+      const last = arr[arr.length - 1];
+      const lastModel = String(last?.requestBody?.model ?? last?.model ?? "");
+      if (lastModel.startsWith("deepseek") && deepseekKey) stickyProvider = "deepseek";
+      else if (lastModel.startsWith("mimo") && mimoKey) stickyProvider = "mimo";
+    } catch {}
+  }
+  const decision = resolveRouteTier(nowUtcMs);
+  const useOpenAi = mode === "openai" || (mode === "auto" && openaiKey.length > 0 && ((!mimoKey && !deepseekKey) || process.env.LLM_PROVIDER === "openai"));
+  const useMimo = !useOpenAi && (mode === "mimo" || (mode === "auto" && (stickyProvider ? stickyProvider === "mimo" : decision.tier === "tier1_mimo_peak" && mimoKey.length > 0)));
+  const isTokenPlan = mimoKey.startsWith("tp-") || mimoKey.startsWith("ttp-");
+  const openaiBaseUrl = (process.env.OPENAI_BASE_URL?.trim() || "https://api.openai.com/v1").replace(/\/$/, "");
+  const mimoBaseUrl = process.env.MIMO_BASE_URL?.trim() || (isTokenPlan ? "https://token-plan-cn.xiaomimimo.com/v1" : "https://api.xiaomimimo.com/v1");
+  const apiUrl = useOpenAi ? `${openaiBaseUrl}/chat/completions` : useMimo ? `${mimoBaseUrl.replace(/\/$/, "")}/chat/completions` : "https://api.deepseek.com/chat/completions";
+  const model = useOpenAi ? process.env.OPENAI_MODEL?.trim() || "gpt-5-codex" : useMimo ? process.env.MIMO_MODEL?.trim() || "mimo-v2.6-pro" : process.env.DEEPSEEK_MODEL?.trim() || "deepseek-reasoner";
+  const apiKey = useOpenAi ? openaiKey : useMimo ? mimoKey : deepseekKey;
+  const baseTag = useOpenAi ? "OpenAI" : useMimo ? "MiMo-2.6" : "DeepSeek";
+  const shortLabel = mode !== "auto" ? `${baseTag}·锁` : stickyProvider ? `${baseTag}·保缓存` : baseTag;
+  return { apiUrl, model, apiKey, shortLabel };
+}
+
+/** 5. 创建真实 HTTP 大模型调用器（原生支持 OpenAI / Codex、DeepSeek 与小米 MiMo 2.6 + 同会话缓存粘性） */
+export function createRouterProvider(
+  wireLogFile = ".sessions/http-wire.json",
+  appendExistingWire = false,
+  getModelMode?: () => ModelMode,
+): LlmProvider {
   let roundCount = 0;
   return {
     async chat(
@@ -172,28 +206,8 @@ export function createRouterProvider(wireLogFile = ".sessions/http-wire.json", a
       tools: ToolContract<any>[] = [],
       options: { signal?: AbortSignal; onStreamEvent?: (event: LlmStreamEvent) => void } = {},
     ): Promise<AssistantMessage> {
-      const decision = resolveRouteTier(Date.now());
-      const openaiKey = loadApiKey("OPENAI_API_KEY", ".openai_key");
-      const mimoKey = loadApiKey("MIMO_API_KEY", ".mimo_key");
-      const deepseekKey = loadApiKey("DEEPSEEK_API_KEY", ".deepseek_key");
-      const useOpenAi = openaiKey.length > 0 && ((!mimoKey && !deepseekKey) || process.env.LLM_PROVIDER === "openai");
-      const useMimo = !useOpenAi && decision.tier === "tier1_mimo_peak" && mimoKey.length > 0;
-      const isTokenPlan = mimoKey.startsWith("tp-") || mimoKey.startsWith("ttp-");
-      const openaiBaseUrl = (process.env.OPENAI_BASE_URL?.trim() || "https://api.openai.com/v1").replace(/\/$/, "");
-      const mimoBaseUrl =
-        process.env.MIMO_BASE_URL?.trim() ||
-        (isTokenPlan ? "https://token-plan-cn.xiaomimimo.com/v1" : "https://api.xiaomimimo.com/v1");
-      const apiUrl = useOpenAi
-        ? `${openaiBaseUrl}/chat/completions`
-        : useMimo
-          ? `${mimoBaseUrl.replace(/\/$/, "")}/chat/completions`
-          : "https://api.deepseek.com/chat/completions";
-      const model = useOpenAi
-        ? process.env.OPENAI_MODEL?.trim() || "gpt-5-codex"
-        : useMimo
-          ? process.env.MIMO_MODEL?.trim() || "mimo-v2.6-pro"
-          : process.env.DEEPSEEK_MODEL?.trim() || "deepseek-reasoner";
-      const apiKey = useOpenAi ? openaiKey : useMimo ? mimoKey : deepseekKey;
+      const hasPrior = messages.some((m) => m.role === "assistant");
+      const { apiUrl, model, apiKey } = resolveActiveModelTarget(wireLogFile, hasPrior, getModelMode?.() ?? "auto");
       if (!apiKey) throw new Error("未检测到 OPENAI_API_KEY、DEEPSEEK_API_KEY 或 MIMO_API_KEY");
 
       const openAiTools = tools.map((t) => ({
