@@ -164,6 +164,7 @@ export async function runAgentSession(
   const isReplay = Boolean(options.replayFromFile);
   const workspaceRoot = options.workspaceRoot ?? process.cwd();
   const snapshots = options.snapshots ?? [];
+  const snapStartIdx = snapshots.length;
   const wireLogFile = options.wireLogFile ?? ".sessions/http-wire.json";
   const provider = isReplay ? createReplayProvider(loadJsonlEntries(options.replayFromFile!)) : (options.provider ?? createRouterProvider(wireLogFile));
   const defaultTools = [
@@ -188,8 +189,9 @@ export async function runAgentSession(
     }
     if (stepRes.effect.type === "ABORT") {
       syncNewMessagesToDisk(options.sessionFile, recordedEntries, stepRes.state.messages, cursor, false);
-      if (snapshots.length > 0) {
-        const rb = await rollbackFileSnapshots(workspaceRoot, snapshots, snapshots.length);
+      const turnSnapCount = snapshots.length - snapStartIdx;
+      if (turnSnapCount > 0) {
+        const rb = await rollbackFileSnapshots(workspaceRoot, snapshots, turnSnapCount);
         console.warn(`🔄 [任务熔断自动回滚] 已自动还原 ${rb.rolledBackCount} 个版本修改 (${rb.touchedPaths.join(", ")})`);
       }
       printCostIfEnabled(options, wireLogFile, isReplay);
@@ -222,7 +224,7 @@ export async function runAgentSession(
     printCostIfEnabled(options, wireLogFile, isReplay);
     console.log(`\n✅ [最终回答 (共执行 ${stepRes.state.step} 步)]:\n${stepRes.effect.finalAnswer}`);
   } else {
-    console.log(formatCompactTurnFooter(wireLogFile, stepRes.state.step, isReplay));
+    console.log(formatCompactTurnFooter(wireLogFile, stepRes.state.step, isReplay, snapshots.slice(snapStartIdx), workspaceRoot));
   }
   return { finalAnswer: stepRes.effect.finalAnswer, stepsUsed: stepRes.state.step, entries: recordedEntries, leafId: cursor.leafId };
 }

@@ -1,5 +1,4 @@
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import * as readline from "node:readline/promises";
 import { fileURLToPath } from "node:url";
@@ -7,7 +6,7 @@ import type { LlmProvider, ToolCall } from "../core/contracts.js";
 import { runAgentSession } from "./cli.js";
 import { loadAndFormatWireCost, padCols } from "./cost-tracker.js";
 import { attachLiveSlashDropdown, getPromptVisualCols } from "./dropdown.js";
-import { createReplCompleter, listManagedProjects, type ManagedProjectSummary, type ProjectSessionPaths, resolveProjectSessionPaths, SLASH_COMMANDS } from "./project-store.js";
+import { createReplCompleter, formatRecentHistoryRecap, formatSnapshotsDiff, listManagedProjects, loadProjectSnapshots, type ManagedProjectSummary, type ProjectSessionPaths, resolveProjectSessionPaths, resolveTargetWorkspace, saveProjectSnapshots, SLASH_COMMANDS } from "./project-store.js";
 import { createRouterProvider, resolveRouteTier } from "./router.js";
 import { loadJsonlEntries } from "./store.js";
 import { formatApprovalBox } from "./ui-logger.js";
@@ -33,30 +32,8 @@ function formatPrompt(workspaceRoot: string): string {
   return `📂 ${short} > `;
 }
 
-function resolveTargetWorkspace(targetArg: string, state: ReplRuntimeState): string | null {
-  const projects = listManagedProjects(path.dirname(state.paths.projectDir));
-  const idx = Number(targetArg);
-  if (Number.isInteger(idx) && idx >= 1 && idx <= projects.length) {
-    return projects[idx - 1]!.workspaceRoot;
-  }
-  const byManaged = projects.find(
-    (p) => p.projectKey === targetArg || path.basename(p.workspaceRoot) === targetArg || p.projectKey.startsWith(`${targetArg}-`),
-  );
-  if (byManaged && fs.existsSync(byManaged.workspaceRoot)) {
-    return byManaged.workspaceRoot;
-  }
-  const expanded = targetArg.startsWith("~/") ? path.join(os.homedir(), targetArg.slice(2)) : targetArg;
-  const candidate = path.resolve(state.paths.workspaceRoot, expanded);
-  if (fs.existsSync(candidate) && fs.statSync(candidate).isDirectory()) return candidate;
-  for (const up of ["..", "../.."]) {
-    const sibling = path.resolve(state.paths.workspaceRoot, up, targetArg);
-    if (fs.existsSync(sibling) && fs.statSync(sibling).isDirectory()) return sibling;
-  }
-  return null;
-}
-
 function switchProjectWorkspace(targetArg: string, state: ReplRuntimeState): void {
-  const candidate = resolveTargetWorkspace(targetArg, state);
+  const candidate = resolveTargetWorkspace(targetArg, state.paths.workspaceRoot, path.dirname(state.paths.projectDir));
   if (!candidate) {
     console.log(`⚠️ 未找到项目或目录 "${targetArg}"（输入 / 然后回车即可用 ↑/↓ 方向键选择项目）`);
     return;
@@ -70,8 +47,10 @@ function switchProjectWorkspace(targetArg: string, state: ReplRuntimeState): voi
   const existing = fs.existsSync(state.paths.sessionFile) ? loadJsonlEntries(state.paths.sessionFile) : [];
   state.leafId = existing.length > 0 ? existing[existing.length - 1]!.id : null;
   state.provider = state.customProvider ?? createRouterProvider(state.paths.wireLogFile, existing.length > 0);
-  state.snapshots = [];
+  state.snapshots = loadProjectSnapshots(state.paths.snapshotsFile);
   console.log(`✅ 已切换到 [${path.basename(realCandidate)}] (${state.paths.workspaceRoot} · 历史记录 ${existing.length} 条)`);
+  const recap = formatRecentHistoryRecap(existing, 2);
+  if (recap) console.log(recap);
 }
 
 function handleSlashCommand(rawCmd: string, state: ReplRuntimeState): Promise<boolean> | boolean {
@@ -107,9 +86,25 @@ function handleSlashCommand(rawCmd: string, state: ReplRuntimeState): Promise<bo
     console.log(`🌿 已将当前对话节点切回 ${targetId}，你的下一句提问将从该节点分叉！`);
     return true;
   }
-  if (cmd === "/undo") {
-    return rollbackFileSnapshots(paths.workspaceRoot, snapshots, 1).then((rb) => {
-      console.log(rb.rolledBackCount > 0 ? `🔄 已撤回修改: ${rb.touchedPaths.join(", ")}` : "ℹ️ 当前没有可撤回的修改。");
+  if (cmd === "/history") {
+    const entries = fs.existsSync(paths.sessionFile) ? loadJsonlEntries(paths.sessionFile) : [];
+    console.log(formatRecentHistoryRecap(entries, 12) || "ℹ️ 当前项目暂无历史对话记录。");
+    return true;
+  }
+  if (cmd === "/diff") {
+    console.log(formatSnapshotsDiff(snapshots, paths.workspaceRoot));
+    return true;
+  }
+  if (cmd === "/undo" || cmd.startsWith("/undo ")) {
+    const arg = cmd.slice("/undo".length).trim();
+    const stepsBack = arg === "all" ? snapshots.length : Math.max(1, Number(arg) || 1);
+    return rollbackFileSnapshots(paths.workspaceRoot, snapshots, stepsBack).then((rb) => {
+      saveProjectSnapshots(paths.snapshotsFile, snapshots);
+      console.log(
+        rb.rolledBackCount > 0
+          ? `🔄 已撤回 ${rb.rolledBackCount} 步修改 (剩余可撤回 ${rb.currentVersion} 步): ${[...new Set(rb.touchedPaths)].join(", ")}`
+          : "ℹ️ 当前没有可撤回的修改。",
+      );
       return true;
     });
   }
@@ -124,50 +119,19 @@ function handleSlashCommand(rawCmd: string, state: ReplRuntimeState): Promise<bo
     return true;
   }
   if (cmd === "/clear" || cmd === "/new") {
-    if (fs.existsSync(paths.sessionFile)) fs.unlinkSync(paths.sessionFile);
-    if (fs.existsSync(paths.wireLogFile)) fs.unlinkSync(paths.wireLogFile);
+    for (const f of [paths.sessionFile, paths.wireLogFile, paths.snapshotsFile]) {
+      if (fs.existsSync(f)) fs.unlinkSync(f);
+    }
     state.leafId = null;
+    state.snapshots = [];
     console.log("🧹 已清空当前项目对话记录，下一句将开启全新会话。");
     return true;
   }
   return false;
 }
 
-export async function startInteractiveRepl(options: {
-  workspaceRoot?: string;
-  homeBaseDir?: string;
-  provider?: LlmProvider;
-} = {}): Promise<void> {
-  const paths = resolveProjectSessionPaths(options.workspaceRoot, options.homeBaseDir);
-  const existing = fs.existsSync(paths.sessionFile) ? loadJsonlEntries(paths.sessionFile) : [];
-  const state: ReplRuntimeState = {
-    paths,
-    provider: options.provider ?? createRouterProvider(paths.wireLogFile, existing.length > 0),
-    snapshots: [],
-    leafId: existing.length > 0 ? existing[existing.length - 1]!.id : null,
-    autoApprove: false,
-    inMainPrompt: false,
-    homeBaseDir: options.homeBaseDir,
-    customProvider: options.provider,
-  };
-
-  console.log(`\n🚀 Duo-Harness | 当前项目: ${path.basename(state.paths.workspaceRoot)} (${state.paths.workspaceRoot})`);
-  console.log(`⚡ 模型路由: ${resolveRouteTier(Date.now()).reason}`);
-  console.log(`💡 输入 / 用 ↑/↓ 方向键选择命令或切换项目 | 历史记录: ${existing.length} 条`);
-
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-    completer: createReplCompleter(() => state.paths.workspaceRoot, () => state.paths.sessionFile),
-  });
-  const detachDropdown = attachLiveSlashDropdown(
-    rl,
-    () => state.inMainPrompt,
-    () => getPromptVisualCols(formatPrompt(state.paths.workspaceRoot)),
-    () => state.paths.workspaceRoot,
-    state.homeBaseDir,
-  );
-  const askApproval = async (toolCalls: ToolCall[]) => {
+function createApprovalHandler(rl: readline.Interface, state: ReplRuntimeState) {
+  return async (toolCalls: ToolCall[]) => {
     if (state.autoApprove) return { approved: true };
     state.inMainPrompt = false;
     console.log(formatApprovalBox(toolCalls, state.paths.workspaceRoot));
@@ -181,6 +145,34 @@ export async function startInteractiveRepl(options: {
       return { approved: false, reason: "用户按 Ctrl+C 取消了该操作" };
     }
   };
+}
+
+export async function startInteractiveRepl(options: { workspaceRoot?: string; homeBaseDir?: string; provider?: LlmProvider } = {}): Promise<void> {
+  const paths = resolveProjectSessionPaths(options.workspaceRoot, options.homeBaseDir);
+  const existing = fs.existsSync(paths.sessionFile) ? loadJsonlEntries(paths.sessionFile) : [];
+  const state: ReplRuntimeState = {
+    paths,
+    provider: options.provider ?? createRouterProvider(paths.wireLogFile, existing.length > 0),
+    snapshots: loadProjectSnapshots(paths.snapshotsFile),
+    leafId: existing.length > 0 ? existing[existing.length - 1]!.id : null,
+    autoApprove: false,
+    inMainPrompt: false,
+    homeBaseDir: options.homeBaseDir,
+    customProvider: options.provider,
+  };
+  console.log(`\n🚀 Duo-Harness | 当前项目: ${path.basename(paths.workspaceRoot)} (${paths.workspaceRoot})`);
+  console.log(`⚡ 模型路由: ${resolveRouteTier(Date.now()).reason}`);
+  console.log(`💡 输入 / 用 ↑/↓ 方向键选择命令或切换项目 | 历史记录: ${existing.length} 条 | 可撤回快照: ${state.snapshots.length} 个`);
+  const recap = formatRecentHistoryRecap(existing, 2);
+  if (recap) console.log(recap);
+
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    completer: createReplCompleter(() => state.paths.workspaceRoot, () => state.paths.sessionFile),
+  });
+  const detachDropdown = attachLiveSlashDropdown(rl, () => state.inMainPrompt, () => getPromptVisualCols(formatPrompt(state.paths.workspaceRoot)), () => state.paths.workspaceRoot, state.homeBaseDir);
+  const askApproval = createApprovalHandler(rl, state);
 
   try {
     while (true) {
@@ -219,6 +211,8 @@ export async function startInteractiveRepl(options: {
         state.leafId = res.leafId;
       } catch (err) {
         console.error(`\n❌ 本轮运行异常: ${err instanceof Error ? err.message : String(err)}`);
+      } finally {
+        saveProjectSnapshots(state.paths.snapshotsFile, state.snapshots);
       }
     }
   } finally {

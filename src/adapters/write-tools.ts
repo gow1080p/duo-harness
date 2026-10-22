@@ -24,7 +24,7 @@ const EditFileArgsSchema = z.object({
 
 const RunBashArgsSchema = z.object({
   command: z.string().min(1),
-  timeoutMs: z.number().int().positive().max(30_000).optional(),
+  timeoutMs: z.number().int().positive().optional(),
   readonly: z.boolean().optional(),
 });
 
@@ -227,7 +227,8 @@ export function createWriteTools(
     readonly: false,
     async execute(args) {
       const isRo = isReadonlyBashCommand(args.command, args.readonly);
-      const res = await runCommandInSandbox(args.command, workspaceRoot, args.timeoutMs ?? 10_000, signal, isRo);
+      const timeoutMs = Math.min(Math.max(args.timeoutMs ?? 15_000, 100), 120_000);
+      const res = await runCommandInSandbox(args.command, workspaceRoot, timeoutMs, signal, isRo);
       if (res.exitCode !== 0) throw new Error(`命令退出码 ${res.exitCode}:\n${res.output}`);
       return res.output;
     },

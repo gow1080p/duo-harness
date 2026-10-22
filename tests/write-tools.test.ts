@@ -191,18 +191,24 @@ describe("Stage 3: 写工具 (edit_file/run_bash/rollback_version)、暂停审�
       },
     };
 
+    const priorSnapshots = [
+      { version: 1, path: "prev.ts", beforeContent: "old", afterContent: "kept", timestamp: 1 },
+    ];
     const res = await runAgentSession("尝试修改", {
       provider: mockProvider,
       workspaceRoot: tmpRoot,
+      snapshots: priorSnapshots,
       enableWriteTools: true,
       maxSteps: 1, // 第 1 轮工具改完文件后 step=1，交卷验证失败时触发 maxSteps 熔断 ABORT
       verifyCompletion: () => ({ ok: false, errorOutput: "编译依然报错" }),
     });
 
     expect(res.finalAnswer).toContain("[ABORT]");
-    // 验证硬盘上的 app.ts 已自动恢复为 clean，且新建的 temp-junk.ts 已被删除
+    // 验证硬盘上的 app.ts 已自动恢复为 clean，新建的 temp-junk.ts 已被删除，且上一轮的 prev.ts 快照未被误回滚
     expect(fs.readFileSync(targetFile, "utf-8")).toBe("export const status = 'clean';\n");
     expect(fs.existsSync(path.join(tmpRoot, "temp-junk.ts"))).toBe(false);
+    expect(priorSnapshots).toHaveLength(1);
+    expect(priorSnapshots[0]!.path).toBe("prev.ts");
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   });
 
@@ -271,13 +277,15 @@ describe("Stage 3: 写工具 (edit_file/run_bash/rollback_version)、暂停审�
     expect(dirTree).toContain("[已过滤忽略目录: venv/]");
     fs.rmSync(tmpRoot, { recursive: true, force: true });
 
-    // 验证 System Prompt 注入工作区路径且审批框严格区分修改文件与运行命令
+    // 验证 System Prompt 注入工作区路径且审批框严格区分修改文件与运行命令（含 -/+ 代码对比预览）
     expect(buildDefaultSystemPrompt("/tmp/my-ai-kb")).toContain("/tmp/my-ai-kb");
     const editBox = formatApprovalBox([
       { id: "1", name: "edit_file", arguments: { path: "a.ts", oldText: "a\nb", newText: "a\nb\nc" } },
     ]);
     expect(editBox).toContain("申请修改文件");
     expect(editBox).toContain("-2 行 / +3 行");
+    expect(editBox).toContain("- a");
+    expect(editBox).toContain("+ a");
     const bashBox = formatApprovalBox([{ id: "2", name: "run_bash", arguments: { command: "pytest" } }]);
     expect(bashBox).toContain("申请执行终端命令");
     const stepTree = formatStepToolCalls(
@@ -287,5 +295,22 @@ describe("Stage 3: 写工具 (edit_file/run_bash/rollback_version)、暂停审�
     );
     expect(stepTree).toContain("正在探索与读取项目");
     expect(stepTree).toContain("README.md (第 1~50 行)");
+
+    // 验证 run_bash timeoutMs > 30000 不会触发 Zod 拒单，且 formatRecentHistoryRecap / formatSnapshotsDiff 正常展示
+    const [, , bashTool] = createWriteTools(process.cwd());
+    expect(bashTool!.parameters.safeParse({ command: "echo ok", timeoutMs: 180_000 }).success).toBe(true);
+    const { formatRecentHistoryRecap, formatSnapshotsDiff } = await import("../src/adapters/project-store.js");
+    const recap = formatRecentHistoryRecap([
+      { id: "e0001", parentId: null, timestamp: 1, message: { role: "user", content: "检查项目合理性" } },
+      { id: "e0002", parentId: "e0001", timestamp: 2, message: { role: "assistant", content: "项目整体清晰，有3处可优化" } },
+    ]);
+    expect(recap).toContain("检查项目合理性");
+    expect(recap).toContain("项目整体清晰");
+    const diffOut = formatSnapshotsDiff(
+      [{ version: 1, path: "main.py", beforeContent: "old_line = 1\n", afterContent: "new_line = 2\n", timestamp: 1 }],
+      process.cwd(),
+    );
+    expect(diffOut).toContain("- old_line = 1");
+    expect(diffOut).toContain("+ new_line = 2");
   });
 });

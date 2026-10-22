@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AssistantMessage, LlmStreamEvent } from "../core/contracts.js";
 import { parseOpenAiAssistantMessage } from "./router.js";
-import { formatMarkdownLine, getVisualCols, sliceTailByVisualCols } from "./ui-logger.js";
+import { formatMarkdownLine, getVisualCols } from "./ui-logger.js";
 
 export { formatMarkdownLine };
 
@@ -138,7 +138,7 @@ export async function readOpenAiSseStream(
 }
 
 export function createStreamRenderer(stream: { write: (s: string) => unknown; columns?: number } = process.stdout) {
-  let inReasoning = false, inOverflow = false, reasoningLen = 0, overflowBuf = "";
+  let inReasoning = false;
   let hasStartedContent = false, inCodeBlock = false, currentLine = "", linePrefix = "";
   let toolName = "", toolChars = 0;
 
@@ -150,13 +150,8 @@ export function createStreamRenderer(stream: { write: (s: string) => unknown; co
   };
   const finishReasoning = () => {
     if (!inReasoning) return;
-    const endText = inOverflow
-      ? `\r\x1b[K\x1b[2m\x1b[3m   ... [共思考 ${reasoningLen + overflowBuf.length} 字] ${sliceTailByVisualCols(overflowBuf, 44)}\x1b[0m\n`
-      : "\x1b[0m\n";
-    stream.write(endText);
-    inReasoning = inOverflow = false;
-    reasoningLen = 0;
-    overflowBuf = "";
+    stream.write("\x1b[0m\n");
+    inReasoning = false;
   };
   const commitCurrentLine = (withNewline: boolean) => {
     const { text: formatted, nextInCodeBlock } = formatMarkdownLine(currentLine, inCodeBlock);
@@ -170,20 +165,11 @@ export function createStreamRenderer(stream: { write: (s: string) => unknown; co
   return {
     onReasoning(chunk: string) {
       clearToolProgress();
-      const clean = chunk.replace(/\r?\n+/g, " ");
-      if (!inReasoning) { stream.write("\n💭 \x1b[2m\x1b[3m"); inReasoning = true; }
-      if (reasoningLen < 260) {
-        const head = clean.slice(0, 260 - reasoningLen);
-        stream.write(head);
-        reasoningLen += head.length;
-        if (clean.length > head.length) overflowBuf += clean.slice(head.length);
-      } else overflowBuf += clean;
-      if (overflowBuf.length > 0) {
-        if (!inOverflow) { stream.write("\x1b[0m\n"); inOverflow = true; }
-        const prefix = `   ... [思考中 · ${reasoningLen + overflowBuf.length}字] `;
-        const maxCols = Math.max(12, (stream.columns ?? 80) - getVisualCols(prefix) - 6);
-        stream.write(`\r\x1b[K\x1b[2m\x1b[3m${prefix}${sliceTailByVisualCols(overflowBuf, maxCols)}\x1b[0m`);
+      if (!inReasoning) {
+        stream.write("\n💭 \x1b[2m\x1b[3m");
+        inReasoning = true;
       }
+      stream.write(chunk.replace(/\r?\n/g, "\n   "));
     },
     onToolCall(name?: string, argsDelta = "") {
       finishReasoning();

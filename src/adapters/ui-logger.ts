@@ -29,7 +29,8 @@ export function buildDefaultSystemPrompt(workspaceRoot: string): string {
     `  1. 查看目录与文件行数分布必须直接调用 list_dir（已自带 2 层目录树、每个代码文件的行数及忽略目录提示），读取文件内容调用 read_file（1000 行以内的文件请直接一次读完，不要拆成多步分段读；多个独立文件请在同一轮并发调用 tool_calls 读取），搜索代码调用 grep；严禁在可用内置只读工具时调用 run_bash 执行 cat/find/grep/ls/wc。`,
     `  2. 调用工具时 path 参数请直接传相对于工作区根目录的简短相对路径（如 "."、"README.md"、"src/index.ts"），不要重复拼接长绝对路径。`,
     `  3. run_bash 默认已在工作区根目录 (${workspaceRoot}) 下启动，严禁在命令开头拼接 cd "${workspaceRoot}" &&。`,
-    `  4. 思考过程（reasoning）请统一使用简明中文，调工具取证阶段思考控制在 150 字以内，聚焦下一步动作，不要长篇英文独白；最终回答请基于真实读取到的文件内容，直接给出清晰结论。`,
+    `  4. 修改同一个文件的多处内容时，请使用 edit_file 的 edits 批量数组在单次调用中完成（或同一步并发调用多个 edit_file）；严禁通过 run_bash 调用 sed -i 或脚本改写源码文件。`,
+    `  5. 思考过程（reasoning）请统一使用简明中文，调工具取证阶段思考控制在 150 字以内，聚焦下一步动作，不要长篇英文独白；最终回答请基于真实读取到的文件内容，直接给出清晰结论。`,
   ].join("\n");
 }
 
@@ -90,7 +91,8 @@ function describeSingleToolCall(
     return { isWrite: false, text: `🔍 搜索代码: "${String(args.pattern ?? "")}" (${relPath})` };
   }
   if (call.name === "edit_file") {
-    const isNew = !args.oldText;
+    const edits = Array.isArray(args.edits) ? args.edits : [];
+    const isNew = !args.oldText && edits.length === 0;
     return { isWrite: true, text: `📝 ${isNew ? "新建文件" : "修改文件"}: ${shortenWorkspaceText(String(args.path ?? ""), workspaceRoot)}` };
   }
   if (call.name === "rollback_version") {
@@ -147,12 +149,25 @@ export function formatApprovalBox(toolCalls: readonly ToolCall[], workspaceRoot?
   for (const c of toolCalls) {
     const args = (c.arguments ?? {}) as Record<string, unknown>;
     if (c.name === "edit_file") {
-      const oldStr = String(args.oldText ?? "");
-      const newStr = String(args.newText ?? "");
-      const oldLines = oldStr ? oldStr.split("\n").length : 0;
-      const newLines = newStr ? newStr.split("\n").length : 0;
-      const diffSummary = !oldStr ? `新建文件 (+${newLines} 行)` : `替换内容 (-${oldLines} 行 / +${newLines} 行)`;
+      const rawEdits =
+        Array.isArray(args.edits) && args.edits.length > 0
+          ? (args.edits as { oldText?: string; newText?: string }[])
+          : [{ oldText: String(args.oldText ?? ""), newText: String(args.newText ?? "") }];
+      let oldLines = 0, newLines = 0;
+      const preview: string[] = [];
+      for (const ed of rawEdits) {
+        const oArr = ed.oldText ? String(ed.oldText).split("\n") : [];
+        const nArr = ed.newText ? String(ed.newText).split("\n") : [];
+        oldLines += oArr.length;
+        newLines += nArr.length;
+        for (const l of oArr.slice(0, 2)) preview.push(`│   \x1b[31m- ${l.slice(0, 76)}\x1b[0m`);
+        if (oArr.length > 2) preview.push(`│   \x1b[90m  ... (共删改 ${oArr.length} 行)\x1b[0m`);
+        for (const l of nArr.slice(0, 2)) preview.push(`│   \x1b[32m+ ${l.slice(0, 76)}\x1b[0m`);
+        if (nArr.length > 2) preview.push(`│   \x1b[90m  ... (共新增 ${nArr.length} 行)\x1b[0m`);
+      }
+      const diffSummary = oldLines === 0 ? `新建文件 (+${newLines} 行)` : `替换内容 (-${oldLines} 行 / +${newLines} 行)`;
       lines.push(`│ 📘 目标文件: ${shortenWorkspaceText(String(args.path ?? ""), workspaceRoot)} (${diffSummary})`);
+      lines.push(...preview.slice(0, 6));
     } else if (c.name === "run_bash") {
       lines.push(`│ 💻 待执行命令: ${shortenWorkspaceText(String(args.command ?? ""), workspaceRoot)}`);
     } else {
@@ -162,41 +177,48 @@ export function formatApprovalBox(toolCalls: readonly ToolCall[], workspaceRoot?
   return lines.join("\n");
 }
 
-export function formatCompactTurnFooter(wireLogFile: string, stepsUsed: number, isReplay = false): string {
+export function formatCompactTurnFooter(
+  wireLogFile: string,
+  stepsUsed: number,
+  isReplay = false,
+  turnSnapshots: readonly { path: string; beforeContent: string | null; afterContent: string }[] = [],
+  workspaceRoot?: string,
+): string {
+  const modLines: string[] = [];
+  if (turnSnapshots.length > 0) {
+    const byFile = new Map<string, { before: string | null; after: string; edits: number }>();
+    for (const s of turnSnapshots) {
+      const rel = shortenWorkspaceText(s.path, workspaceRoot);
+      const prev = byFile.get(rel);
+      byFile.set(rel, { before: prev ? prev.before : s.beforeContent, after: s.afterContent, edits: (prev?.edits ?? 0) + 1 });
+    }
+    modLines.push(`\n📋 [本轮共修改 ${byFile.size} 个文件 · 输入 /diff 查看代码对比 | 输入 /undo 撤回修改]:`);
+    for (const [f, info] of byFile.entries()) {
+      const bLen = info.before === null ? 0 : info.before.split("\n").length;
+      const aLen = info.after.split("\n").length;
+      const tag = info.before === null ? `新建 +${aLen} 行` : `${bLen} -> ${aLen} 行 (${info.edits} 处修改)`;
+      modLines.push(`  ✏️  ${f} (${tag})`);
+    }
+  }
+  const modPrefix = modLines.length > 0 ? `${modLines.join("\n")}\n` : "\n";
   try {
     if (fs.existsSync(wireLogFile)) {
       const entries = JSON.parse(fs.readFileSync(wireLogFile, "utf-8")) as HttpWireLogEntry[];
       if (Array.isArray(entries) && entries.length > 0) {
         const s = summarizeWireCost(entries, { isReplay });
         if (s.rounds.length > 0) {
-          return `\n✅ 本轮完成 (共 ${stepsUsed} 步 · 💰 累计实付 ¥${s.totalCostCny.toFixed(4)} · 缓存命中 ${s.overallCacheRatePct.toFixed(0)}% · 输入 /xray 查看完整账单)`;
+          return `${modPrefix}✅ 本轮完成 (共 ${stepsUsed} 步 · 💰 累计实付 ¥${s.totalCostCny.toFixed(4)} · 缓存命中 ${s.overallCacheRatePct.toFixed(0)}% · 输入 /xray 查账单)`;
         }
       }
     }
-  } catch {
-    // ignore wire read errors
-  }
-  return `\n✅ 本轮完成 (共 ${stepsUsed} 步)`;
+  } catch {}
+  return `${modPrefix}✅ 本轮完成 (共 ${stepsUsed} 步)`;
 }
 
 export function getVisualCols(s: string): number {
   let w = 0;
   for (const ch of s.replace(/\x1b\[[0-9;]*m/g, "")) w += (ch.codePointAt(0) ?? 0) > 0xff ? 2 : 1;
   return w;
-}
-
-export function sliceTailByVisualCols(text: string, maxCols: number): string {
-  const chars = Array.from(text.trim());
-  let tail = "";
-  let cols = 0;
-  for (let i = chars.length - 1; i >= 0; i--) {
-    const ch = chars[i]!;
-    const w = (ch.codePointAt(0) ?? 0) > 0xff ? 2 : 1;
-    if (cols + w > maxCols) break;
-    tail = ch + tail;
-    cols += w;
-  }
-  return tail.length < chars.length ? `...${tail}` : tail;
 }
 
 function formatInlineMarkdown(line: string): string {

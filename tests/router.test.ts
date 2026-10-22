@@ -108,7 +108,7 @@ describe("Step 1.4: src/adapters/router.ts 协议转换与分时路由测试", (
     renderer.onEvent({ type: "content_delta", text: "## 标题\n- **重点**: `main.py`\n---\n1. 第一项\n```py\napp()\n```\n" });
     renderer.flush();
     const out = chunks.join("");
-    expect(out).toContain("💭 \x1b[2m\x1b[3mLet me think about this");
+    expect(out).toContain("💭 \x1b[2m\x1b[3mLet me think\n   about this");
     expect(out).toContain("⏳ 正在生成工具调用 read_file");
     expect(out).toContain("▍ 标题");
     expect(out).toContain("\x1b[1;97m重点\x1b[0m");
