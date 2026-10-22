@@ -135,7 +135,8 @@ describe("Stage 5: 自主探路代码审查特工 (reviewer.ts)、RepoMap 与轻
     }
   });
 
-  it("3. 轻量 HTTP/SSE 接口服务 (rpc-server.ts)：支持 /health、JSON 问答/审查与 SSE 实时事件流推送", async () => {
+  it("3. 轻量 HTTP/SSE 接口服务 (rpc-server.ts)：支持 /health、/api/status、/api/command 双端状态同步与 SSE 实时事件流", async () => {
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "duo-rpc-home-"));
     const mockProvider: LlmProvider = {
       async chat() {
         return {
@@ -151,6 +152,7 @@ describe("Stage 5: 自主探路代码审查特工 (reviewer.ts)、RepoMap 与轻
 
     const server = createHarnessRpcServer({
       workspaceRoot: process.cwd(),
+      homeBaseDir: tmpHome,
       provider: mockProvider,
     });
 
@@ -183,8 +185,30 @@ describe("Stage 5: 自主探路代码审查特工 (reviewer.ts)、RepoMap 与轻
       const sseText = await sseResp.text();
       expect(sseText).toContain("event: step");
       expect(sseText).toContain("event: done");
+
+      // 验证双端共享控制接口：切换模型与开启新会话并持久化至 meta.json
+      const cmdModel = await fetch(`${baseUrl}/api/command`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "model", arg: "mimo" }),
+      });
+      expect(((await cmdModel.json()) as any).status.modelMode).toBe("mimo");
+
+      const statusResp = await fetch(`${baseUrl}/api/status`);
+      const statusJson = (await statusResp.json()) as any;
+      expect(statusJson.ok).toBe(true);
+      expect(statusJson.status.isNew).toBe(false);
+      expect(statusJson.turns.length).toBe(1);
+
+      const cmdNew = await fetch(`${baseUrl}/api/command`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "new" }),
+      });
+      expect(((await cmdNew.json()) as any).status.isNew).toBe(true);
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
+      fs.rmSync(tmpHome, { recursive: true, force: true });
     }
   });
 

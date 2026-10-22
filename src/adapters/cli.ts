@@ -30,7 +30,7 @@ export interface RunSessionOptions {
   leafId?: string;
   onApprovalRequest?: (toolCalls: ToolCall[]) => Promise<{ approved: boolean; reason?: string }> | { approved: boolean; reason?: string };
   verifyCompletion?: (finalAnswer: string) => Promise<{ ok: boolean; errorOutput?: string }> | { ok: boolean; errorOutput?: string };
-  onStepEvent?: (event: { phase: string; step: number; detail?: string }) => void;
+  onStepEvent?: (event: { phase: string; step: number; detail?: string; toolCalls?: ToolCall[]; toolResults?: { toolCallId: string; name: string; content: string; isError?: boolean }[] }) => void;
   onStreamEvent?: (event: LlmStreamEvent) => void;
 }
 
@@ -102,15 +102,14 @@ async function runSingleEffectStep(
     const next = stepAgentLoop(state, { type: "LLM_REPLIED", message: reply, requiresApproval });
     if (calls.length > 0 && next.effect.type !== "ABORT") {
       console.log(formatStepToolCalls(state.step + 1, calls, readonlyMap, options.workspaceRoot));
+      options.onStepEvent?.({ phase: next.state.phase, step: state.step + 1, detail: "tool_calls", toolCalls: calls });
     }
     return next;
   }
 
   if (effect.type === "AWAIT_APPROVAL") {
     const writeCalls = filterCallsNeedingApproval(effect.toolCalls, readonlyMap);
-    const decision = options.onApprovalRequest
-      ? await options.onApprovalRequest(writeCalls.length > 0 ? writeCalls : effect.toolCalls)
-      : { approved: false, reason: "未配置审批回调，默认拒绝写操作" };
+    const decision = options.onApprovalRequest ? await options.onApprovalRequest(writeCalls.length > 0 ? writeCalls : effect.toolCalls) : { approved: false, reason: "未配置审批回调，默认拒绝写操作" };
     console.log(decision.approved ? `  🟢 已确认允许执行` : `  🔴 已拒绝执行: ${decision.reason}`);
     return stepAgentLoop(state, { type: "APPROVAL_RESOLVED", approved: decision.approved, reason: decision.reason });
   }
@@ -118,6 +117,7 @@ async function runSingleEffectStep(
   if (effect.type === "EXECUTE_TOOLS") {
     const results = await executeToolCalls(effect.toolCalls, tools);
     for (const r of results) console.log(formatToolResultLine(r));
+    options.onStepEvent?.({ phase: "executing", step: state.step, detail: "tool_results", toolResults: results });
     return stepAgentLoop(state, { type: "TOOLS_FINISHED", results });
   }
 

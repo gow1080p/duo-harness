@@ -43,17 +43,8 @@ export function isReadonlyBashCommand(cmd: string, explicitReadonly?: boolean): 
   if (/\bsed\b/.test(raw) && /\/[gIimM]*[ew](?:\s|$|['";])/.test(raw)) return false;
   const maskedQuotes = raw.replace(/(?:'[^']*'|"(?:[^"\\]|\\.)*")/g, '"__STR__"');
   if (/['"]/.test(maskedQuotes.replace(/"__STR__"/g, ""))) return false;
-  const cleaned = maskedQuotes
-    .replace(/\b2>\s*\/dev\/null\b/g, "")
-    .replace(/<\s*\/dev\/null\b/g, "")
-    .replace(/\b2>&1\b/g, "")
-    .trim();
-  if (
-    !cleaned ||
-    /[><]|(?:^|\s)(?:-(?:delete|exec|execdir|ok|okdir|fprint|fprint0|fprintf|fls)|--(?:output|in-place))\b/.test(
-      cleaned,
-    )
-  ) {
+  const cleaned = maskedQuotes.replace(/\b2>\s*\/dev\/null\b|<\s*\/dev\/null\b|\b2>&1\b/g, "").trim();
+  if (!cleaned || /[><]|(?:^|\s)(?:-(?:delete|exec|execdir|ok|okdir|fprint|fprint0|fprintf|fls)|--(?:output|in-place))\b/.test(cleaned)) {
     return false;
   }
   const segments = cleaned.split(/\s*(?:\|\||&&|;|\|)\s*/);
@@ -63,42 +54,28 @@ export function isReadonlyBashCommand(cmd: string, explicitReadonly?: boolean): 
     if (/^(?:sort|tree)\b/.test(core) && /(?:^|\s)-o\b/.test(core)) return false;
     if (/^sed\b/.test(core) && /(?:^|\s)-[a-zA-Z]*[if]/.test(core)) return false;
     if (WRITE_VERBS_RE.test(core) || GIT_WRITE_SUBCMD_RE.test(core)) return false;
-    if (
-      /^(?:node|nodejs|deno|tsx|ts-node|python3?|ruby|perl|php|lua|sh|bash|zsh|fish|dash|ksh)\b/.test(core) &&
-      !/^(?:node|python3?)\s+(?:-v|--version|-V)\s*$/.test(core)
-    ) {
+    if (/^(?:node|nodejs|deno|tsx|ts-node|python3?|ruby|perl|php|lua|sh|bash|zsh|fish|dash|ksh)\b/.test(core) && !/^(?:node|python3?)\s+(?:-v|--version|-V)\s*$/.test(core)) {
       return false;
     }
     return true;
   });
 }
 
-function describeSingleToolCall(
-  call: ToolCall,
-  readonlyMap: Map<string, boolean>,
-  workspaceRoot?: string,
-): { isWrite: boolean; text: string } {
+function describeSingleToolCall(call: ToolCall, readonlyMap: Map<string, boolean>, workspaceRoot?: string): { isWrite: boolean; text: string } {
   const args = (call.arguments ?? {}) as Record<string, unknown>;
   const relPath = shortenWorkspaceText(String(args.path || "."), workspaceRoot);
-  if (call.name === "list_dir") {
-    return { isWrite: false, text: `📂 查看目录: ${relPath}` };
-  }
+  if (call.name === "list_dir") return { isWrite: false, text: `📂 查看目录: ${relPath}` };
   if (call.name === "read_file") {
-    const range =
-      args.startLine || args.endLine ? ` (第 ${args.startLine ?? 1}~${args.endLine ?? "末"} 行)` : "";
+    const range = args.startLine || args.endLine ? ` (第 ${args.startLine ?? 1}~${args.endLine ?? "末"} 行)` : "";
     return { isWrite: false, text: `📘 读取文件: ${shortenWorkspaceText(String(args.path ?? ""), workspaceRoot)}${range}` };
   }
-  if (call.name === "grep") {
-    return { isWrite: false, text: `🔍 搜索代码: "${String(args.pattern ?? "")}" (${relPath})` };
-  }
+  if (call.name === "grep") return { isWrite: false, text: `🔍 搜索代码: "${String(args.pattern ?? "")}" (${relPath})` };
   if (call.name === "edit_file") {
     const edits = Array.isArray(args.edits) ? args.edits : [];
     const isNew = !args.oldText && edits.length === 0;
     return { isWrite: true, text: `📝 ${isNew ? "新建文件" : "修改文件"}: ${shortenWorkspaceText(String(args.path ?? ""), workspaceRoot)}` };
   }
-  if (call.name === "rollback_version") {
-    return { isWrite: true, text: `🔄 回退版本: 撤回最近 ${String(args.stepsBack ?? 1)} 步修改` };
-  }
+  if (call.name === "rollback_version") return { isWrite: true, text: `🔄 回退版本: 撤回最近 ${String(args.stepsBack ?? 1)} 步修改` };
   if (call.name === "run_bash") {
     const rawCmd = String(args.command ?? "").trim();
     const isRo = isReadonlyBashCommand(rawCmd, args.readonly as boolean | undefined);
@@ -106,25 +83,13 @@ function describeSingleToolCall(
     const shortCmd = displayCmd.length > 76 ? `${displayCmd.slice(0, 73)}...` : displayCmd;
     return { isWrite: !isRo, text: `${isRo ? "📊 统计/查询命令" : "💻 运行终端命令"}: ${shortCmd}` };
   }
-  const isWrite = readonlyMap.get(call.name) === false;
-  return { isWrite, text: `🔧 调用工具 ${call.name}: ${JSON.stringify(args).slice(0, 60)}` };
+  return { isWrite: readonlyMap.get(call.name) === false, text: `🔧 调用工具 ${call.name}: ${JSON.stringify(args).slice(0, 60)}` };
 }
 
-export function formatStepToolCalls(
-  step: number,
-  calls: readonly ToolCall[],
-  readonlyMap: Map<string, boolean>,
-  workspaceRoot?: string,
-): string {
+export function formatStepToolCalls(step: number, calls: readonly ToolCall[], readonlyMap: Map<string, boolean>, workspaceRoot?: string): string {
   const items = calls.map((c) => describeSingleToolCall(c, readonlyMap, workspaceRoot));
-  const hasWrite = items.some((i) => i.isWrite);
-  const header = hasWrite
-    ? `\n🔧 [第 ${step} 步 · 准备执行修改或命令]`
-    : `\n🔍 [第 ${step} 步 · 正在探索与读取项目]`;
-  const treeLines = items.map((item, idx) => {
-    const branch = idx === items.length - 1 ? "  └─ " : "  ├─ ";
-    return `${branch}${item.text}`;
-  });
+  const header = items.some((i) => i.isWrite) ? `\n🔧 [第 ${step} 步 · 准备执行修改或命令]` : `\n🔍 [第 ${step} 步 · 正在探索与读取项目]`;
+  const treeLines = items.map((item, idx) => `${idx === items.length - 1 ? "  └─ " : "  ├─ "}${item.text}`);
   return [header, ...treeLines].join("\n");
 }
 
@@ -178,6 +143,71 @@ export function formatApprovalBox(toolCalls: readonly ToolCall[], workspaceRoot?
   return lines.join("\n");
 }
 
+export interface FileDiffSummaryItem {
+  file: string;
+  isNew: boolean;
+  edits: number;
+  oldLines: number;
+  newLines: number;
+  removedPreview: string[];
+  addedPreview: string[];
+}
+
+export function summarizeSnapshotsDiff(
+  snapshots: readonly { path: string; beforeContent: string | null; afterContent: string }[],
+  workspaceRoot?: string,
+): FileDiffSummaryItem[] {
+  const byFile = new Map<string, { before: string | null; after: string; edits: number }>();
+  for (const s of snapshots) {
+    const rel = shortenWorkspaceText(s.path, workspaceRoot);
+    const prev = byFile.get(rel);
+    byFile.set(rel, { before: prev ? prev.before : s.beforeContent, after: s.afterContent, edits: (prev?.edits ?? 0) + 1 });
+  }
+  return Array.from(byFile.entries()).map(([file, info]) => {
+    const oldArr = info.before === null ? [] : info.before.split("\n");
+    const newArr = info.after.split("\n");
+    const oldSet = new Set(oldArr.map((l) => l.trim()).filter(Boolean));
+    const newSet = new Set(newArr.map((l) => l.trim()).filter(Boolean));
+    return {
+      file,
+      isNew: info.before === null,
+      edits: info.edits,
+      oldLines: oldArr.length,
+      newLines: newArr.length,
+      removedPreview: oldArr.filter((l) => l.trim() && !newSet.has(l.trim())).slice(0, 5),
+      addedPreview: newArr.filter((l) => l.trim() && !oldSet.has(l.trim())).slice(0, 5),
+    };
+  });
+}
+
+export interface TurnMetricsSummary {
+  activeModel: string;
+  turnCostCny: number;
+  totalCostCny: number;
+  cacheHitRatePct: number;
+}
+
+export function computeTurnMetrics(wireLogFile: string, stepsUsed: number, isReplay = false): TurnMetricsSummary | null {
+  try {
+    if (!fs.existsSync(wireLogFile)) return null;
+    const entries = JSON.parse(fs.readFileSync(wireLogFile, "utf-8")) as HttpWireLogEntry[];
+    if (!Array.isArray(entries) || entries.length === 0) return null;
+    const s = summarizeWireCost(entries, { isReplay });
+    if (s.rounds.length === 0) return null;
+    const turnRounds = s.rounds.slice(-Math.max(1, (stepsUsed ?? 0) + 1));
+    const turnIn = turnRounds.reduce((acc, r) => acc + r.promptTokens, 0);
+    const turnHit = turnRounds.reduce((acc, r) => acc + r.cacheHitTokens, 0);
+    return {
+      activeModel: turnRounds[turnRounds.length - 1]?.model || "unknown",
+      turnCostCny: turnRounds.reduce((acc, r) => acc + r.costCny, 0),
+      totalCostCny: s.totalCostCny,
+      cacheHitRatePct: turnIn > 0 ? (turnHit / turnIn) * 100 : s.overallCacheRatePct,
+    };
+  } catch {
+    return null;
+  }
+}
+
 export function formatCompactTurnFooter(
   wireLogFile: string,
   stepsUsed: number,
@@ -185,40 +215,12 @@ export function formatCompactTurnFooter(
   turnSnapshots: readonly { path: string; beforeContent: string | null; afterContent: string }[] = [],
   workspaceRoot?: string,
 ): string {
-  const modLines: string[] = [];
-  if (turnSnapshots.length > 0) {
-    const byFile = new Map<string, { before: string | null; after: string; edits: number }>();
-    for (const s of turnSnapshots) {
-      const rel = shortenWorkspaceText(s.path, workspaceRoot);
-      const prev = byFile.get(rel);
-      byFile.set(rel, { before: prev ? prev.before : s.beforeContent, after: s.afterContent, edits: (prev?.edits ?? 0) + 1 });
-    }
-    modLines.push(`\n📋 [本轮共修改 ${byFile.size} 个文件 · 输入 /diff 查看代码对比 | 输入 /undo 撤回修改]:`);
-    for (const [f, info] of byFile.entries()) {
-      const bLen = info.before === null ? 0 : info.before.split("\n").length;
-      const aLen = info.after.split("\n").length;
-      const tag = info.before === null ? `新建 +${aLen} 行` : `${bLen} -> ${aLen} 行 (${info.edits} 处修改)`;
-      modLines.push(`  ✏️  ${f} (${tag})`);
-    }
-  }
+  const diffs = summarizeSnapshotsDiff(turnSnapshots, workspaceRoot);
+  const modLines = diffs.length > 0 ? [`\n📋 [本轮共修改 ${diffs.length} 个文件 · 输入 /diff 查看代码对比 | 输入 /undo 撤回修改]:`, ...diffs.map((d) => `  ✏️  ${d.file} (${d.isNew ? `新建 +${d.newLines} 行` : `${d.oldLines} -> ${d.newLines} 行 (${d.edits} 处修改)`})`)] : [];
   const modPrefix = modLines.length > 0 ? `${modLines.join("\n")}\n` : "\n";
-  try {
-    if (fs.existsSync(wireLogFile)) {
-      const entries = JSON.parse(fs.readFileSync(wireLogFile, "utf-8")) as HttpWireLogEntry[];
-      if (Array.isArray(entries) && entries.length > 0) {
-        const s = summarizeWireCost(entries, { isReplay });
-        if (s.rounds.length > 0) {
-          const turnCount = Math.max(1, (stepsUsed ?? 0) + 1);
-          const turnRounds = s.rounds.slice(-turnCount);
-          const turnCost = turnRounds.reduce((acc, r) => acc + r.costCny, 0);
-          const turnIn = turnRounds.reduce((acc, r) => acc + r.promptTokens, 0);
-          const turnHit = turnRounds.reduce((acc, r) => acc + r.cacheHitTokens, 0);
-          const turnCachePct = turnIn > 0 ? (turnHit / turnIn) * 100 : s.overallCacheRatePct;
-          const lastModel = turnRounds[turnRounds.length - 1]?.model || "unknown";
-          return `${modPrefix}✅ 本轮完成 (🤖 ${lastModel} · 共 ${stepsUsed} 步 · 💰 本轮 ¥${turnCost.toFixed(4)} / 累计 ¥${s.totalCostCny.toFixed(4)} · 缓存命中 ${turnCachePct.toFixed(0)}% · 输入 /xray 查账单)`;
-        }
-      }
-    }
-  } catch {}
+  const m = computeTurnMetrics(wireLogFile, stepsUsed, isReplay);
+  if (m) {
+    return `${modPrefix}✅ 本轮完成 (🤖 ${m.activeModel} · 共 ${stepsUsed} 步 · 💰 本轮 ¥${m.turnCostCny.toFixed(4)} / 累计 ¥${m.totalCostCny.toFixed(4)} · 缓存命中 ${m.cacheHitRatePct.toFixed(0)}% · 输入 /xray 查账单)`;
+  }
   return `${modPrefix}✅ 本轮完成 (共 ${stepsUsed} 步)`;
 }

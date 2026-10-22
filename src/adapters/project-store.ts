@@ -4,8 +4,29 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { SessionEntry } from "../core/contracts.js";
 import { loadJsonlEntries } from "./store.js";
-import { shortenWorkspaceText } from "./ui-logger.js";
+import { shortenWorkspaceText, summarizeSnapshotsDiff } from "./ui-logger.js";
 import type { FileVersionSnapshot } from "./write-tools.js";
+
+export interface ProjectMetaState {
+  projectKey: string;
+  workspaceRoot: string;
+  updatedAt: string;
+  activeLeafId?: string | null;
+  modelMode?: "auto" | "deepseek" | "mimo" | "openai";
+}
+
+export function loadProjectMeta(metaFile: string): Partial<ProjectMetaState> {
+  if (!fs.existsSync(metaFile)) return {};
+  try { return JSON.parse(fs.readFileSync(metaFile, "utf-8")); } catch { return {}; }
+}
+
+export function saveProjectMeta(metaFile: string, patch: Partial<ProjectMetaState>): void {
+  try {
+    const prev = loadProjectMeta(metaFile);
+    fs.mkdirSync(path.dirname(metaFile), { recursive: true });
+    fs.writeFileSync(metaFile, JSON.stringify({ ...prev, ...patch, updatedAt: new Date().toISOString() }, null, 2), "utf-8");
+  } catch {}
+}
 
 export interface ProjectSessionPaths {
   projectKey: string;
@@ -59,7 +80,7 @@ export function resolveProjectSessionPaths(workspaceRoot = process.cwd(), homeBa
   const projectDir = path.join(homeBaseDir, projectKey);
   fs.mkdirSync(projectDir, { recursive: true });
   const metaFile = path.join(projectDir, "meta.json");
-  fs.writeFileSync(metaFile, JSON.stringify({ projectKey, workspaceRoot: realRoot, updatedAt: new Date().toISOString() }, null, 2), "utf-8");
+  saveProjectMeta(metaFile, { projectKey, workspaceRoot: realRoot });
   return { projectKey, workspaceRoot: realRoot, projectDir, sessionFile: path.join(projectDir, "chat.jsonl"), wireLogFile: path.join(projectDir, "http-wire.json"), snapshotsFile: path.join(projectDir, "snapshots.json"), metaFile };
 }
 
@@ -188,6 +209,7 @@ export function formatRecentHistoryRecap(entries: readonly SessionEntry[], maxTu
   const turns = extractConversationTurns(entries, activeLeafId);
   if (turns.length === 0) return "";
   if (maxTurns === 1) {
+    if (activeLeafId && entries[0]?.id === activeLeafId) return "";
     const cur = turns.find((t) => t.isCurrentLeaf) ?? turns[turns.length - 1]!;
     const uShort = cur.userText.length > 68 ? `${cur.userText.slice(0, 65)}...` : cur.userText;
     const rShort = cur.replyText ? (cur.replyText.length > 74 ? `${cur.replyText.slice(0, 71)}...` : cur.replyText) : `已执行 ${cur.toolSteps} 步工具调用`;
@@ -209,29 +231,13 @@ export function formatRecentHistoryRecap(entries: readonly SessionEntry[], maxTu
 }
 
 export function formatSnapshotsDiff(snapshots: readonly FileVersionSnapshot[], workspaceRoot: string): string {
-  if (snapshots.length === 0) return "ℹ️ 当前没有未撤回的文件修改记录。";
-  const byFile = new Map<string, { before: string | null; after: string; count: number; lastVer: number }>();
-  for (const s of snapshots) {
-    const rel = shortenWorkspaceText(s.path, workspaceRoot);
-    const prev = byFile.get(rel);
-    byFile.set(rel, {
-      before: prev ? prev.before : s.beforeContent,
-      after: s.afterContent,
-      count: (prev?.count ?? 0) + 1,
-      lastVer: s.version,
-    });
-  }
-  const out = [`\n🔍 [文件修改审核对比 (共 ${byFile.size} 个文件, ${snapshots.length} 个快照版本 · 输入 /undo [步数|all] 可撤回)]:`];
-  for (const [file, info] of byFile.entries()) {
-    const oldLines = info.before === null ? [] : info.before.split("\n");
-    const newLines = info.after.split("\n");
-    const oldSet = new Set(oldLines.map((l) => l.trim()).filter(Boolean));
-    const newSet = new Set(newLines.map((l) => l.trim()).filter(Boolean));
-    const removed = oldLines.filter((l) => l.trim() && !newSet.has(l.trim())).slice(0, 5);
-    const added = newLines.filter((l) => l.trim() && !oldSet.has(l.trim())).slice(0, 5);
-    out.push(`  📘 ${file} (${info.before === null ? "新建文件" : `修改 ${info.count} 次 · ${oldLines.length} -> ${newLines.length} 行`})`);
-    for (const r of removed) out.push(`     \x1b[31m- ${r.slice(0, 84)}\x1b[0m`);
-    for (const a of added) out.push(`     \x1b[32m+ ${a.slice(0, 84)}\x1b[0m`);
+  const diffs = summarizeSnapshotsDiff(snapshots, workspaceRoot);
+  if (diffs.length === 0) return "ℹ️ 当前没有未撤回的文件修改记录。";
+  const out = [`\n🔍 [文件修改审核对比 (共 ${diffs.length} 个文件, ${snapshots.length} 个快照版本 · 输入 /undo [步数|all] 可撤回)]:`];
+  for (const d of diffs) {
+    out.push(`  📘 ${d.file} (${d.isNew ? "新建文件" : `修改 ${d.edits} 次 · ${d.oldLines} -> ${d.newLines} 行`})`);
+    for (const r of d.removedPreview) out.push(`     \x1b[31m- ${r.slice(0, 84)}\x1b[0m`);
+    for (const a of d.addedPreview) out.push(`     \x1b[32m+ ${a.slice(0, 84)}\x1b[0m`);
   }
   return out.join("\n");
 }
