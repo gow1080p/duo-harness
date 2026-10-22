@@ -219,6 +219,11 @@ describe("Stage 3: 写工具 (edit_file/run_bash/rollback_version)、暂停审�
     expect(isReadonlyBashCommand("git status && git diff && git branch --show-current")).toBe(true);
     expect(isReadonlyBashCommand("git remote -v && git branch -a && git tag -l </dev/null")).toBe(true);
     expect(isReadonlyBashCommand("uname -a && realpath . && node -v && python3 --version")).toBe(true);
+    expect(
+      isReadonlyBashCommand(
+        'grep -n "@app\\.|def \\|async def" "/Volumes/T7 Shield/code/kids-essay-copilot/main.py" | head -50; echo ---; wc -l "/Volumes/T7 Shield/code/kids-essay-copilot/main.py"',
+      ),
+    ).toBe(true);
 
     // 严防绕过测试
     expect(isReadonlyBashCommand("find . -name '*.tmp' -delete")).toBe(false);

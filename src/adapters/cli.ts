@@ -85,7 +85,7 @@ async function runSingleEffectStep(
 
     const calls = reply.toolCalls ?? [];
     if (calls.length > 0) {
-      console.log(formatStepToolCalls(state.step + 1, calls, readonlyMap));
+      console.log(formatStepToolCalls(state.step + 1, calls, readonlyMap, options.workspaceRoot));
     }
     const writeCalls = filterCallsNeedingApproval(calls, readonlyMap);
     const requiresApproval = writeCalls.length > 0 && Boolean(options.onApprovalRequest);
@@ -208,7 +208,7 @@ export async function runAgentSession(
       break;
     }
     options.onStepEvent?.({ phase: stepRes.state.phase, step: stepRes.state.step, detail: stepRes.effect.type });
-    stepRes = await runSingleEffectStep(stepRes, recordedEntries, cursor, provider, tools, readonlyMap, options);
+    stepRes = await runSingleEffectStep(stepRes, recordedEntries, cursor, provider, tools, readonlyMap, { ...options, workspaceRoot });
     if (stepRes.state.phase !== "awaiting_approval" && stepRes.state.phase !== "executing") {
       syncNewMessagesToDisk(options.sessionFile, recordedEntries, stepRes.state.messages, cursor, false);
     }

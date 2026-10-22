@@ -63,7 +63,7 @@ function switchProjectWorkspace(targetArg: string, state: ReplRuntimeState): voi
   }
   const realCandidate = fs.realpathSync(candidate);
   if (realCandidate === state.paths.workspaceRoot) {
-    console.log(`ℹ️ 当前已经在 [${path.basename(realCandidate)}] 工作区中，无需重复切换。`);
+    console.log(`💡 当前已经在 [${path.basename(realCandidate)}] 工作区中，无需重复切换。`);
     return;
   }
   state.paths = resolveProjectSessionPaths(realCandidate, state.homeBaseDir);
@@ -170,7 +170,7 @@ export async function startInteractiveRepl(options: {
   const askApproval = async (toolCalls: ToolCall[]) => {
     if (state.autoApprove) return { approved: true };
     state.inMainPrompt = false;
-    console.log(formatApprovalBox(toolCalls));
+    console.log(formatApprovalBox(toolCalls, state.paths.workspaceRoot));
     try {
       const ans = (await rl.question(`└─ 是否允许执行？[直接回车/y=允许本次 | a=本轮全自动放行 | n=拒绝] > `)).trim().toLowerCase();
       if (ans === "a") state.autoApprove = true;
