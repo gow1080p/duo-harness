@@ -1,6 +1,6 @@
 import { fileURLToPath } from "node:url";
 import { compactMessages, type CompactorOptions } from "../core/compactor.js";
-import type { LlmProvider, LoopStepResult, SessionEntry, ToolCall, ToolContract } from "../core/contracts.js";
+import type { LlmProvider, LlmStreamEvent, LoopStepResult, SessionEntry, ToolCall, ToolContract } from "../core/contracts.js";
 import { createInitialState, stepAgentLoop } from "../core/loop.js";
 import { assertSessionInvariant, buildSessionEntries, projectToMessages, repairDanglingToolCalls } from "../core/session-tree.js";
 import { createRouterProvider, resolveRouteTier } from "./router.js";
@@ -31,6 +31,7 @@ export interface RunSessionOptions {
   onApprovalRequest?: (toolCalls: ToolCall[]) => Promise<{ approved: boolean; reason?: string }> | { approved: boolean; reason?: string };
   verifyCompletion?: (finalAnswer: string) => Promise<{ ok: boolean; errorOutput?: string }> | { ok: boolean; errorOutput?: string };
   onStepEvent?: (event: { phase: string; step: number; detail?: string }) => void;
+  onStreamEvent?: (event: LlmStreamEvent) => void;
 }
 
 interface SessionCursor {
@@ -74,10 +75,17 @@ async function runSingleEffectStep(
   if (effect.type === "REQUEST_LLM") {
     const rawMessages = repairDanglingToolCalls(projectToMessages(recordedEntries, cursor.leafId ?? undefined));
     const messagesToSend = compactMessages(rawMessages, options.compactor);
+    if (state.step >= state.maxSteps - 1 && messagesToSend.length > 0) {
+      const last = messagesToSend[messagesToSend.length - 1]!;
+      messagesToSend[messagesToSend.length - 1] = {
+        ...last,
+        content: `${last.content}\n[系统提示：当前已执行 ${state.step}/${state.maxSteps} 步，请勿再发起只读探索，请立即完成修改或直接输出总结回答。]`,
+      };
+    }
     assertSessionInvariant(messagesToSend);
     let reply;
     try {
-      reply = await provider.chat(messagesToSend, tools, { signal: options.signal });
+      reply = await provider.chat(messagesToSend, tools, { signal: options.signal, onStreamEvent: options.onStreamEvent });
     } catch (err) {
       if (options.signal?.aborted) {
         return {
@@ -89,12 +97,13 @@ async function runSingleEffectStep(
     }
 
     const calls = reply.toolCalls ?? [];
-    if (calls.length > 0) {
-      console.log(formatStepToolCalls(state.step + 1, calls, readonlyMap, options.workspaceRoot));
-    }
     const writeCalls = filterCallsNeedingApproval(calls, readonlyMap);
     const requiresApproval = writeCalls.length > 0 && Boolean(options.onApprovalRequest);
-    return stepAgentLoop(state, { type: "LLM_REPLIED", message: reply, requiresApproval });
+    const next = stepAgentLoop(state, { type: "LLM_REPLIED", message: reply, requiresApproval });
+    if (calls.length > 0 && next.effect.type !== "ABORT") {
+      console.log(formatStepToolCalls(state.step + 1, calls, readonlyMap, options.workspaceRoot));
+    }
+    return next;
   }
 
   if (effect.type === "AWAIT_APPROVAL") {
@@ -108,9 +117,7 @@ async function runSingleEffectStep(
 
   if (effect.type === "EXECUTE_TOOLS") {
     const results = await executeToolCalls(effect.toolCalls, tools);
-    for (const r of results) {
-      console.log(formatToolResultLine(r));
-    }
+    for (const r of results) console.log(formatToolResultLine(r));
     return stepAgentLoop(state, { type: "TOOLS_FINISHED", results });
   }
 
@@ -129,22 +136,13 @@ function initSessionContext(userPrompt: string, workspaceRoot: string, options: 
   if (options.leafId && options.sessionFile) {
     try {
       existingEntries = loadJsonlEntries(options.sessionFile);
-    } catch {
-      existingEntries = [];
-    }
+    } catch {}
   }
-  const baseState = createInitialState({ systemPrompt, maxSteps: options.maxSteps ?? 8 });
-  const rawPrior =
-    existingEntries.length > 0 && options.leafId
-      ? projectToMessages(existingEntries, options.leafId)
-      : baseState.messages;
+  const baseState = createInitialState({ systemPrompt, maxSteps: options.maxSteps ?? 20 });
+  const rawPrior = existingEntries.length > 0 && options.leafId ? projectToMessages(existingEntries, options.leafId) : baseState.messages;
   const priorMessages = repairDanglingToolCalls(rawPrior);
-  while (priorMessages.length > 0 && priorMessages[priorMessages.length - 1]!.role === "user") {
-    priorMessages.pop();
-  }
-  const wasHealed =
-    existingEntries.length > 0 &&
-    (priorMessages.length !== rawPrior.length || priorMessages.some((m, i) => m !== rawPrior[i]));
+  while (priorMessages.length > 0 && priorMessages[priorMessages.length - 1]!.role === "user") priorMessages.pop();
+  const wasHealed = existingEntries.length > 0 && (priorMessages.length !== rawPrior.length || priorMessages.some((m, i) => m !== rawPrior[i]));
   if (priorMessages[0]?.role === "system") priorMessages[0] = { role: "system", content: systemPrompt };
   const recordedEntries: SessionEntry[] = wasHealed
     ? buildSessionEntries([], priorMessages, Date.now(), null)
@@ -167,9 +165,7 @@ export async function runAgentSession(
   const workspaceRoot = options.workspaceRoot ?? process.cwd();
   const snapshots = options.snapshots ?? [];
   const wireLogFile = options.wireLogFile ?? ".sessions/http-wire.json";
-  const provider = isReplay
-    ? createReplayProvider(loadJsonlEntries(options.replayFromFile!))
-    : (options.provider ?? createRouterProvider(wireLogFile));
+  const provider = isReplay ? createReplayProvider(loadJsonlEntries(options.replayFromFile!)) : (options.provider ?? createRouterProvider(wireLogFile));
   const defaultTools = [
     ...createBuiltinTools(workspaceRoot),
     ...(options.enableWriteTools ? createWriteTools(workspaceRoot, snapshots, options.signal) : []),
@@ -191,6 +187,7 @@ export async function runAgentSession(
       };
     }
     if (stepRes.effect.type === "ABORT") {
+      syncNewMessagesToDisk(options.sessionFile, recordedEntries, stepRes.state.messages, cursor, false);
       if (snapshots.length > 0) {
         const rb = await rollbackFileSnapshots(workspaceRoot, snapshots, snapshots.length);
         console.warn(`🔄 [任务熔断自动回滚] 已自动还原 ${rb.rolledBackCount} 个版本修改 (${rb.touchedPaths.join(", ")})`);

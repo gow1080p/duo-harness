@@ -7,6 +7,7 @@ import {
   AssistantMessageSchema,
   type AssistantMessage,
   type LlmProvider,
+  type LlmStreamEvent,
   type Message,
   type ToolCall,
   type ToolContract,
@@ -166,12 +167,16 @@ function loadApiKey(envName: string, dotFileName: string): string {
 export function createRouterProvider(wireLogFile = ".sessions/http-wire.json", appendExistingWire = false): LlmProvider {
   let roundCount = 0;
   return {
-    async chat(messages: Message[], tools: ToolContract<any>[] = [], options: { signal?: AbortSignal } = {}): Promise<AssistantMessage> {
+    async chat(
+      messages: Message[],
+      tools: ToolContract<any>[] = [],
+      options: { signal?: AbortSignal; onStreamEvent?: (event: LlmStreamEvent) => void } = {},
+    ): Promise<AssistantMessage> {
       const decision = resolveRouteTier(Date.now());
       const openaiKey = loadApiKey("OPENAI_API_KEY", ".openai_key");
       const mimoKey = loadApiKey("MIMO_API_KEY", ".mimo_key");
       const deepseekKey = loadApiKey("DEEPSEEK_API_KEY", ".deepseek_key");
-      const useOpenAi = openaiKey.length > 0 && (!mimoKey && !deepseekKey || process.env.LLM_PROVIDER === "openai");
+      const useOpenAi = openaiKey.length > 0 && ((!mimoKey && !deepseekKey) || process.env.LLM_PROVIDER === "openai");
       const useMimo = !useOpenAi && decision.tier === "tier1_mimo_peak" && mimoKey.length > 0;
       const isTokenPlan = mimoKey.startsWith("tp-") || mimoKey.startsWith("ttp-");
       const openaiBaseUrl = (process.env.OPENAI_BASE_URL?.trim() || "https://api.openai.com/v1").replace(/\/$/, "");
@@ -187,7 +192,7 @@ export function createRouterProvider(wireLogFile = ".sessions/http-wire.json", a
         ? process.env.OPENAI_MODEL?.trim() || "gpt-5-codex"
         : useMimo
           ? process.env.MIMO_MODEL?.trim() || "mimo-v2.6-pro"
-          : "deepseek-chat";
+          : process.env.DEEPSEEK_MODEL?.trim() || "deepseek-reasoner";
       const apiKey = useOpenAi ? openaiKey : useMimo ? mimoKey : deepseekKey;
       if (!apiKey) throw new Error("未检测到 OPENAI_API_KEY、DEEPSEEK_API_KEY 或 MIMO_API_KEY");
 
@@ -199,7 +204,7 @@ export function createRouterProvider(wireLogFile = ".sessions/http-wire.json", a
         model,
         messages: toOpenAiMessages(messages),
         ...(openAiTools.length > 0 ? { tools: openAiTools } : {}),
-        temperature: 0,
+        ...(model.includes("reasoner") ? {} : { temperature: 0 }),
         stream: true,
       };
       const timeoutSig = AbortSignal.timeout(60_000);
@@ -212,9 +217,10 @@ export function createRouterProvider(wireLogFile = ".sessions/http-wire.json", a
       });
       if (!res.ok) throw new Error(`LLM HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
 
-      const renderer = createStreamRenderer();
-      const { message, rawSseLines } = await readOpenAiSseStream(res, renderer.onContent, renderer.onReasoning);
-      renderer.flush();
+      const fallbackRenderer = options.onStreamEvent ? null : createStreamRenderer();
+      const handleEvent = options.onStreamEvent ?? ((evt: LlmStreamEvent) => fallbackRenderer?.onEvent(evt));
+      const { message, rawSseLines } = await readOpenAiSseStream(res, undefined, undefined, handleEvent);
+      fallbackRenderer?.flush();
 
       const entry = { roundTimestamp: new Date().toISOString(), apiUrl, requestBody, rawSseLines, assembledMessage: message };
       recordHttpWireLog(entry, wireLogFile, roundCount === 0 && !appendExistingWire);

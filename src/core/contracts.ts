@@ -102,11 +102,16 @@ export interface ToolContract<TArgs = unknown> {
   execute: (args: TArgs) => Promise<string> | string;
 }
 
+export type LlmStreamEvent =
+  | { type: "reasoning_delta"; text: string }
+  | { type: "content_delta"; text: string }
+  | { type: "tool_call_delta"; index: number; name?: string; argsDelta: string };
+
 export interface LlmProvider {
   chat(
     messages: Message[],
     tools?: ToolContract[],
-    options?: { signal?: AbortSignal },
+    options?: { signal?: AbortSignal; onStreamEvent?: (event: LlmStreamEvent) => void },
   ): Promise<AssistantMessage>;
 }
 

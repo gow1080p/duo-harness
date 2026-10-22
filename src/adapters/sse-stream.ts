@@ -1,7 +1,10 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { AssistantMessage } from "../core/contracts.js";
+import type { AssistantMessage, LlmStreamEvent } from "../core/contracts.js";
 import { parseOpenAiAssistantMessage } from "./router.js";
+import { formatMarkdownLine, getVisualCols, sliceTailByVisualCols } from "./ui-logger.js";
+
+export { formatMarkdownLine };
 
 export interface HttpWireLogEntry {
   roundTimestamp: string;
@@ -70,14 +73,23 @@ export async function readOpenAiSseStream(
   res: Response,
   onDeltaText?: (text: string) => void,
   onReasoningDelta?: (text: string) => void,
+  onStreamEvent?: (event: LlmStreamEvent) => void,
 ): Promise<{ message: AssistantMessage; rawSseLines: string[] }> {
+  const emitReasoning = (text: string) => {
+    onReasoningDelta?.(text);
+    onStreamEvent?.({ type: "reasoning_delta", text });
+  };
+  const emitContent = (text: string) => {
+    onDeltaText?.(text);
+    onStreamEvent?.({ type: "content_delta", text });
+  };
   const contentType = res.headers.get("content-type") ?? "";
   if (!contentType.includes("text/event-stream") || !res.body) {
     const data = (await res.json()) as Record<string, any>;
     const rawMsg = data.choices?.[0]?.message;
     if (!rawMsg) throw new Error("LLM 响应缺少 choices[0].message 字段");
-    if (typeof rawMsg.reasoning_content === "string" && rawMsg.reasoning_content) onReasoningDelta?.(rawMsg.reasoning_content);
-    if (typeof rawMsg.content === "string" && rawMsg.content) onDeltaText?.(rawMsg.content);
+    if (typeof rawMsg.reasoning_content === "string" && rawMsg.reasoning_content) emitReasoning(rawMsg.reasoning_content);
+    if (typeof rawMsg.content === "string" && rawMsg.content) emitContent(rawMsg.content);
     return { message: parseOpenAiAssistantMessage(rawMsg), rawSseLines: [`[非流式 JSON 响应] ${JSON.stringify(data)}`] };
   }
 
@@ -93,14 +105,23 @@ export async function readOpenAiSseStream(
     rawSseLines.push(trimmed);
     const payload = trimmed.slice(5).trim();
     dataPayloads.push(payload);
-    if (!payload || payload === "[DONE]" || (!onDeltaText && !onReasoningDelta)) return;
+    if (!payload || payload === "[DONE]" || (!onDeltaText && !onReasoningDelta && !onStreamEvent)) return;
     try {
       const delta = (JSON.parse(payload) as Record<string, any>).choices?.[0]?.delta;
-      if (typeof delta?.reasoning_content === "string" && delta.reasoning_content) onReasoningDelta?.(delta.reasoning_content);
-      if (typeof delta?.content === "string" && delta.content) onDeltaText?.(delta.content);
-    } catch {
-      // 忽略单行非 JSON 注释或心跳
-    }
+      const rText = typeof delta?.reasoning_content === "string" ? delta.reasoning_content : delta?.reasoning;
+      if (typeof rText === "string" && rText) emitReasoning(rText);
+      if (typeof delta?.content === "string" && delta.content) emitContent(delta.content);
+      if (Array.isArray(delta?.tool_calls)) {
+        for (const tc of delta.tool_calls) {
+          onStreamEvent?.({
+            type: "tool_call_delta",
+            index: typeof tc.index === "number" ? tc.index : 0,
+            name: typeof tc.function?.name === "string" ? tc.function.name : undefined,
+            argsDelta: typeof tc.function?.arguments === "string" ? tc.function.arguments : "",
+          });
+        }
+      }
+    } catch {}
   };
 
   while (true) {
@@ -116,111 +137,78 @@ export async function readOpenAiSseStream(
   return { message: assembleSsePayloads(dataPayloads), rawSseLines };
 }
 
-function getVisualCols(s: string): number {
-  let w = 0;
-  for (const ch of s.replace(/\x1b\[[0-9;]*m/g, "")) w += (ch.codePointAt(0) ?? 0) > 0xff ? 2 : 1;
-  return w;
-}
-
-function sliceTailByVisualCols(text: string, maxCols: number): string {
-  const chars = Array.from(text.trim());
-  let tail = "";
-  let cols = 0;
-  for (let i = chars.length - 1; i >= 0; i--) {
-    const ch = chars[i]!;
-    const w = (ch.codePointAt(0) ?? 0) > 0xff ? 2 : 1;
-    if (cols + w > maxCols) break;
-    tail = ch + tail;
-    cols += w;
-  }
-  return tail.length < chars.length ? `...${tail}` : tail;
-}
-
-function formatInlineMarkdown(line: string): string {
-  return line.replace(/`([^`]+)`/g, "\x1b[36m$1\x1b[0m").replace(/\*\*([^*]+)\*\*/g, "\x1b[1;97m$1\x1b[0m");
-}
-
-export function formatMarkdownLine(rawLine: string, inCodeBlock: boolean): { text: string; nextInCodeBlock: boolean } {
-  const fenceMatch = rawLine.match(/^\s*```(\w*)\s*$/);
-  if (fenceMatch) {
-    return inCodeBlock
-      ? { text: "\x1b[90m  ╰────────────────────────\x1b[0m", nextInCodeBlock: false }
-      : { text: `\x1b[90m  ╭── ${fenceMatch[1] || "code"} ────────────────\x1b[0m`, nextInCodeBlock: true };
-  }
-  if (inCodeBlock) return { text: `\x1b[90m  │ \x1b[0m\x1b[32m${rawLine}\x1b[0m`, nextInCodeBlock: true };
-  if (/^\s*(?:---+|\*\*\*+)\s*$/.test(rawLine)) {
-    return { text: "\x1b[90m  ────────────────────────────────────────\x1b[0m", nextInCodeBlock: false };
-  }
-  const headingMatch = rawLine.match(/^(#{1,6})\s+(.*)$/);
-  if (headingMatch) {
-    const isTop = headingMatch[1]!.length <= 2;
-    const body = formatInlineMarkdown(headingMatch[2]!);
-    return { text: isTop ? `\x1b[1;36m▍ ${body}\x1b[0m` : `\x1b[1;97m• ${body}\x1b[0m`, nextInCodeBlock: false };
-  }
-  const bulletMatch = rawLine.match(/^(\s*)[-*]\s+(.*)$/);
-  if (bulletMatch) return { text: `${bulletMatch[1]!}\x1b[36m•\x1b[0m ${formatInlineMarkdown(bulletMatch[2]!)}`, nextInCodeBlock: false };
-  const numMatch = rawLine.match(/^(\s*)(\d+\.)\s+(.*)$/);
-  if (numMatch) return { text: `${numMatch[1]!}\x1b[36m${numMatch[2]!}\x1b[0m ${formatInlineMarkdown(numMatch[3]!)}`, nextInCodeBlock: false };
-  return { text: formatInlineMarkdown(rawLine), nextInCodeBlock: false };
-}
-
 export function createStreamRenderer(stream: { write: (s: string) => unknown; columns?: number } = process.stdout) {
-  let inReasoning = false;
-  let reasoningBuf = "";
-  let hasStartedContent = false;
-  let inCodeBlock = false;
-  let currentLine = "";
-  let linePrefix = "";
+  let inReasoning = false, inOverflow = false, reasoningLen = 0, overflowBuf = "";
+  let hasStartedContent = false, inCodeBlock = false, currentLine = "", linePrefix = "";
+  let toolName = "", toolChars = 0;
 
+  const clearToolProgress = () => {
+    if (!toolChars && !toolName) return;
+    stream.write("\r\x1b[K");
+    toolName = "";
+    toolChars = 0;
+  };
   const finishReasoning = () => {
     if (!inReasoning) return;
-    stream.write(`\r\x1b[K\x1b[2m💭 思考完成 (${reasoningBuf.length} 字)\x1b[0m\n`);
-    inReasoning = false;
-    reasoningBuf = "";
+    const endText = inOverflow
+      ? `\r\x1b[K\x1b[2m\x1b[3m   ... [共思考 ${reasoningLen + overflowBuf.length} 字] ${sliceTailByVisualCols(overflowBuf, 44)}\x1b[0m\n`
+      : "\x1b[0m\n";
+    stream.write(endText);
+    inReasoning = inOverflow = false;
+    reasoningLen = 0;
+    overflowBuf = "";
   };
-
   const commitCurrentLine = (withNewline: boolean) => {
     const { text: formatted, nextInCodeBlock } = formatMarkdownLine(currentLine, inCodeBlock);
     inCodeBlock = nextInCodeBlock;
-    const totalCols = getVisualCols(linePrefix + currentLine);
-    if (formatted !== currentLine && totalCols < (stream.columns ?? 80) - 4) {
+    if (formatted !== currentLine && getVisualCols(linePrefix + currentLine) < (stream.columns ?? 80) - 4) {
       stream.write(`\r\x1b[K${linePrefix}${formatted}${withNewline ? "\n" : ""}`);
-    } else if (withNewline) {
-      stream.write("\n");
-    }
-    currentLine = "";
-    linePrefix = "";
+    } else if (withNewline) stream.write("\n");
+    currentLine = linePrefix = "";
   };
 
   return {
     onReasoning(chunk: string) {
-      if (!inReasoning) {
-        stream.write("\n");
-        inReasoning = true;
+      clearToolProgress();
+      const clean = chunk.replace(/\r?\n+/g, " ");
+      if (!inReasoning) { stream.write("\n💭 \x1b[2m\x1b[3m"); inReasoning = true; }
+      if (reasoningLen < 260) {
+        const head = clean.slice(0, 260 - reasoningLen);
+        stream.write(head);
+        reasoningLen += head.length;
+        if (clean.length > head.length) overflowBuf += clean.slice(head.length);
+      } else overflowBuf += clean;
+      if (overflowBuf.length > 0) {
+        if (!inOverflow) { stream.write("\x1b[0m\n"); inOverflow = true; }
+        const prefix = `   ... [思考中 · ${reasoningLen + overflowBuf.length}字] `;
+        const maxCols = Math.max(12, (stream.columns ?? 80) - getVisualCols(prefix) - 6);
+        stream.write(`\r\x1b[K\x1b[2m\x1b[3m${prefix}${sliceTailByVisualCols(overflowBuf, maxCols)}\x1b[0m`);
       }
-      reasoningBuf += chunk.replace(/\s+/g, " ");
-      const prefix = `💭 [思考中 · ${reasoningBuf.length}字] `;
-      const maxTailCols = Math.max(12, (stream.columns ?? 80) - getVisualCols(prefix) - 6);
-      stream.write(`\r\x1b[K\x1b[2m\x1b[3m${prefix}${sliceTailByVisualCols(reasoningBuf, maxTailCols)}\x1b[0m`);
+    },
+    onToolCall(name?: string, argsDelta = "") {
+      finishReasoning();
+      if (name) toolName = name;
+      toolChars += argsDelta.length;
+      stream.write(`\r\x1b[K\x1b[2m⏳ 正在生成工具调用 ${toolName || "..."} (${toolChars} 字符)...\x1b[0m`);
     },
     onContent(chunk: string) {
       finishReasoning();
-      if (!hasStartedContent) {
-        linePrefix = "💬 ";
-        stream.write(`\n${linePrefix}`);
-        hasStartedContent = true;
-      }
+      clearToolProgress();
+      if (!hasStartedContent) { linePrefix = "💬 "; stream.write(`\n${linePrefix}`); hasStartedContent = true; }
       const parts = chunk.split("\n");
       for (let i = 0; i < parts.length; i++) {
-        if (parts[i]) {
-          stream.write(parts[i]!);
-          currentLine += parts[i]!;
-        }
+        if (parts[i]) { stream.write(parts[i]!); currentLine += parts[i]!; }
         if (i < parts.length - 1) commitCurrentLine(true);
       }
     },
+    onEvent(evt: LlmStreamEvent) {
+      if (evt.type === "reasoning_delta") this.onReasoning(evt.text);
+      else if (evt.type === "content_delta") this.onContent(evt.text);
+      else if (evt.type === "tool_call_delta") this.onToolCall(evt.name, evt.argsDelta);
+    },
     flush() {
       finishReasoning();
+      clearToolProgress();
       if (currentLine.length > 0) commitCurrentLine(false);
       if (hasStartedContent) stream.write("\x1b[0m\n");
     },

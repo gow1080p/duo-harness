@@ -10,7 +10,7 @@ const RpcRequestSchema = z.object({
   mode: z.enum(["ask", "review"]).default("ask"),
   files: z.array(z.string()).optional(),
   stream: z.boolean().default(false),
-  maxSteps: z.number().int().positive().max(20).optional(),
+  maxSteps: z.number().int().positive().max(50).optional(),
 });
 
 export interface HarnessRpcServerOptions {
@@ -84,6 +84,7 @@ async function streamAskSession(
       signal: abortCtrl.signal,
       enableWriteTools: false,
       onStepEvent: (evt) => writeSse("step", evt),
+      onStreamEvent: (evt) => writeSse("stream", evt),
     });
     writeSse("done", { ok: true, finalAnswer: result.finalAnswer, stepsUsed: result.stepsUsed });
   } catch (err) {

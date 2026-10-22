@@ -26,7 +26,7 @@ export function buildDefaultSystemPrompt(workspaceRoot: string): string {
     `你是一个运行在本地代码库中的专业编程智能体。`,
     `- 当前工作区根目录 (workspaceRoot): ${workspaceRoot} (操作系统: ${process.platform})`,
     `- 工具使用纪律（必须严格遵守）：`,
-    `  1. 查看目录与文件行数分布必须直接调用 list_dir（已自带 2 层目录树、每个代码文件的行数及忽略目录提示），读取文件内容调用 read_file，搜索代码调用 grep；严禁在可用内置只读工具时调用 run_bash 执行 cat/find/grep/ls/wc。`,
+    `  1. 查看目录与文件行数分布必须直接调用 list_dir（已自带 2 层目录树、每个代码文件的行数及忽略目录提示），读取文件内容调用 read_file（1000 行以内的文件请直接一次读完，不要拆成多步分段读；多个独立文件请在同一轮并发调用 tool_calls 读取），搜索代码调用 grep；严禁在可用内置只读工具时调用 run_bash 执行 cat/find/grep/ls/wc。`,
     `  2. 调用工具时 path 参数请直接传相对于工作区根目录的简短相对路径（如 "."、"README.md"、"src/index.ts"），不要重复拼接长绝对路径。`,
     `  3. run_bash 默认已在工作区根目录 (${workspaceRoot}) 下启动，严禁在命令开头拼接 cd "${workspaceRoot}" &&。`,
     `  4. 思考过程（reasoning）请统一使用简明中文，调工具取证阶段思考控制在 150 字以内，聚焦下一步动作，不要长篇英文独白；最终回答请基于真实读取到的文件内容，直接给出清晰结论。`,
@@ -177,4 +177,51 @@ export function formatCompactTurnFooter(wireLogFile: string, stepsUsed: number, 
     // ignore wire read errors
   }
   return `\n✅ 本轮完成 (共 ${stepsUsed} 步)`;
+}
+
+export function getVisualCols(s: string): number {
+  let w = 0;
+  for (const ch of s.replace(/\x1b\[[0-9;]*m/g, "")) w += (ch.codePointAt(0) ?? 0) > 0xff ? 2 : 1;
+  return w;
+}
+
+export function sliceTailByVisualCols(text: string, maxCols: number): string {
+  const chars = Array.from(text.trim());
+  let tail = "";
+  let cols = 0;
+  for (let i = chars.length - 1; i >= 0; i--) {
+    const ch = chars[i]!;
+    const w = (ch.codePointAt(0) ?? 0) > 0xff ? 2 : 1;
+    if (cols + w > maxCols) break;
+    tail = ch + tail;
+    cols += w;
+  }
+  return tail.length < chars.length ? `...${tail}` : tail;
+}
+
+function formatInlineMarkdown(line: string): string {
+  return line.replace(/`([^`]+)`/g, "\x1b[36m$1\x1b[0m").replace(/\*\*([^*]+)\*\*/g, "\x1b[1;97m$1\x1b[0m");
+}
+
+export function formatMarkdownLine(rawLine: string, inCodeBlock: boolean): { text: string; nextInCodeBlock: boolean } {
+  const fenceMatch = rawLine.match(/^\s*```(\w*)\s*$/);
+  if (fenceMatch) {
+    return inCodeBlock
+      ? { text: "\x1b[90m  ╰────────────────────────\x1b[0m", nextInCodeBlock: false }
+      : { text: `\x1b[90m  ╭── ${fenceMatch[1] || "code"} ────────────────\x1b[0m`, nextInCodeBlock: true };
+  }
+  if (inCodeBlock) return { text: `\x1b[90m  │ \x1b[0m\x1b[32m${rawLine}\x1b[0m`, nextInCodeBlock: true };
+  if (/^\s*(?:---+|\*\*\*+)\s*$/.test(rawLine)) {
+    return { text: "\x1b[90m  ────────────────────────────────────────\x1b[0m", nextInCodeBlock: false };
+  }
+  const headingMatch = rawLine.match(/^(#{1,6})\s+(.*)$/);
+  if (headingMatch) {
+    const body = formatInlineMarkdown(headingMatch[2]!);
+    return { text: headingMatch[1]!.length <= 2 ? `\x1b[1;36m▍ ${body}\x1b[0m` : `\x1b[1;97m• ${body}\x1b[0m`, nextInCodeBlock: false };
+  }
+  const bulletMatch = rawLine.match(/^(\s*)[-*]\s+(.*)$/);
+  if (bulletMatch) return { text: `${bulletMatch[1]!}\x1b[36m•\x1b[0m ${formatInlineMarkdown(bulletMatch[2]!)}`, nextInCodeBlock: false };
+  const numMatch = rawLine.match(/^(\s*)(\d+\.)\s+(.*)$/);
+  if (numMatch) return { text: `${numMatch[1]!}\x1b[36m${numMatch[2]!}\x1b[0m ${formatInlineMarkdown(numMatch[3]!)}`, nextInCodeBlock: false };
+  return { text: formatInlineMarkdown(rawLine), nextInCodeBlock: false };
 }

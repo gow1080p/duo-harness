@@ -22,7 +22,7 @@ export function createInitialState(config: InitialStateConfig = {}): AgentState 
     phase: "idle",
     messages,
     step: 0,
-    maxSteps: config.maxSteps ?? 10,
+    maxSteps: config.maxSteps ?? 20,
   });
 }
 
