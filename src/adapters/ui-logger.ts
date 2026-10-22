@@ -4,7 +4,7 @@ import { summarizeWireCost } from "./cost-tracker.js";
 import type { HttpWireLogEntry } from "./sse-stream.js";
 
 const SAFE_CMD_PREFIX =
-  /^(ls|find|wc|head|tail|cat|pwd|which|stat|file|grep|rg|tree|du|df|echo|cd|sort|uniq|uname|realpath|basename|dirname|nl|cut|tr|sed\s+-n|xargs\s+(wc|head|tail|cat|grep|rg|file|stat)|git\s+(status|diff|log|show|rev-parse|remote\s+-v|tag\s+(-l|--list)|branch\s+(--show-current|-a|-r|--list))|node\s+(-v|--version)|python3?\s+(-V|--version))\b/;
+  /^(ls|find|wc|head|tail|cat|pwd|which|stat|file|grep|rg|tree|du|df|echo|cd|sort|uniq|uname|realpath|basename|dirname|nl|cut|tr|sed|column|paste|comm|diff|xargs\s+(wc|head|tail|cat|grep|rg|file|stat)|git\s+(status|diff|log|show|rev-parse|remote\s+-v|tag\s+(-l|--list)|branch\s+(--show-current|-a|-r|--list))|node\s+(-v|--version)|python3?\s+(-V|--version))\b/;
 
 export function shortenWorkspaceText(raw: string, workspaceRoot?: string): string {
   if (!raw || !workspaceRoot) return raw;
@@ -32,6 +32,7 @@ export function buildDefaultSystemPrompt(workspaceRoot: string): string {
 export function isReadonlyBashCommand(cmd: string): boolean {
   const raw = cmd.trim();
   if (!raw || /`|\$\(|[\n\r]/.test(raw)) return false;
+  if (/\bsed\b/.test(raw) && /\/[gIimM]*[ew](?:\s|$|['";])/.test(raw)) return false;
   const maskedQuotes = raw
     .replace(/'[^']*'/g, '"__STR__"')
     .replace(/"(?:[^"\\]|\\.)*"/g, '"__STR__"');
@@ -53,6 +54,7 @@ export function isReadonlyBashCommand(cmd: string): boolean {
     const s = seg.trim();
     if (!s || /(^|\s)&(\s|$)/.test(s)) return false;
     if (/^(?:sort|tree)\b/.test(s) && /(?:^|\s)-o\b/.test(s)) return false;
+    if (/^sed\b/.test(s) && /(?:^|\s)-[a-zA-Z]*[if]/.test(s)) return false;
     return SAFE_CMD_PREFIX.test(s);
   });
 }

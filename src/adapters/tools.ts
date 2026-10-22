@@ -79,6 +79,9 @@ export function resolveSafePath(
   throw new Error(`禁止访问工作区以外的路径 (${mode}): ${targetPath}`);
 }
 
+const IGNORED_DIRS = new Set([".git", "node_modules", ".sessions", "venv", ".venv", "__pycache__", "dist", "build", ".next"]);
+const BINARY_EXT_RE = /\.(png|jpe?g|gif|webp|ico|pdf|zip|tar|gz|woff2?|ttf|eot|mp[34]|mov|pyc|so|dylib|dll|exe|db|sqlite3?|lock)$/i;
+
 async function runGrepSearch(
   workspaceRoot: string,
   args: z.infer<typeof GrepArgsSchema>,
@@ -88,14 +91,11 @@ async function runGrepSearch(
   const stat = await fs.stat(fullPath);
   const files = stat.isDirectory()
     ? (await fs.readdir(fullPath, { recursive: true, withFileTypes: true }))
-        .filter(
-          (e) =>
-            e.isFile() &&
-            !e.parentPath.includes("node_modules") &&
-            !e.parentPath.includes(".git") &&
-            !e.parentPath.includes(".sessions") &&
-            (e.name.endsWith(".ts") || e.name.endsWith(".md") || e.name.endsWith(".json")),
-        )
+        .filter((e) => {
+          if (!e.isFile() || BINARY_EXT_RE.test(e.name)) return false;
+          const relParts = path.relative(fullPath, e.parentPath).split(path.sep);
+          return !relParts.some((p) => IGNORED_DIRS.has(p));
+        })
         .map((e) => path.join(e.parentPath, e.name))
     : [fullPath];
 
@@ -109,7 +109,9 @@ async function runGrepSearch(
   const ctx = args.contextLines ?? 0;
   const matches: string[] = [];
   for (const file of files) {
-    const lines = (await fs.readFile(file, "utf-8")).split("\n");
+    const raw = await fs.readFile(file, "utf-8").catch(() => "");
+    if (!raw || raw.length > 512_000 || raw.includes("\u0000")) continue;
+    const lines = raw.split("\n");
     const rel = path.relative(realRoot, file);
     lines.forEach((line, idx) => {
       if (regex.test(line)) {
@@ -148,13 +150,29 @@ export function createBuiltinTools(workspaceRoot: string = process.cwd()): ToolC
 
   const listDirTool: ToolContract<z.infer<typeof ListDirArgsSchema>> = {
     name: "list_dir",
-    description: "列出指定目录下的文件与子目录名称",
+    description:
+      "列出指定目录的项目结构树（自动展开 2 层子目录并过滤 node_modules/.git/venv，看项目结构请直接调本工具，勿调 find）",
     parameters: ListDirArgsSchema,
     readonly: true,
     async execute(args) {
       const fullPath = resolveSafePath(workspaceRoot, args.path, "read");
       const entries = await fs.readdir(fullPath, { withFileTypes: true });
-      return entries.map((e) => (e.isDirectory() ? `${e.name}/` : e.name)).join("\n");
+      const lines: string[] = [];
+      for (const e of entries) {
+        if (IGNORED_DIRS.has(e.name)) continue;
+        if (e.isDirectory()) {
+          lines.push(`${e.name}/`);
+          const subEntries = await fs.readdir(path.join(fullPath, e.name), { withFileTypes: true }).catch(() => []);
+          for (const sub of subEntries.slice(0, 25)) {
+            if (!IGNORED_DIRS.has(sub.name)) {
+              lines.push(`  ${e.name}/${sub.name}${sub.isDirectory() ? "/" : ""}`);
+            }
+          }
+        } else {
+          lines.push(e.name);
+        }
+      }
+      return lines.join("\n");
     },
   };
 

@@ -224,8 +224,17 @@ describe("Stage 3: 写工具 (edit_file/run_bash/rollback_version)、暂停审�
         'grep -n "@app\\.|def \\|async def" "/Volumes/T7 Shield/code/kids-essay-copilot/main.py" | head -50; echo ---; wc -l "/Volumes/T7 Shield/code/kids-essay-copilot/main.py"',
       ),
     ).toBe(true);
+    expect(
+      isReadonlyBashCommand(
+        'cd "/Volumes/T7 Shield/code/kids-essay-copilot" && find . -not -path "*/venv/*" -not -path "*/node_modules/*" -not -path "*/.git/*" -not -path "*/dist/*" -not -path "*/__pycache__/*" | sort | sed -e \'s/[^-][^\\/]*\\//  /g\' -e \'s/\\/\\///\'',
+      ),
+    ).toBe(true);
 
     // 严防绕过测试
+    expect(isReadonlyBashCommand("sed -i 's/a/b/g' app.ts")).toBe(false);
+    expect(isReadonlyBashCommand("sed -Ei 's/a/b/g' app.ts")).toBe(false);
+    expect(isReadonlyBashCommand("sed 's/a/b/w out.txt' app.ts")).toBe(false);
+    expect(isReadonlyBashCommand("sed 's/a/b/e' app.ts")).toBe(false);
     expect(isReadonlyBashCommand("find . -name '*.tmp' -delete")).toBe(false);
     expect(isReadonlyBashCommand("sort a.txt -o b.txt")).toBe(false);
     expect(isReadonlyBashCommand("tree -o out.txt")).toBe(false);
