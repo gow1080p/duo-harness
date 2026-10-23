@@ -221,19 +221,20 @@ export function createRouterProvider(wireLogFile = ".sessions/http-wire.json", a
         ...(model.includes("reasoner") ? {} : { temperature: 0 }),
         stream: true,
       };
-      const timeoutSig = AbortSignal.timeout(60_000);
-      const signal = options.signal ? AbortSignal.any([options.signal, timeoutSig]) : timeoutSig;
+      const connectCtrl = new AbortController();
+      const connectTimer = setTimeout(() => connectCtrl.abort(new Error("LLM 首包连接超时 (45s)")), 45_000);
+      const signal = options.signal ? AbortSignal.any([options.signal, connectCtrl.signal]) : connectCtrl.signal;
       const res = await fetch(apiUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
         body: JSON.stringify(requestBody),
         signal,
-      });
+      }).finally(() => clearTimeout(connectTimer));
       if (!res.ok) throw new Error(`LLM HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
 
       const fallbackRenderer = options.onStreamEvent ? null : createStreamRenderer();
       const handleEvent = options.onStreamEvent ?? ((evt: LlmStreamEvent) => fallbackRenderer?.onEvent(evt));
-      const { message, rawSseLines } = await readOpenAiSseStream(res, undefined, undefined, handleEvent);
+      const { message, rawSseLines } = await readOpenAiSseStream(res, undefined, undefined, handleEvent, 45_000);
       fallbackRenderer?.flush();
 
       const entry = { roundTimestamp: new Date().toISOString(), apiUrl, requestBody, rawSseLines, assembledMessage: message };

@@ -2,49 +2,12 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AssistantMessage, LlmStreamEvent } from "../core/contracts.js";
 import { parseOpenAiAssistantMessage } from "./router.js";
+import { formatMarkdownLine, getVisualCols, wrapReasoningLines } from "./ui-logger.js";
 
-export function getVisualCols(s: string): number {
-  let w = 0;
-  for (const ch of s.replace(/\x1b\[[0-9;]*m/g, "")) w += (ch.codePointAt(0) ?? 0) > 0xff ? 2 : 1;
-  return w;
-}
-
-function formatInlineMarkdown(line: string): string {
-  return line.replace(/`([^`]+)`/g, "\x1b[36m$1\x1b[0m").replace(/\*\*([^*]+)\*\*/g, "\x1b[1;97m$1\x1b[0m").replace(/(^|[^*])\*([^*]+)\*(?!\*)/g, "$1\x1b[3m$2\x1b[0m");
-}
-
-export function formatMarkdownLine(rawLine: string, inCodeBlock: boolean): { text: string; nextInCodeBlock: boolean } {
-  const fenceMatch = rawLine.match(/^\s*```(\w*)\s*$/);
-  if (fenceMatch) {
-    return inCodeBlock ? { text: "\x1b[90m  ╰────────────────────────\x1b[0m", nextInCodeBlock: false } : { text: `\x1b[90m  ╭── ${fenceMatch[1] || "code"} ────────────────\x1b[0m`, nextInCodeBlock: true };
-  }
-  if (inCodeBlock) return { text: `\x1b[90m  │ \x1b[0m\x1b[32m${rawLine}\x1b[0m`, nextInCodeBlock: true };
-  if (/^\s*(?:---+|\*\*\*+)\s*$/.test(rawLine)) return { text: "\x1b[90m  ────────────────────────────────────────\x1b[0m", nextInCodeBlock: false };
-  if (/^\s*\|[\s:|-]+\|\s*$/.test(rawLine)) return { text: "\x1b[90m  ├────────────────────────────────────────┤\x1b[0m", nextInCodeBlock: false };
-  if (/^\s*\|.*\|\s*$/.test(rawLine)) {
-    const cells = rawLine.trim().replace(/^\||\|$/g, "").split("|").map((c) => formatInlineMarkdown(c.trim()));
-    return { text: `  \x1b[90m│\x1b[0m ${cells.join(" \x1b[90m│\x1b[0m ")} \x1b[90m│\x1b[0m`, nextInCodeBlock: false };
-  }
-  const headingMatch = rawLine.match(/^(#{1,6})\s+(.*)$/);
-  if (headingMatch) {
-    const body = formatInlineMarkdown(headingMatch[2]!);
-    return { text: headingMatch[1]!.length <= 2 ? `\x1b[1;36m▍ ${body}\x1b[0m` : `\x1b[1;33m▸ ${body}\x1b[0m`, nextInCodeBlock: false };
-  }
-  const quoteMatch = rawLine.match(/^(\s*)>\s?(.*)$/);
-  if (quoteMatch) return { text: `${quoteMatch[1]!}\x1b[90m▎\x1b[0m \x1b[3m${formatInlineMarkdown(quoteMatch[2]!)}\x1b[0m`, nextInCodeBlock: false };
-  const bulletMatch = rawLine.match(/^(\s*)[-*]\s+(.*)$/);
-  if (bulletMatch) return { text: `${bulletMatch[1]!}\x1b[36m•\x1b[0m ${formatInlineMarkdown(bulletMatch[2]!)}`, nextInCodeBlock: false };
-  const numMatch = rawLine.match(/^(\s*)(\d+\.)\s+(.*)$/);
-  if (numMatch) return { text: `${numMatch[1]!}\x1b[36m${numMatch[2]!}\x1b[0m ${formatInlineMarkdown(numMatch[3]!)}`, nextInCodeBlock: false };
-  return { text: formatInlineMarkdown(rawLine), nextInCodeBlock: false };
-}
+export { formatMarkdownLine, getVisualCols, wrapReasoningLines };
 
 export interface HttpWireLogEntry {
-  roundTimestamp: string;
-  apiUrl: string;
-  requestBody: Record<string, unknown>;
-  rawSseLines: string[];
-  assembledMessage: AssistantMessage;
+  roundTimestamp: string; apiUrl: string; requestBody: Record<string, unknown>; rawSseLines: string[]; assembledMessage: AssistantMessage;
 }
 
 export function assembleSsePayloads(dataPayloads: readonly string[]): AssistantMessage {
@@ -85,15 +48,10 @@ export async function readOpenAiSseStream(
   onDeltaText?: (text: string) => void,
   onReasoningDelta?: (text: string) => void,
   onStreamEvent?: (event: LlmStreamEvent) => void,
+  idleTimeoutMs = 45_000,
 ): Promise<{ message: AssistantMessage; rawSseLines: string[] }> {
-  const emitReasoning = (text: string) => {
-    onReasoningDelta?.(text);
-    onStreamEvent?.({ type: "reasoning_delta", text });
-  };
-  const emitContent = (text: string) => {
-    onDeltaText?.(text);
-    onStreamEvent?.({ type: "content_delta", text });
-  };
+  const emitReasoning = (text: string) => { onReasoningDelta?.(text); onStreamEvent?.({ type: "reasoning_delta", text }); };
+  const emitContent = (text: string) => { onDeltaText?.(text); onStreamEvent?.({ type: "content_delta", text }); };
   const contentType = res.headers.get("content-type") ?? "";
   if (!contentType.includes("text/event-stream") || !res.body) {
     const data = (await res.json()) as Record<string, any>;
@@ -136,7 +94,18 @@ export async function readOpenAiSseStream(
   };
 
   while (true) {
-    const { done, value } = await reader.read();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const { done, value } = await (idleTimeoutMs > 0
+      ? Promise.race([
+          reader.read(),
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => {
+              reject(new Error(`SSE 流空闲超时 (${idleTimeoutMs}ms 无新数据)`));
+              reader.cancel().catch(() => {});
+            }, idleTimeoutMs);
+          }),
+        ]).finally(() => clearTimeout(timer))
+      : reader.read());
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
     const lines = buffer.split("\n");
@@ -150,18 +119,22 @@ export async function readOpenAiSseStream(
 
 export function createStreamRenderer(stream: { write: (s: string) => unknown; columns?: number } = process.stdout) {
   let inReasoning = false, hasStartedContent = false, inCodeBlock = false;
-  let currentLine = "", linePrefix = "", previewCols = 0, toolName = "", toolChars = 0;
-
+  let currentLine = "", linePrefix = "", previewCols = 0, toolName = "", toolChars = 0, reasoningRaw = "", reasoningRows = 0;
   const clearToolProgress = () => {
     if (!toolChars && !toolName) return;
-    stream.write("\r\x1b[K");
-    toolName = "";
-    toolChars = 0;
+    stream.write("\r\x1b[K"); toolName = ""; toolChars = 0;
+  };
+  const eraseReasoningBox = () => {
+    if (reasoningRows <= 0) return;
+    stream.write(`${reasoningRows > 1 ? `\x1b[${reasoningRows - 1}A` : ""}\r\x1b[J`); reasoningRows = 0;
   };
   const finishReasoning = () => {
     if (!inReasoning) return;
-    stream.write("\x1b[0m\n");
-    inReasoning = false;
+    const allLines = wrapReasoningLines(reasoningRaw, Math.max(20, (stream.columns ?? 80) - 6));
+    if (allLines.length > 5) {
+      eraseReasoningBox(); stream.write(`💭 \x1b[2m[已思考 ${reasoningRaw.length} 字]\x1b[0m\n`);
+    } else stream.write("\x1b[0m\n");
+    inReasoning = false; reasoningRaw = ""; reasoningRows = 0;
   };
   const writePreviewSlice = (text: string) => {
     const maxCols = Math.max(20, (stream.columns ?? 80) - 8);
@@ -170,8 +143,7 @@ export function createStreamRenderer(stream: { write: (s: string) => unknown; co
     for (const ch of text) {
       const w = (ch.codePointAt(0) ?? 0) > 0xff ? 2 : 1;
       if (previewCols + w > maxCols) break;
-      out += ch;
-      previewCols += w;
+      out += ch; previewCols += w;
     }
     if (out) stream.write(out);
   };
@@ -179,15 +151,22 @@ export function createStreamRenderer(stream: { write: (s: string) => unknown; co
     const { text: formatted, nextInCodeBlock } = formatMarkdownLine(currentLine, inCodeBlock);
     inCodeBlock = nextInCodeBlock;
     stream.write(`\r\x1b[K${linePrefix}${formatted}${withNewline ? "\n" : ""}`);
-    currentLine = linePrefix = "";
-    previewCols = 0;
+    currentLine = linePrefix = ""; previewCols = 0;
   };
-
   return {
     onReasoning(chunk: string) {
       clearToolProgress();
-      if (!inReasoning) { stream.write("\n💭 \x1b[2m\x1b[3m"); inReasoning = true; }
-      stream.write(chunk.replace(/(?:\r?\n)+/g, "\n   "));
+      if (!inReasoning) { stream.write("\n"); inReasoning = true; }
+      reasoningRaw += chunk;
+      const allLines = wrapReasoningLines(reasoningRaw, Math.max(20, (stream.columns ?? 80) - 6));
+      eraseReasoningBox();
+      if (allLines.length <= 5) {
+        stream.write(`💭 \x1b[2m\x1b[3m${allLines.join("\n   ")}`); reasoningRows = allLines.length;
+      } else {
+        const tail = allLines.slice(-5);
+        stream.write(`💭 \x1b[2m[思考中 ${reasoningRaw.length} 字 · 实时滚动]\x1b[0m\n   \x1b[2m\x1b[3m${tail.join("\n   ")}\x1b[0m`);
+        reasoningRows = tail.length + 1;
+      }
     },
     onToolCall(name?: string, argsDelta = "") {
       finishReasoning();
@@ -196,20 +175,14 @@ export function createStreamRenderer(stream: { write: (s: string) => unknown; co
       stream.write(`\r\x1b[K\x1b[2m⏳ 正在生成工具调用 ${toolName || "..."} (${toolChars} 字符)...\x1b[0m`);
     },
     onContent(chunk: string) {
-      finishReasoning();
-      clearToolProgress();
+      finishReasoning(); clearToolProgress();
       if (!hasStartedContent) {
-        linePrefix = "💬 ";
-        previewCols = getVisualCols(linePrefix);
-        stream.write(`\n${linePrefix}`);
-        hasStartedContent = true;
+        linePrefix = "💬 "; previewCols = getVisualCols(linePrefix);
+        stream.write(`\n${linePrefix}`); hasStartedContent = true;
       }
       const parts = chunk.split("\n");
       for (let i = 0; i < parts.length; i++) {
-        if (parts[i]) {
-          writePreviewSlice(parts[i]!);
-          currentLine += parts[i]!;
-        }
+        if (parts[i]) { writePreviewSlice(parts[i]!); currentLine += parts[i]!; }
         if (i < parts.length - 1) commitCurrentLine(true);
       }
     },
@@ -219,8 +192,7 @@ export function createStreamRenderer(stream: { write: (s: string) => unknown; co
       else if (evt.type === "tool_call_delta") this.onToolCall(evt.name, evt.argsDelta);
     },
     flush() {
-      finishReasoning();
-      clearToolProgress();
+      finishReasoning(); clearToolProgress();
       if (currentLine.length > 0) commitCurrentLine(false);
       if (hasStartedContent) stream.write("\x1b[0m\n");
     },

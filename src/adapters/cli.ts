@@ -163,7 +163,7 @@ export async function runAgentSession(
   userPrompt: string,
   options: RunSessionOptions = {},
 ): Promise<{ finalAnswer: string; stepsUsed: number; entries: SessionEntry[]; leafId: string | null }> {
-  const isReplay = Boolean(options.replayFromFile);
+  const isReplay = Boolean(options.replayFromFile), turnStartMs = Date.now();
   const workspaceRoot = options.workspaceRoot ?? process.cwd();
   const snapshots = options.snapshots ?? [];
   const snapStartIdx = snapshots.length;
@@ -196,7 +196,7 @@ export async function runAgentSession(
         const rb = await rollbackFileSnapshots(workspaceRoot, snapshots, turnSnapCount, options.onSnapshotChange);
         console.warn(`🔄 [任务熔断自动回滚] 已自动还原 ${rb.rolledBackCount} 个版本修改 (${rb.touchedPaths.join(", ")})`);
       } else if (turnSnapCount > 0 && options.suppressFinalEcho) {
-        console.log(formatCompactTurnFooter(wireLogFile, stepRes.state.step, isReplay, snapshots.slice(snapStartIdx), workspaceRoot));
+        console.log(formatCompactTurnFooter(wireLogFile, stepRes.state.step, isReplay, snapshots.slice(snapStartIdx), workspaceRoot, Date.now() - turnStartMs));
       }
       printCostIfEnabled(options, wireLogFile, isReplay);
       console.error(`\n❌ [循环熔断终止] ${stepRes.effect.reason}`);
@@ -228,7 +228,7 @@ export async function runAgentSession(
     printCostIfEnabled(options, wireLogFile, isReplay);
     console.log(`\n✅ [最终回答 (共执行 ${stepRes.state.step} 步)]:\n${stepRes.effect.finalAnswer}`);
   } else {
-    console.log(formatCompactTurnFooter(wireLogFile, stepRes.state.step, isReplay, snapshots.slice(snapStartIdx), workspaceRoot));
+    console.log(formatCompactTurnFooter(wireLogFile, stepRes.state.step, isReplay, snapshots.slice(snapStartIdx), workspaceRoot, Date.now() - turnStartMs));
   }
   return { finalAnswer: stepRes.effect.finalAnswer, stepsUsed: stepRes.state.step, entries: recordedEntries, leafId: cursor.leafId };
 }

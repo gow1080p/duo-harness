@@ -1,10 +1,63 @@
 import * as fs from "node:fs";
+import * as path from "node:path";
+import { pathToFileURL } from "node:url";
 import type { ToolResultMessage } from "../core/contracts.js";
 import { summarizeWireCost } from "./cost-tracker.js";
 import { type FileDiffSummaryItem, formatApprovalBox, formatStepToolCalls, normalizeEditsArray, summarizeSnapshotsDiff } from "./diff-presenter.js";
-import { formatMarkdownLine, getVisualCols, type HttpWireLogEntry } from "./sse-stream.js";
+import { toPosixPath } from "./platform.js";
+import type { HttpWireLogEntry } from "./sse-stream.js";
 
-export { type FileDiffSummaryItem, formatApprovalBox, formatMarkdownLine, formatStepToolCalls, getVisualCols, normalizeEditsArray, summarizeSnapshotsDiff };
+export { type FileDiffSummaryItem, formatApprovalBox, formatStepToolCalls, normalizeEditsArray, summarizeSnapshotsDiff };
+
+export function getVisualCols(s: string): number {
+  let w = 0;
+  for (const ch of s.replace(/\x1b\[[0-9;]*m/g, "")) w += (ch.codePointAt(0) ?? 0) > 0xff ? 2 : 1;
+  return w;
+}
+
+function formatInlineMarkdown(line: string): string {
+  return line.replace(/`([^`]+)`/g, "\x1b[36m$1\x1b[0m").replace(/\*\*([^*]+)\*\*/g, "\x1b[1;97m$1\x1b[0m").replace(/(^|[^*])\*([^*]+)\*(?!\*)/g, "$1\x1b[3m$2\x1b[0m");
+}
+
+export function formatMarkdownLine(rawLine: string, inCodeBlock: boolean): { text: string; nextInCodeBlock: boolean } {
+  const fenceMatch = rawLine.match(/^\s*```(\w*)\s*$/);
+  if (fenceMatch) {
+    return inCodeBlock ? { text: "\x1b[90m  ╰────────────────────────\x1b[0m", nextInCodeBlock: false } : { text: `\x1b[90m  ╭── ${fenceMatch[1] || "code"} ────────────────\x1b[0m`, nextInCodeBlock: true };
+  }
+  if (inCodeBlock) return { text: `\x1b[90m  │ \x1b[0m\x1b[32m${rawLine}\x1b[0m`, nextInCodeBlock: true };
+  if (/^\s*(?:---+|\*\*\*+)\s*$/.test(rawLine)) return { text: "\x1b[90m  ────────────────────────────────────────\x1b[0m", nextInCodeBlock: false };
+  if (/^\s*\|[\s:|-]+\|\s*$/.test(rawLine)) return { text: "\x1b[90m  ├────────────────────────────────────────┤\x1b[0m", nextInCodeBlock: false };
+  if (/^\s*\|.*\|\s*$/.test(rawLine)) {
+    const cells = rawLine.trim().replace(/^\||\|$/g, "").split("|").map((c) => formatInlineMarkdown(c.trim()));
+    return { text: `  \x1b[90m│\x1b[0m ${cells.join(" \x1b[90m│\x1b[0m ")} \x1b[90m│\x1b[0m`, nextInCodeBlock: false };
+  }
+  const headingMatch = rawLine.match(/^(#{1,6})\s+(.*)$/);
+  if (headingMatch) {
+    const body = formatInlineMarkdown(headingMatch[2]!);
+    return { text: headingMatch[1]!.length <= 2 ? `\x1b[1;36m▍ ${body}\x1b[0m` : `\x1b[1;33m▸ ${body}\x1b[0m`, nextInCodeBlock: false };
+  }
+  const quoteMatch = rawLine.match(/^(\s*)>\s?(.*)$/);
+  if (quoteMatch) return { text: `${quoteMatch[1]!}\x1b[90m▎\x1b[0m \x1b[3m${formatInlineMarkdown(quoteMatch[2]!)}\x1b[0m`, nextInCodeBlock: false };
+  const bulletMatch = rawLine.match(/^(\s*)[-*]\s+(.*)$/);
+  if (bulletMatch) return { text: `${bulletMatch[1]!}\x1b[36m•\x1b[0m ${formatInlineMarkdown(bulletMatch[2]!)}`, nextInCodeBlock: false };
+  const numMatch = rawLine.match(/^(\s*)(\d+\.)\s+(.*)$/);
+  if (numMatch) return { text: `${numMatch[1]!}\x1b[36m${numMatch[2]!}\x1b[0m ${formatInlineMarkdown(numMatch[3]!)}`, nextInCodeBlock: false };
+  return { text: formatInlineMarkdown(rawLine), nextInCodeBlock: false };
+}
+
+export function wrapReasoningLines(raw: string, maxCols: number): string[] {
+  const out: string[] = [];
+  for (const para of raw.split(/\r?\n/)) {
+    if (!para) { out.push(""); continue; }
+    let line = "", cols = 0;
+    for (const ch of para) {
+      const w = (ch.codePointAt(0) ?? 0) > 0xff ? 2 : 1;
+      if (cols + w > maxCols) { out.push(line); line = ch; cols = w; } else { line += ch; cols += w; }
+    }
+    if (line) out.push(line);
+  }
+  return out.length > 0 ? out : [""];
+}
 
 const SAFE_READONLY_VERBS_RE =
   /^(?:ls|cat|head|tail|wc|grep|egrep|fgrep|rg|ag|find|stat|file|du|df|pwd|realpath|dirname|basename|which|whereis|type|echo|printf|tr|cut|sort|uniq|diff|comm|cmp|md5|shasum|sha256sum|xxd|hexdump|strings|tree|uname|whoami|id|hostname|date|uptime|printenv|ps|lsof|pgrep|sed|curl|test|true|false)(?:\s|$)/;
@@ -19,8 +72,11 @@ export function shortenWorkspaceText(raw: string, workspaceRoot?: string): strin
   if (!raw) return raw;
   let res = raw;
   if (workspaceRoot) {
-    const cleanRoot = workspaceRoot.replace(/\/$/, "");
-    if (cleanRoot) res = res.split(`${cleanRoot}/`).join("").split(cleanRoot).join(".");
+    for (const rootVariant of [workspaceRoot.replace(/[\\/]+$/, ""), toPosixPath(workspaceRoot).replace(/\/+$/, "")]) {
+      if (rootVariant) {
+        res = res.split(`${rootVariant}/`).join("").split(`${rootVariant}\\`).join("").split(rootVariant).join(".");
+      }
+    }
   }
   return res.replace(/^\s*cd\s+(?:"\."|'\.'|\.)\s*(?:&&|;)\s*/, "");
 }
@@ -40,10 +96,10 @@ export function buildDefaultSystemPrompt(workspaceRoot: string): string {
     `你是运行在 Duo-Harness 宿主环境中的本地编程智能体（全程必须使用简明中文思考与回答，第 1 步起 reasoning 严禁输出英文 Let me...；严禁自称 Claude 或 Anthropic 模型，当用户询问模型身份时请如实回答底层模型如 DeepSeek 或小米 MiMo）。`,
     `- 当前工作区根目录 (workspaceRoot): ${workspaceRoot} (操作系统: ${process.platform})`,
     `- 工具使用纪律（必须严格遵守）：`,
-    `  1. 查看目录与文件行数必须直接调用 list_dir（已自带 2 层目录树、代码文件行数及顶层/二级 [已过滤忽略目录] 如 venv/、web-ui/node_modules/），读文件调 read_file（1000 行内直接一次读完，多个文件同轮并发读取），搜索代码调 grep；严禁调用 run_bash 执行 cat/find/grep/ls/wc，也严禁用 ls node_modules 或 python -c "import ..." 试探依赖。`,
+    `  1. 查看目录与文件行数必须直接调用 list_dir（已自带 2 层目录树、代码文件行数及顶层/二级 [已过滤忽略目录] 如 venv/、web-ui/node_modules/），读文件调 read_file（1000 行内直接一次读完，多个文件同轮并发读取），搜索代码调 grep；严禁调用未注册的 glob、find_by_name 或 write_file 工具（找文件只用 list_dir/grep，新建与修改文件统一用 edit_file）；严禁调用 run_bash 执行 cat/find/grep/ls/wc，也严禁用 ls node_modules 或 python -c "import ..." 试探依赖。`,
     `  2. 调用工具时 path 参数请直接传相对于工作区根目录的简短相对路径（如 "."、"README.md"、"src/index.ts"），不要重复拼接长绝对路径。`,
     `  3. run_bash 默认已在工作区根目录 (${workspaceRoot}) 下启动，严禁在命令开头拼接 cd "${workspaceRoot}" &&；前端/TS 类型检查请统一用只读命令 npx tsc --noEmit（自动免确认放行，勿用会写缓存的 tsc -b）；只读环境检查严禁与写操作或 python -c 混写在同一条 run_bash 中；启动常驻服务（如 uvicorn/vite/npm run dev）必须用后台方式（nohup ... > /tmp/xxx.log 2>&1 </dev/null &）并在同条命令内 sleep 1~2 后检查端口或日志，严禁前台裸跑常驻进程。`,
-    `  4. 修改同一个文件的多处内容时，请使用 edit_file 的 edits 批量数组在单次调用中完成（或同一步并发调用多个 edit_file）；严禁通过 run_bash 调用 sed -i 或脚本改写源码文件。`,
+    `  4. 修改同一个文件的多处内容时，请使用 edit_file 的 edits 批量数组在单次调用中完成（或同一步并发调用多个 edit_file）；从 0 到 1 初始化或搭建多文件项目（Vibe Coding）时，必须采用「分批小步落盘」：每一步最多新建或修改 1~3 个文件（先写 package.json/基础配置 -> 安装依赖或写核心逻辑 -> 写页面/入口并验证），严禁在单步 tool_calls 中一口气塞入超过 3 个大文件的完整代码；严禁通过 run_bash 调用 sed -i 或脚本改写源码文件。`,
     `  5. 思考过程（reasoning）必须全程使用简明中文，调工具取证阶段思考控制在 100 字以内，聚焦下一步动作；当用户要求“拉起/启动项目”时，第 1~2 步用 list_dir 与 read_file 读齐入口配置（如 README.md、main.py、package.json、vite.config.ts）后立即在下一步直接启动服务，禁止超过 2 步纯探索。`,
   ].join("\n");
 }
@@ -132,12 +188,23 @@ export function computeTurnMetrics(wireLogFile: string, stepsUsed: number, isRep
   } catch { return null; }
 }
 
-export function formatCompactTurnFooter(wireLogFile: string, stepsUsed: number, isReplay = false, turnSnapshots: readonly { path: string; beforeContent: string | null; afterContent: string; hunkCount?: number }[] = [], workspaceRoot?: string): string {
+export function formatDurationMs(ms?: number): string {
+  if (ms === undefined || ms < 0) return "";
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  const totalSec = Math.round(ms / 1000);
+  return `${Math.floor(totalSec / 60)}m${totalSec % 60}s`;
+}
+
+export function formatCompactTurnFooter(wireLogFile: string, stepsUsed: number, isReplay = false, turnSnapshots: readonly { path: string; beforeContent: string | null; afterContent: string; hunkCount?: number }[] = [], workspaceRoot?: string, elapsedMs?: number): string {
   const diffs = summarizeSnapshotsDiff(turnSnapshots, workspaceRoot);
   const totalAdd = diffs.reduce((a, d) => a + d.addedLines, 0), totalRem = diffs.reduce((a, d) => a + d.removedLines, 0);
-  const modLines = diffs.length > 0 ? [`\n📋 [本轮共修改 ${diffs.length} 个文件 (\x1b[32m+${totalAdd}\x1b[0m / \x1b[31m-${totalRem}\x1b[0m 行) · 输入 /diff 查看代码对比 | 输入 /undo 撤回修改]:`, ...diffs.map((d) => `  ✏️  ${d.file} (${d.isNew ? `新建 \x1b[32m+${d.newLines}\x1b[0m 行` : `\x1b[32m+${d.addedLines}\x1b[0m / \x1b[31m-${d.removedLines}\x1b[0m 行 · ${d.edits} 处修改 (${d.oldLines} -> ${d.newLines} 行)`})`)] : [];
+  const modLines = diffs.length > 0 ? [`\n📋 [本轮共修改 ${diffs.length} 个文件 (\x1b[32m+${totalAdd}\x1b[0m / \x1b[31m-${totalRem}\x1b[0m 行) · 输入 /diff 查看代码对比 | 输入 /undo 撤回修改]:`, ...diffs.map((d) => {
+    const previewLink = workspaceRoot && /\.(?:html?|svg)$/i.test(d.file) ? ` · 🌐 ${pathToFileURL(path.resolve(workspaceRoot, d.file)).href}` : "";
+    return `  ✏️  ${d.file} (${d.isNew ? `新建 \x1b[32m+${d.newLines}\x1b[0m 行` : `\x1b[32m+${d.addedLines}\x1b[0m / \x1b[31m-${d.removedLines}\x1b[0m 行 · ${d.edits} 处修改 (${d.oldLines} -> ${d.newLines} 行)`})${previewLink}`;
+  })] : [];
   const modPrefix = modLines.length > 0 ? `${modLines.join("\n")}\n` : "\n";
+  const durTag = elapsedMs !== undefined ? ` · ⏱️ ${formatDurationMs(elapsedMs)}` : "";
   const m = computeTurnMetrics(wireLogFile, stepsUsed, isReplay);
   const costStr = m ? (m.totalCostCny > m.sessionCostCny + 0.00005 ? `本轮 ¥${m.turnCostCny.toFixed(4)} / 当前对话 ¥${m.sessionCostCny.toFixed(4)} (项目总计 ¥${m.totalCostCny.toFixed(4)})` : `本轮 ¥${m.turnCostCny.toFixed(4)} / 当前对话 ¥${m.sessionCostCny.toFixed(4)}`) : "";
-  return m ? `${modPrefix}✅ 本轮完成 (🤖 ${m.activeModel} · 共 ${stepsUsed} 步 · 💰 ${costStr} · 缓存命中 ${m.cacheHitRatePct.toFixed(0)}% · 输入 /xray 查账单)` : `${modPrefix}✅ 本轮完成 (共 ${stepsUsed} 步)`;
+  return m ? `${modPrefix}✅ 本轮完成 (🤖 ${m.activeModel}${durTag} · 共 ${stepsUsed} 步 · 💰 ${costStr} · 缓存命中 ${m.cacheHitRatePct.toFixed(0)}% · 输入 /xray 查账单)` : `${modPrefix}✅ 本轮完成 (${durTag ? `⏱️ ${formatDurationMs(elapsedMs)} · ` : ""}共 ${stepsUsed} 步)`;
 }

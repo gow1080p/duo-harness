@@ -1,4 +1,4 @@
-import { execFile, execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import * as fs from "node:fs";
 import * as https from "node:https";
 import * as os from "node:os";
@@ -6,6 +6,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { AssistantMessageSchema, type AssistantMessage, type LlmProvider, type LlmStreamEvent, type Message, type ToolContract } from "../core/contracts.js";
+import { discoverOsLsProcess, querySqliteFirstValue, resolveAntigravityLsBin } from "./platform.js";
 import { zodObjectToJsonSchema } from "./router.js";
 import { createStreamRenderer, recordHttpWireLog } from "./sse-stream.js";
 
@@ -27,10 +28,6 @@ export function stripAgyFooter(rawText: string): string {
   return head.length > 0 ? head : rawText;
 }
 
-function resolveLsBin(): string {
-  return process.env.ANTIGRAVITY_LS_BIN && fs.existsSync(process.env.ANTIGRAVITY_LS_BIN) ? process.env.ANTIGRAVITY_LS_BIN : "/Applications/Antigravity.app/Contents/Resources/bin/language_server";
-}
-
 function callLocalLsRpc(port: number, token: string, rpcName: string, body: Record<string, unknown> = {}): Promise<any> {
   return new Promise((resolve) => {
     const req = https.request(
@@ -50,25 +47,17 @@ function callLocalLsRpc(port: number, token: string, rpcName: string, body: Reco
 
 async function discoverLocalLs(): Promise<{ port: number; grpcPort: number; token: string; projectId: string } | null> {
   try {
-    const psOut = execFileSync("ps", ["-ww", "-axo", "pid=,command="], { timeout: 1500 }).toString();
-    let pid = "", token = process.env.ANTIGRAVITY_CSRF_TOKEN?.trim() || "", projectId = process.env.ANTIGRAVITY_PROJECT_ID?.trim() || "";
-    for (const line of psOut.split("\n")) {
-      if (line.includes("language_server") && !line.includes("agentapi")) {
-        const m = line.trim().match(/^(\d+)\s+.*--csrf_token[=\s]+([0-9a-fA-F-]+)/);
-        if (m?.[1] && m?.[2]) { pid = m[1]; token = m[2]; break; }
-      }
-    }
-    if (!token) return null;
+    const { token, ports } = discoverOsLsProcess();
+    if (!token || ports.length === 0) return null;
     const dbPath = path.join(os.homedir(), ".gemini", "antigravity", "conversation_summaries.db");
-    if (!projectId && fs.existsSync(dbPath)) {
-      try { projectId = execFileSync("sqlite3", ["-list", dbPath, "SELECT project_id FROM conversation_summaries WHERE project_id IS NOT NULL AND project_id != '' ORDER BY last_modified_time DESC LIMIT 1;"], { timeout: 1000 }).toString().trim(); } catch {}
-    }
-    const lsofArgs = pid ? ["-nP", "-a", "-p", pid, "-iTCP", "-sTCP:LISTEN"] : ["-iTCP", "-sTCP:LISTEN", "-n", "-P"];
-    const lsofOut = execFileSync("lsof", lsofArgs, { timeout: 1500 }).toString();
-    const ports = lsofOut.split("\n").filter((l) => l.includes("language_")).map((l) => Number(l.match(/:(\d+)\s+\(LISTEN\)/)?.[1] ?? 0)).filter(Boolean);
+    const projectId =
+      process.env.ANTIGRAVITY_PROJECT_ID?.trim() ||
+      querySqliteFirstValue(dbPath, "SELECT project_id FROM conversation_summaries WHERE project_id IS NOT NULL AND project_id != '' ORDER BY last_modified_time DESC LIMIT 1;");
     for (const port of ports) {
       const status = await callLocalLsRpc(port, token, "GetUserStatus", {});
-      if (status?.userStatus) return { port, grpcPort: ports.includes(port + 1) ? port + 1 : (ports.find((p) => p !== port) ?? port + 1), token, projectId };
+      if (status?.userStatus) {
+        return { port, grpcPort: ports.includes(port + 1) ? port + 1 : (ports.find((p) => p !== port) ?? port + 1), token, projectId };
+      }
     }
   } catch {}
   return null;
@@ -176,7 +165,7 @@ export function createAgyBridgeProvider(wireLogFile = ".sessions/http-wire.json"
   let roundCount = 0;
   return {
     async chat(messages: Message[], tools: ToolContract<any>[] = [], options: { signal?: AbortSignal; onStreamEvent?: (event: LlmStreamEvent) => void } = {}): Promise<AssistantMessage> {
-      const lsBin = resolveLsBin();
+      const lsBin = resolveAntigravityLsBin();
       const conn = await discoverLocalLs();
       if (!fs.existsSync(lsBin) || !conn) throw new Error("未检测到本机运行中的 Antigravity language_server，无法使用 agy 桥接模式");
       const cleanEnv: NodeJS.ProcessEnv = { ...process.env, ANTIGRAVITY_LS_ADDRESS: process.env.ANTIGRAVITY_LS_ADDRESS || `localhost:${conn.grpcPort}`, ANTIGRAVITY_CSRF_TOKEN: process.env.ANTIGRAVITY_CSRF_TOKEN || conn.token, ...(conn.projectId ? { ANTIGRAVITY_PROJECT_ID: conn.projectId } : {}) };

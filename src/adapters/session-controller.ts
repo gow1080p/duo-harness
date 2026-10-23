@@ -3,19 +3,7 @@ import * as path from "node:path";
 import type { LlmProvider, SessionEntry } from "../core/contracts.js";
 import { runAgentSession, type RunSessionOptions } from "./cli.js";
 import { loadAndFormatWireCost } from "./cost-tracker.js";
-import {
-  type ConversationTurnSummary,
-  extractConversationTurns,
-  formatRecentHistoryRecap,
-  formatSnapshotsDiff,
-  loadProjectMeta,
-  loadProjectSnapshots,
-  type ProjectSessionPaths,
-  resolveProjectSessionPaths,
-  resolveTargetWorkspace,
-  saveProjectMeta,
-  saveProjectSnapshots,
-} from "./project-store.js";
+import { type ConversationTurnSummary, extractConversationTurns, formatRecentHistoryRecap, formatSnapshotsDiff, loadProjectMeta, loadProjectSnapshots, type ProjectSessionPaths, resolveProjectSessionPaths, resolveTargetWorkspace, saveProjectMeta, saveProjectSnapshots } from "./project-store.js";
 import { createRouterProvider, type ModelMode, resolveActiveModelTarget } from "./router.js";
 import { loadJsonlEntries } from "./store.js";
 import { computeTurnMetrics, type FileDiffSummaryItem, summarizeSnapshotsDiff } from "./ui-logger.js";
@@ -23,43 +11,23 @@ import { type FileVersionSnapshot, rollbackFileSnapshots } from "./write-tools.j
 import { analyzeSessionXray, formatXrayReport } from "./xray.js";
 
 export interface SessionStatusSummary {
-  projectKey: string;
-  projectName: string;
-  workspaceRoot: string;
-  isNew: boolean;
-  activeTurnIndex: number | null;
-  totalTurns: number;
-  leafId: string | null;
-  modelMode: ModelMode;
-  activeModel: string;
-  modelLabel: string;
+  projectKey: string; projectName: string; workspaceRoot: string; isNew: boolean;
+  activeTurnIndex: number | null; totalTurns: number; leafId: string | null;
+  modelMode: ModelMode; activeModel: string; modelLabel: string;
 }
 
 export interface TurnExecutionSummary {
-  finalAnswer: string;
-  stepsUsed: number;
-  leafId: string | null;
-  activeModel: string;
-  turnCostCny: number;
-  totalCostCny: number;
-  cacheHitRatePct: number;
-  modifiedFiles: FileDiffSummaryItem[];
+  finalAnswer: string; stepsUsed: number; leafId: string | null; activeModel: string;
+  turnCostCny: number; totalCostCny: number; cacheHitRatePct: number; modifiedFiles: FileDiffSummaryItem[];
 }
 
 export interface SessionControllerOptions {
-  workspaceRoot?: string;
-  homeBaseDir?: string;
-  provider?: LlmProvider;
+  workspaceRoot?: string; homeBaseDir?: string; provider?: LlmProvider;
 }
 
 interface ControllerMutableState {
-  paths: ProjectSessionPaths;
-  snapshots: FileVersionSnapshot[];
-  leafId: string | null;
-  modelMode: ModelMode;
-  provider: LlmProvider;
-  customProvider?: LlmProvider;
-  homeBaseDir?: string;
+  paths: ProjectSessionPaths; snapshots: FileVersionSnapshot[]; leafId: string | null;
+  modelMode: ModelMode; provider: LlmProvider; customProvider?: LlmProvider; homeBaseDir?: string;
 }
 
 function loadDiskEntries(sessionFile: string): SessionEntry[] {
@@ -105,6 +73,18 @@ function buildStatusSummary(st: ControllerMutableState): SessionStatusSummary {
   };
 }
 
+export function squashTurnSnapshots(snapshots: FileVersionSnapshot[], startIndex: number, turnId: string): void {
+  if (snapshots.length <= startIndex) return;
+  const byPath = new Map<string, FileVersionSnapshot>();
+  for (let i = startIndex; i < snapshots.length; i++) {
+    const s = snapshots[i]!;
+    const prev = byPath.get(s.path);
+    byPath.set(s.path, { version: 0, path: s.path, beforeContent: prev ? prev.beforeContent : s.beforeContent, afterContent: s.afterContent, timestamp: s.timestamp, turnId, hunkCount: (prev?.hunkCount ?? 0) + (s.hunkCount ?? 1) });
+  }
+  const merged = [...byPath.values()].filter((s) => s.beforeContent !== s.afterContent).map((s, idx) => ({ ...s, version: startIndex + idx + 1 }));
+  snapshots.splice(startIndex, snapshots.length - startIndex, ...merged);
+}
+
 async function executeControllerAsk(st: ControllerMutableState, prompt: string, runOpts: Partial<RunSessionOptions> = {}): Promise<TurnExecutionSummary> {
   syncStateFromDisk(st);
   const meta = loadProjectMeta(st.paths.metaFile);
@@ -116,6 +96,7 @@ async function executeControllerAsk(st: ControllerMutableState, prompt: string, 
     for (let i = snapStart; i < st.snapshots.length; i++) if (!st.snapshots[i]!.turnId) st.snapshots[i]!.turnId = turnId;
     saveProjectSnapshots(st.paths.snapshotsFile, st.snapshots);
   };
+  let finalLeafId = st.leafId;
   try {
     const res = await runAgentSession(effectivePrompt, {
       ...runOpts,
@@ -129,10 +110,10 @@ async function executeControllerAsk(st: ControllerMutableState, prompt: string, 
       enableWriteTools: runOpts.enableWriteTools ?? true,
       showCostReport: runOpts.showCostReport ?? false,
     });
-    st.leafId = res.leafId;
-    saveProjectMeta(st.paths.metaFile, { activeLeafId: res.leafId });
-    const turnSnaps = st.snapshots.slice(snapStart);
+    finalLeafId = res.leafId;
+    squashTurnSnapshots(st.snapshots, snapStart, turnId);
     persistTurnSnapshots();
+    const turnSnaps = st.snapshots.slice(snapStart);
     const m = computeTurnMetrics(st.paths.wireLogFile, res.stepsUsed);
     const status = buildStatusSummary(st);
     return {
@@ -145,7 +126,13 @@ async function executeControllerAsk(st: ControllerMutableState, prompt: string, 
       cacheHitRatePct: m?.cacheHitRatePct ?? 0,
       modifiedFiles: summarizeSnapshotsDiff(turnSnaps, st.paths.workspaceRoot),
     };
+  } catch (err) {
+    const disk = loadDiskEntries(st.paths.sessionFile);
+    if (disk.length > 0) finalLeafId = disk[disk.length - 1]!.id;
+    throw err;
   } finally {
+    st.leafId = finalLeafId;
+    saveProjectMeta(st.paths.metaFile, { activeLeafId: finalLeafId });
     persistTurnSnapshots();
   }
 }
@@ -216,9 +203,14 @@ export function createSessionController(options: SessionControllerOptions = {}) 
       saveProjectMeta(st.paths.metaFile, { modelMode: mode });
       return buildStatusSummary(st);
     },
-    getDiff: () => {
+    getDiff: (arg = "turn") => {
       syncStateFromDisk(st);
-      return { files: summarizeSnapshotsDiff(st.snapshots, st.paths.workspaceRoot), totalSnapshots: st.snapshots.length, formattedText: formatSnapshotsDiff(st.snapshots, st.paths.workspaceRoot) };
+      const rawTokens = arg.trim().split(/\s+/).filter(Boolean), lower = rawTokens.map((t) => t.toLowerCase());
+      const isAll = lower.includes("all"), isFull = lower.includes("full");
+      const fileFilter = rawTokens.find((t) => !/^(?:turn|all|full)$/i.test(t));
+      const top = st.snapshots[st.snapshots.length - 1];
+      const targetSnaps = !isAll && top?.turnId ? st.snapshots.filter((s) => s.turnId === top.turnId) : st.snapshots;
+      return { files: summarizeSnapshotsDiff(targetSnaps, st.paths.workspaceRoot, isFull), totalSnapshots: st.snapshots.length, formattedText: formatSnapshotsDiff(targetSnaps, st.paths.workspaceRoot, { full: isFull, totalVersions: st.snapshots.length, fileFilter }) };
     },
     undo: (arg = "turn") => executeControllerUndo(st, arg),
     switchWorkspace: (targetArg: string) => {

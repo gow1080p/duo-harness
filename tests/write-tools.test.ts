@@ -3,7 +3,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import { runAgentSession } from "../src/adapters/cli.js";
+import { expandHomePath, isPathInside, toPosixPath } from "../src/adapters/platform.js";
 import { createBuiltinTools, executeToolCalls, resolveSafePath } from "../src/adapters/tools.js";
+import { shortenWorkspaceText } from "../src/adapters/ui-logger.js";
 import { createWriteTools, type FileVersionSnapshot } from "../src/adapters/write-tools.js";
 import type { AssistantMessage, LlmProvider, Message } from "../src/core/contracts.js";
 
@@ -13,6 +15,11 @@ describe("Stage 3: 写工具 (edit_file/run_bash/rollback_version)、暂停审�
     // 允许工作区内多层尚不存在的新建子目录写操作
     const nestedNewFile = resolveSafePath(tmpRoot, "a/b/c/new.ts", "write");
     expect(nestedNewFile).toContain(path.join("a", "b", "c", "new.ts"));
+    expect(toPosixPath("src\\core\\loop.ts")).toBe("src/core/loop.ts");
+    expect(expandHomePath("~/skills", "/home/dev")).toBe(path.join("/home/dev", "skills"));
+    expect(expandHomePath("~\\skills", "/home/dev")).toBe(path.join("/home/dev", "skills"));
+    expect(isPathInside(path.join(tmpRoot, "sub", "file.ts"), tmpRoot)).toBe(true);
+    expect(shortenWorkspaceText("d:\\code\\app\\src\\a.ts", "d:\\code\\app")).toBe("src\\a.ts");
 
     // 严禁越界写操作
     expect(() => resolveSafePath(tmpRoot, "../outside.ts", "write")).toThrow(/禁止访问/);
@@ -341,7 +348,7 @@ describe("Stage 3: 写工具 (edit_file/run_bash/rollback_version)、暂停审�
     // 验证启动后台常驻进程（即使子进程继承了 stdout/stderr 管道未关闭）在主 Shell exit 后 150ms 内返回，不挂死满超时且进程存活
     const t0 = Date.now();
     const bgRes = await runCommandInSandbox(
-      'node -e "setInterval(() => {}, 1000)" & bg_pid=$!; echo "BG_PID=$bg_pid"',
+      'node -e "console.log(\'BG_PID=\' + process.pid); setInterval(() => {}, 1000)" & sleep 0.15',
       tmpRoot,
       5_000,
       undefined,
@@ -367,7 +374,9 @@ describe("Stage 3: 写工具 (edit_file/run_bash/rollback_version)、暂停审�
     const dirTree = await listDirTool!.execute({ path: "." });
     expect(dirTree).toContain("a.py (3 lines)");
     expect(dirTree).toContain("[已过滤忽略目录: venv/, web-ui/node_modules/]");
-    fs.rmSync(tmpRoot, { recursive: true, force: true });
+    try {
+      fs.rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    } catch {}
 
     // 验证 System Prompt 注入工作区路径且审批框严格区分修改文件与运行命令（含 -/+ 代码对比预览）
     expect(buildDefaultSystemPrompt("/tmp/my-ai-kb")).toContain("/tmp/my-ai-kb");
@@ -473,15 +482,46 @@ describe("Stage 3: 写工具 (edit_file/run_bash/rollback_version)、暂停审�
           version: 1,
           path: "main.py",
           beforeContent: "def foo():\n  return null\n",
-          afterContent: "def foo():\n  return null\ndef bar():\n  return null\n",
+          afterContent: `def foo():\n  return null\ndef bar():\n  return null\n${Array.from({ length: 18 }, (_, i) => `  line_${i} = ${i}`).join("\n")}\n`,
           timestamp: 1,
         },
       ],
       process.cwd(),
     );
-    // LCS 差异提取：即便文件中原本已有 return null，新增的重复行 return null 也不会被吞掉（且保留相对缩进）
+    // LCS 差异提取：即便文件中原本已有 return null，新增的重复行 return null 也不会被吞掉（且保留相对缩进），超过 15 行自动提示 /diff full
     expect(diffOut).toContain("+ def bar():");
     expect(diffOut).toContain("+   return null");
+    expect(diffOut).toContain("/diff full 查看全部");
+    const fullDiffOut = formatSnapshotsDiff(
+      [
+        {
+          version: 1,
+          path: "main.py",
+          beforeContent: "def foo():\n  return null\n",
+          afterContent: `def foo():\n  return null\ndef bar():\n  return null\n${Array.from({ length: 18 }, (_, i) => `  line_${i} = ${i}`).join("\n")}\n`,
+          timestamp: 1,
+        },
+      ],
+      process.cwd(),
+      { full: true },
+    );
+    expect(fullDiffOut).toContain("line_17 = 17");
+    const multiSnaps = ["a.ts", "b.ts", "c.ts"].map((p, i) => ({
+      version: i + 1,
+      path: p,
+      beforeContent: null,
+      afterContent: Array.from({ length: 10 }, (_, k) => `const ${p[0]}_${k} = ${k};`).join("\n"),
+      timestamp: i + 1,
+    }));
+    const multiOut = formatSnapshotsDiff(multiSnaps, process.cwd());
+    expect(multiOut).toContain("📂 修改文件清单");
+    expect(multiOut).toContain("[1] a.ts");
+    expect(multiOut).toContain("[3] c.ts");
+    expect(multiOut).not.toContain("const a_8 = 8;");
+    const singleFiltered = formatSnapshotsDiff(multiSnaps, process.cwd(), { fileFilter: "2" });
+    expect(singleFiltered).toContain("📘 b.ts");
+    expect(singleFiltered).not.toContain("📘 a.ts");
+    expect(singleFiltered).toContain("const b_8 = 8;");
 
     // 验证 formatStepToolCalls 同文件合并 & formatApprovalBox 剥离未修改上下文行（如 Volume2, Square）并展示修改点
     const stepCalls = [
@@ -514,7 +554,17 @@ describe("Stage 3: 写工具 (edit_file/run_bash/rollback_version)、暂停审�
     expect(boxText).toContain("@@ 修改点 #2");
 
     // 验证只读 tsc --noEmit 自动放行，而会写 .tsbuildinfo 的 tsc -b 必须走写审批；cleanDisplayBash 自动过滤末尾 echo exit
-    const { cleanDisplayBash, formatToolResultLine } = await import("../src/adapters/ui-logger.js");
+    const { cleanDisplayBash, formatCompactTurnFooter, formatDurationMs, formatToolResultLine } = await import("../src/adapters/ui-logger.js");
+    expect(formatDurationMs(12_400)).toBe("12.4s");
+    expect(formatDurationMs(278_000)).toBe("4m38s");
+    const htmlFooter = formatCompactTurnFooter(".sessions/non-existent.json", 4, false, [{ path: "van-gogh-pelican.html", beforeContent: null, afterContent: "<html></html>" }], process.cwd(), 278_000);
+    expect(htmlFooter).toContain("⏱️ 4m38s");
+    expect(htmlFooter).toContain("🌐 file:///");
+    expect(htmlFooter).toContain("van-gogh-pelican.html");
+    if (process.platform === "win32") {
+      const cmdRes = await runCommandInSandbox('cmd.exe /c echo msys_ok', process.cwd(), 5_000, undefined, true);
+      expect(cmdRes.output.trim()).toBe("msys_ok");
+    }
     expect(isReadonlyBashCommand('cd web-ui && npx tsc --noEmit 2>&1 | tail -5; echo "tsc exit: $?"', true)).toBe(true);
     expect(isReadonlyBashCommand('cd web-ui && npx tsc -b 2>&1 | tail -5; echo "tsc exit: $?"', true)).toBe(false);
     expect(cleanDisplayBash('cd web-ui && npx tsc -b 2>&1 | tail -5; echo "tsc exit: $?"')).toEqual([
@@ -531,28 +581,33 @@ describe("Stage 3: 写工具 (edit_file/run_bash/rollback_version)、暂停审�
       }),
     ).toContain("↳ ✏️  已写入文件: web-ui/src/App.tsx (共应用 5 处修改 · +53 / -18 行，当前版本 v2)");
 
-    // 验证 SessionController.ask 结束后 snapshots.json 不会被 buildStatusSummary 覆盖清空，/diff 与 /undo 正常工作
+    // 验证 SessionController.ask 结束后 snapshots.json 不会被 buildStatusSummary 覆盖清空，且同轮内对同一文件的多次自修自动合并为 1 个版本
     const { createSessionController } = await import("../src/adapters/session-controller.js");
     const tmpWs = fs.mkdtempSync(path.join(os.tmpdir(), "duo-ctrl-ws-"));
     const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "duo-ctrl-home-"));
     fs.writeFileSync(path.join(tmpWs, "index.html"), "<title>旧标题</title>\n", "utf-8");
+    let stepIdx = 0;
     const ctrl = createSessionController({
       workspaceRoot: tmpWs,
       homeBaseDir: tmpHome,
       provider: {
-        async chat(msgs) {
-          if (msgs[msgs.length - 1]?.role === "tool") return { role: "assistant", content: "已完成标题修改" };
-          return {
-            role: "assistant",
-            content: "修改标题",
-            toolCalls: [
-              {
-                id: "c_html",
-                name: "edit_file",
-                arguments: { path: "index.html", edits: [{ oldText: "<title>旧标题</title>", newText: "<title>新标题</title>" }] },
-              },
-            ],
-          };
+        async chat() {
+          stepIdx++;
+          if (stepIdx === 1) {
+            return {
+              role: "assistant",
+              content: "先改第一稿",
+              toolCalls: [{ id: "c_html_1", name: "edit_file", arguments: { path: "index.html", edits: [{ oldText: "<title>旧标题</title>", newText: "<title>中间草稿</title>" }] } }],
+            };
+          }
+          if (stepIdx === 2) {
+            return {
+              role: "assistant",
+              content: "模型自查修正为最终标题",
+              toolCalls: [{ id: "c_html_2", name: "edit_file", arguments: { path: "index.html", edits: [{ oldText: "<title>中间草稿</title>", newText: "<title>新标题</title>" }] } }],
+            };
+          }
+          return { role: "assistant", content: "已完成标题修改" };
         },
       },
     });
@@ -563,7 +618,9 @@ describe("Stage 3: 写工具 (edit_file/run_bash/rollback_version)、暂停审�
     const diffAfterAsk = ctrl.getDiff();
     expect(diffAfterAsk.totalSnapshots).toBe(1);
     expect(diffAfterAsk.formattedText).toContain("index.html");
+    expect(diffAfterAsk.formattedText).toContain("- <title>旧标题</title>");
     expect(diffAfterAsk.formattedText).toContain("+ <title>新标题</title>");
+    expect(ctrl.getDiff("all").files[0]?.isNew).toBe(false);
     const undoInvalid = await ctrl.undo("invalid_arg");
     expect(undoInvalid.rolledBackCount).toBe(0);
     const undoOk = await ctrl.undo("turn");
@@ -598,6 +655,13 @@ describe("Stage 3: 写工具 (edit_file/run_bash/rollback_version)、暂停审�
     });
     await expect(crashCtrl.ask("半途崩溃测试", { suppressFinalEcho: true, onApprovalRequest: () => ({ approved: true }) })).rejects.toThrow("模拟半途进程断电");
     expect(snapshotsFlushedMidTurn).toBe(1);
+    // 验证半途异常后 Controller 内存与 meta.json 的 activeLeafId 均已保存最新断点，直接续聊不丢上下文
+    expect(crashCtrl.getLeafId()).toBeTruthy();
+    const { verifyGoalCompletion } = await import("../src/adapters/repl.js");
+    expect(buildDefaultSystemPrompt("/tmp/ws")).toContain("严禁调用未注册的 glob");
+    expect(buildDefaultSystemPrompt("/tmp/ws")).toContain("分批小步落盘");
+    expect((await verifyGoalCompletion(tmpWs, "接下来我将开始创建组件文件")).ok).toBe(false);
+    expect((await verifyGoalCompletion(tmpWs, "已完成全部模块初始化并通过验证。")).ok).toBe(true);
     const restartedCtrl = createSessionController({ workspaceRoot: tmpWs, homeBaseDir: tmpHome });
     expect(restartedCtrl.getDiff().totalSnapshots).toBe(1);
     const resumed = restartedCtrl.resumeTurn("#1");

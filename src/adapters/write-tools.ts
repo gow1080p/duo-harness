@@ -1,13 +1,15 @@
 import { spawn } from "node:child_process";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
-import * as path from "node:path";
 import { z } from "zod";
 import type { ToolContract } from "../core/contracts.js";
 import { extractChangedHunk } from "./diff-presenter.js";
+import { killProcessGroup, resolvePosixShell, toPosixRelative } from "./platform.js";
 import { writeFileAtomicSync } from "./store.js";
 import { resolveSafePath } from "./tools.js";
 import { isReadonlyBashCommand } from "./ui-logger.js";
+
+export { killProcessGroup };
 
 const SEATBELT_READONLY_PROFILE =
   '(version 1)(allow default)(deny file-write*)(allow file-write* (literal "/dev/null") (literal "/private/dev/null") (subpath "/dev/fd"))(allow process-exec (literal "/bin/ps") (with no-sandbox))';
@@ -62,17 +64,6 @@ export async function rollbackFileSnapshots(
   return { rolledBackCount: count, currentVersion: snapshots.length, touchedPaths };
 }
 
-export function killProcessGroup(pid: number | undefined): void {
-  if (!pid) return;
-  try {
-    process.kill(-pid, "SIGKILL");
-  } catch {
-    try {
-      process.kill(pid, "SIGKILL");
-    } catch {}
-  }
-}
-
 export function runCommandInSandbox(
   command: string,
   cwd: string,
@@ -81,11 +72,17 @@ export function runCommandInSandbox(
   readonly = false,
 ): Promise<{ exitCode: number; output: string }> {
   return new Promise((resolve) => {
-    const shellBin = fsSync.existsSync("/bin/zsh") ? "/bin/zsh" : "/bin/sh";
+    const { bin: shellBin, env: shellEnv } = resolvePosixShell();
     const useSeatbelt = readonly && process.platform === "darwin" && fsSync.existsSync("/usr/bin/sandbox-exec");
     const spawnBin = useSeatbelt ? "/usr/bin/sandbox-exec" : shellBin;
     const spawnArgs = useSeatbelt ? ["-p", SEATBELT_READONLY_PROFILE, shellBin, "-c", command] : ["-c", command];
-    const child = spawn(spawnBin, spawnArgs, { cwd, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(spawnBin, spawnArgs, {
+      cwd,
+      env: shellEnv,
+      detached: process.platform !== "win32",
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
 
     let combined = "";
     const appendChunk = (chunk: Buffer) => {
@@ -130,7 +127,7 @@ export function runCommandInSandbox(
     child.on("error", (err) => finish(1, `启动命令失败: ${err.message}\n`));
     child.on("exit", (code) => {
       exitTimer = setTimeout(() => {
-        if (readonly) killProcessGroup(child.pid);
+        if (!finished && readonly) killProcessGroup(child.pid);
         finish(code ?? 1);
       }, 150);
     });
@@ -191,7 +188,7 @@ async function applyFileEdit(
   }
 
   writeFileAtomicSync(fullPath, workingContent);
-  const relPath = path.relative(resolveSafePath(workspaceRoot, ".", "read"), fullPath) || args.path;
+  const relPath = toPosixRelative(resolveSafePath(workspaceRoot, ".", "read"), fullPath) || args.path;
   const version = snapshots.length + 1;
   snapshots.push({ version, path: relPath, beforeContent, afterContent: workingContent, timestamp: Date.now(), hunkCount: editList.length });
   onSnapshotChange?.();

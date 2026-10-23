@@ -1,3 +1,4 @@
+import * as fs from "node:fs";
 import * as path from "node:path";
 import * as readline from "node:readline/promises";
 import { fileURLToPath } from "node:url";
@@ -17,14 +18,41 @@ import { resolveRouteTier } from "./router.js";
 import { probeAgyQuota } from "./agy-bridge.js";
 import { createSessionController, type SessionController } from "./session-controller.js";
 import { formatApprovalBox } from "./ui-logger.js";
+import { runCommandInSandbox } from "./write-tools.js";
 
 export { createReplCompleter, listManagedProjects, type ManagedProjectSummary, type ProjectSessionPaths, resolveProjectSessionPaths };
+
+export async function verifyGoalCompletion(workspaceRoot: string, finalAnswer: string, signal?: AbortSignal): Promise<{ ok: boolean; errorOutput?: string }> {
+  if (/(?:接下来我将|下一步我将|现在开始创建|准备开始修改)/.test(finalAnswer) && finalAnswer.length < 240) {
+    return { ok: false, errorOutput: "当前处于 /goal 自治模式，请不要只汇报下一步计划，请直接调用工具完成剩余步骤后再总结。" };
+  }
+  const hasTsConfig = fs.existsSync(path.join(workspaceRoot, "tsconfig.json"));
+  const hasLocalTsc = fs.existsSync(path.join(workspaceRoot, "node_modules", ".bin", "tsc")) || fs.existsSync(path.join(workspaceRoot, "node_modules", ".bin", "tsc.cmd"));
+  if (hasTsConfig && hasLocalTsc) {
+    const check = await runCommandInSandbox("./node_modules/.bin/tsc --noEmit --incremental false", workspaceRoot, 30_000, signal, false);
+    if (check.exitCode !== 0) {
+      return { ok: false, errorOutput: `npx tsc --noEmit 类型检查未通过 (exit ${check.exitCode}):\n${check.output.slice(0, 1500)}` };
+    }
+  }
+  return { ok: true };
+}
 
 function formatPrompt(ctrl: SessionController): string {
   const st = ctrl.getStatus();
   const short = st.projectName.length > 18 ? `${st.projectName.slice(0, 15)}...` : st.projectName;
   if (st.isNew) return `📂 ${short} [新对话 · ${st.modelLabel}] > `;
   return `📂 ${short} [${st.activeTurnIndex ? `续#${st.activeTurnIndex}` : "续聊"} · ${st.modelLabel}] > `;
+}
+
+function printReplWelcomeBanner(ctrl: SessionController): void {
+  const st0 = ctrl.getStatus();
+  console.log(`\n🚀 Duo-Harness | 当前项目: ${st0.projectName} (${st0.workspaceRoot})`);
+  console.log(`⚡ 模型路由: ${resolveRouteTier(Date.now()).reason} (同会话自动锁定原模型防缓存失效 · 输入 /model 可手动切换)`);
+  console.log(`💡 输入 / 用 ↑/↓ 方向键选择命令 (/goal 自治任务 | /resume 选轮次 | /new 新对话 | /model 切模型 | /diff 看修改 | /undo 撤回)`);
+  const recap = formatRecentHistoryRecap(ctrl.loadEntries(), 1, ctrl.getLeafId());
+  if (recap) console.log(recap);
+  const diff0 = ctrl.getDiff();
+  if (diff0.totalSnapshots > 0) console.log(`📋 [检测到未撤回修改] 当前工作区有 ${diff0.files.length} 个已修改文件 (${diff0.totalSnapshots} 个版本 · 输入 /diff 查看 | /undo 撤回)`);
 }
 
 async function handleSlashCommand(rawCmd: string, ctrl: SessionController): Promise<boolean> {
@@ -71,8 +99,8 @@ async function handleSlashCommand(rawCmd: string, ctrl: SessionController): Prom
     console.log(res.ok ? res.recapText : `⚠️ ${res.error}`);
     return true;
   }
-  if (cmd === "/diff") {
-    console.log(ctrl.getDiff().formattedText);
+  if (cmd === "/diff" || cmd.startsWith("/diff ")) {
+    console.log(ctrl.getDiff(cmd.slice("/diff".length).trim() || "turn").formattedText);
     return true;
   }
   if (cmd === "/undo" || cmd.startsWith("/undo ")) {
@@ -97,6 +125,13 @@ async function handleSlashCommand(rawCmd: string, ctrl: SessionController): Prom
     console.log("🧹 已彻底清空当前项目所有历史记录。");
     return true;
   }
+  if (cmd === "/goal") {
+    if (ctrl.getStatus().isNew) {
+      console.log("💡 用法: /goal <任务目标> (例如: /goal 按照项目文档初始化项目并运行)");
+      return true;
+    }
+    return false;
+  }
   return false;
 }
 
@@ -104,14 +139,7 @@ export async function startInteractiveRepl(options: { workspaceRoot?: string; ho
   const ctrl = createSessionController(options);
   let autoApprove = false;
   let inMainPrompt = false;
-  const st0 = ctrl.getStatus();
-  console.log(`\n🚀 Duo-Harness | 当前项目: ${st0.projectName} (${st0.workspaceRoot})`);
-  console.log(`⚡ 模型路由: ${resolveRouteTier(Date.now()).reason} (同会话自动锁定原模型防缓存失效 · 输入 /model 可手动切换)`);
-  console.log(`💡 输入 / 用 ↑/↓ 方向键选择命令或切换历史 (/resume 选轮次 | /new 新对话 | /model 切模型 | /diff 看修改 | /undo 撤回)`);
-  const recap = formatRecentHistoryRecap(ctrl.loadEntries(), 1, ctrl.getLeafId());
-  if (recap) console.log(recap);
-  const diff0 = ctrl.getDiff();
-  if (diff0.totalSnapshots > 0) console.log(`📋 [检测到未撤回修改] 当前工作区有 ${diff0.files.length} 个已修改文件 (${diff0.totalSnapshots} 步快照 · 输入 /diff 查看 | /undo 撤回)`);
+  printReplWelcomeBanner(ctrl);
 
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout, completer: createReplCompleter(() => ctrl.getPaths().workspaceRoot, () => ctrl.getPaths().sessionFile) });
   const detachDropdown = attachLiveSlashDropdown(rl, () => inMainPrompt, () => getPromptVisualCols(formatPrompt(ctrl)), () => ctrl.getPaths().workspaceRoot, options.homeBaseDir, () => ctrl.getLeafId());
@@ -159,11 +187,20 @@ export async function startInteractiveRepl(options: { workspaceRoot?: string; ho
         break;
       }
       if (await handleSlashCommand(line, ctrl)) continue;
+      const isGoal = /^\/g(?:oal)?(?:\s|$)/.test(line);
+      const askPrompt = isGoal ? (line.replace(/^\/g(?:oal)?\b/, "").trim() || "请继续推进并完成当前目标，采用分批小步落盘（每步最多写 1~3 个文件），确保所有代码落盘并通过构建/运行验证。") : line;
+      if (isGoal) console.log("🎯 [已开启 /goal 长程自治模式] 本轮自动放行工作区写与构建操作 · 步数上限 50 步 · 完成前自动校验编译状态");
       turnAbort = new AbortController();
       const onSigint = () => turnAbort?.abort();
       rl.on("SIGINT", onSigint);
       try {
-        await ctrl.ask(line, { suppressFinalEcho: true, onApprovalRequest: askApproval, signal: turnAbort.signal });
+        await ctrl.ask(askPrompt, {
+          suppressFinalEcho: true,
+          maxSteps: isGoal ? 50 : undefined,
+          onApprovalRequest: isGoal ? () => ({ approved: true }) : askApproval,
+          verifyCompletion: isGoal ? (ans) => verifyGoalCompletion(ctrl.getPaths().workspaceRoot, ans, turnAbort?.signal) : undefined,
+          signal: turnAbort.signal,
+        });
       } catch (err) {
         console.error(`\n❌ 本轮运行异常: ${err instanceof Error ? err.message : String(err)}`);
       } finally {

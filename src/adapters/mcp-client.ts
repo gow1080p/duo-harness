@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { z } from "zod";
 import type { ToolContract } from "../core/contracts.js";
-import { killProcessGroup } from "./write-tools.js";
+import { killProcessGroup } from "./platform.js";
 
 export interface McpToolInfo {
   name: string;
@@ -49,7 +49,12 @@ function createJsonRpcTransport(
   cwd: string,
   defaultTimeoutMs: number,
 ) {
-  const child = spawn(command, args, { cwd, detached: true, stdio: ["pipe", "pipe", "pipe"] });
+  const child = spawn(command, args, {
+    cwd,
+    detached: process.platform !== "win32",
+    windowsHide: true,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
   let nextId = 1;
   let lineBuffer = "";
   let closed = false;

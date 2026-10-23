@@ -8,14 +8,12 @@ import type { FileVersionSnapshot } from "./write-tools.js";
 export interface FileDiffSummaryItem {
   file: string; isNew: boolean; edits: number; oldLines: number; newLines: number;
   addedLines: number; removedLines: number; removedPreview: string[]; addedPreview: string[];
-  hunksPreview?: { removed: string[]; added: string[] }[];
+  totalHunks?: number; hunksPreview?: { removed: string[]; added: string[]; totalRemoved?: number; totalAdded?: number }[];
 }
 
 export function normalizeEditsArray(rawEdits: unknown): { oldText?: string; newText?: string }[] {
   let arr: unknown[] = Array.isArray(rawEdits) ? rawEdits : [];
-  if (!Array.isArray(rawEdits) && typeof rawEdits === "string") {
-    try { const parsed = JSON.parse(rawEdits); if (Array.isArray(parsed)) arr = parsed; } catch {}
-  }
+  if (!Array.isArray(rawEdits) && typeof rawEdits === "string") try { const p = JSON.parse(rawEdits); if (Array.isArray(p)) arr = p; } catch {}
   return arr.filter((x): x is { oldText?: string; newText?: string } => Boolean(x && typeof x === "object"));
 }
 
@@ -26,8 +24,7 @@ export function truncateVisualCols(text: string, maxCols = 66): string {
   for (const ch of clean) {
     const w = (ch.codePointAt(0) ?? 0) > 0xff ? 2 : 1;
     if (cols + w > maxCols - 3) break;
-    out += ch;
-    cols += w;
+    out += ch; cols += w;
   }
   return `${out}...`;
 }
@@ -134,16 +131,13 @@ export function formatStepToolCalls(step: number, calls: readonly ToolCall[], re
       const info = editCounts.get(rel)!;
       const suffix = !info.isNew && info.count > 1 ? ` (${info.count} 处修改)` : "";
       items.push({ isWrite: true, text: `📝 ${info.isNew ? "新建文件" : "修改文件"}: ${rel}${suffix}` });
-    } else if (call.name === "list_dir") {
-      items.push({ isWrite: false, text: `📂 查看目录: ${relPath}` });
-    } else if (call.name === "read_file") {
+    } else if (call.name === "list_dir") items.push({ isWrite: false, text: `📂 查看目录: ${relPath}` });
+    else if (call.name === "read_file") {
       const range = args.startLine || args.endLine ? ` (第 ${args.startLine ?? 1}~${args.endLine ?? "末"} 行)` : "";
       items.push({ isWrite: false, text: `📘 读取文件: ${shortenWorkspaceText(String(args.path ?? ""), workspaceRoot)}${range}` });
-    } else if (call.name === "grep") {
-      items.push({ isWrite: false, text: `🔍 搜索代码: "${String(args.pattern ?? "")}" (${relPath})` });
-    } else if (call.name === "rollback_version") {
-      items.push({ isWrite: true, text: `🔄 回退版本: 撤回最近 ${String(args.stepsBack ?? 1)} 步修改` });
-    } else if (call.name === "run_bash") {
+    } else if (call.name === "grep") items.push({ isWrite: false, text: `🔍 搜索代码: "${String(args.pattern ?? "")}" (${relPath})` });
+    else if (call.name === "rollback_version") items.push({ isWrite: true, text: `🔄 回退版本: 撤回最近 ${String(args.stepsBack ?? 1)} 步修改` });
+    else if (call.name === "run_bash") {
       const rawCmd = String(args.command ?? "").trim();
       const isRo = isReadonlyBashCommand(rawCmd, args.readonly as boolean | undefined);
       const parts = cleanDisplayBash(rawCmd, workspaceRoot);
@@ -165,22 +159,18 @@ export function formatApprovalBox(toolCalls: readonly ToolCall[], workspaceRoot?
   const groupedEdits = new Map<string, { rawPath: string; hunks: { oldText: string; newText: string }[] }>();
   for (const c of toolCalls) {
     if (c.name !== "edit_file") continue;
-    const args = (c.arguments ?? {}) as Record<string, unknown>;
-    const rawPath = String(args.path ?? "");
-    const rel = shortenWorkspaceText(rawPath, workspaceRoot);
-    const parsed = normalizeEditsArray(args.edits);
+    const args = (c.arguments ?? {}) as Record<string, unknown>, rawPath = String(args.path ?? "");
+    const rel = shortenWorkspaceText(rawPath, workspaceRoot), parsed = normalizeEditsArray(args.edits);
     const list = parsed.length > 0 ? parsed : [{ oldText: String(args.oldText ?? ""), newText: String(args.newText ?? "") }];
     const entry = groupedEdits.get(rel) ?? { rawPath, hunks: [] };
     for (const h of list) entry.hunks.push({ oldText: String(h.oldText ?? ""), newText: String(h.newText ?? "") });
     groupedEdits.set(rel, entry);
   }
   for (const [rel, { rawPath, hunks }] of groupedEdits.entries()) {
-    const fullPath = workspaceRoot ? path.resolve(workspaceRoot, rawPath) : "";
-    const existed = Boolean(fullPath && fs.existsSync(fullPath));
+    const existed = Boolean(workspaceRoot && fs.existsSync(path.resolve(workspaceRoot, rawPath)));
     const diffs = hunks.map((h) => extractChangedHunk(h.oldText, h.newText));
     const oldLines = diffs.reduce((a, d) => a + d.removed.length, 0), newLines = diffs.reduce((a, d) => a + d.added.length, 0);
-    const isAllEmptyOld = hunks.every((h) => !h.oldText);
-    const diffSummary = isAllEmptyOld ? (existed ? `覆盖文件 (+${newLines} 行)` : `新建文件 (+${newLines} 行)`) : `${hunks.length > 1 ? `共 ${hunks.length} 处修改 · ` : ""}替换内容 (-${oldLines} 行 / +${newLines} 行)`;
+    const diffSummary = hunks.every((h) => !h.oldText) ? (existed ? `覆盖文件 (+${newLines} 行)` : `新建文件 (+${newLines} 行)`) : `${hunks.length > 1 ? `共 ${hunks.length} 处修改 · ` : ""}替换内容 (-${oldLines} 行 / +${newLines} 行)`;
     lines.push(`│ 📘 目标文件: ${rel} (${diffSummary})`);
     for (let i = 0; i < Math.min(diffs.length, 4); i++) {
       const d = diffs[i]!;
@@ -208,39 +198,52 @@ export function formatApprovalBox(toolCalls: readonly ToolCall[], workspaceRoot?
   return lines.join("\n");
 }
 
-export function summarizeSnapshotsDiff(snapshots: readonly { path: string; beforeContent: string | null; afterContent: string; hunkCount?: number }[], workspaceRoot?: string): FileDiffSummaryItem[] {
+export function summarizeSnapshotsDiff(snapshots: readonly { path: string; beforeContent: string | null; afterContent: string; hunkCount?: number }[], workspaceRoot?: string, full = false): FileDiffSummaryItem[] {
   const byFile = new Map<string, { before: string | null; after: string; edits: number }>();
   for (const s of snapshots) {
-    const rel = shortenWorkspaceText(s.path, workspaceRoot);
-    const prev = byFile.get(rel);
+    const rel = shortenWorkspaceText(s.path, workspaceRoot), prev = byFile.get(rel);
     byFile.set(rel, { before: prev ? prev.before : s.beforeContent, after: s.afterContent, edits: (prev?.edits ?? 0) + Math.max(1, s.hunkCount ?? 1) });
   }
-  const items: FileDiffSummaryItem[] = [];
+  const items: FileDiffSummaryItem[] = [], isMulti = byFile.size >= 3 && !full;
+  const maxH = full ? 1000 : isMulti ? 2 : 8, maxL = full ? 10_000 : isMulti ? 5 : 15, maxC = full ? 160 : 76;
   for (const [file, info] of byFile.entries()) {
     if (info.before !== null && info.before === info.after) continue;
-    const oldArr = info.before === null ? [] : info.before.replace(/\r\n/g, "\n").split("\n");
-    const newArr = info.after.replace(/\r\n/g, "\n").split("\n");
+    const oldArr = info.before === null ? [] : info.before.replace(/\r\n/g, "\n").split("\n"), newArr = info.after.replace(/\r\n/g, "\n").split("\n");
     const hunks = info.before === null ? [{ removed: [], added: stripCommonPairIndent([], newArr).added }] : extractChangedHunks(info.before, info.after);
     const removed = hunks.flatMap((h) => h.removed), added = hunks.flatMap((h) => h.added);
     const addedLines = info.before === null ? newArr.length : added.length, removedLines = info.before === null ? 0 : removed.length;
-    const hunksPreview = hunks.slice(0, 4).map((h) => ({ removed: h.removed.slice(0, 3).map((l) => truncateVisualCols(l, 70)), added: h.added.slice(0, 3).map((l) => truncateVisualCols(l, 70)) }));
-    items.push({ file, isNew: info.before === null, edits: info.edits, oldLines: oldArr.length, newLines: newArr.length, addedLines, removedLines, removedPreview: removed.slice(0, 5).map((l) => truncateVisualCols(l, 70)), addedPreview: added.slice(0, 5).map((l) => truncateVisualCols(l, 70)), hunksPreview });
+    const hunksPreview = hunks.slice(0, maxH).map((h) => ({ removed: h.removed.slice(0, maxL).map((l) => truncateVisualCols(l, maxC)), added: h.added.slice(0, maxL).map((l) => truncateVisualCols(l, maxC)), totalRemoved: h.removed.length, totalAdded: h.added.length }));
+    items.push({ file, isNew: info.before === null, edits: info.edits, oldLines: oldArr.length, newLines: newArr.length, addedLines, removedLines, removedPreview: removed.slice(0, 5).map((l) => truncateVisualCols(l, 70)), addedPreview: added.slice(0, 5).map((l) => truncateVisualCols(l, 70)), totalHunks: hunks.length, hunksPreview });
   }
   return items;
 }
 
-export function formatSnapshotsDiff(snapshots: readonly FileVersionSnapshot[], workspaceRoot: string): string {
-  const diffs = summarizeSnapshotsDiff(snapshots, workspaceRoot);
-  if (diffs.length === 0) return "ℹ️  当前没有未撤回的文件修改记录。";
-  const out = [`\n🔍 [文件修改审核对比 (共 ${diffs.length} 个文件, ${snapshots.length} 个快照版本 · 输入 /undo 可撤回上一轮修改 | /undo all 全部撤回)]:`];
+export function formatSnapshotsDiff(snapshots: readonly FileVersionSnapshot[], workspaceRoot: string, opts: { full?: boolean; totalVersions?: number; fileFilter?: string } = {}): string {
+  const allDiffs = summarizeSnapshotsDiff(snapshots, workspaceRoot, opts.full);
+  if (allDiffs.length === 0) return "ℹ️  当前没有未撤回的文件修改记录。";
+  const flt = opts.fileFilter?.trim().toLowerCase();
+  const matched = flt ? (/^\d+$/.test(flt) ? (allDiffs[Number(flt) - 1] ? [allDiffs[Number(flt) - 1]!.file] : []) : allDiffs.filter((d) => d.file.toLowerCase().includes(flt)).map((d) => d.file)) : null;
+  if (matched && matched.length === 0) return `⚠️ 未找到匹配 "${opts.fileFilter}" 的修改文件（当前共修改 ${allDiffs.length} 个文件）。`;
+  const diffs = matched ? summarizeSnapshotsDiff(snapshots.filter((s) => matched.includes(shortenWorkspaceText(s.path, workspaceRoot))), workspaceRoot, opts.full) : allDiffs;
+  const totalVer = opts.totalVersions ?? snapshots.length;
+  const scopeStr = totalVer > snapshots.length ? `当前展示最新第 v${totalVer} 版 · 输入 /diff all 查看累计 ${totalVer} 版` : `共 ${totalVer} 个版本`;
+  const out = [`\n🔍 [文件修改审核对比 (共 ${allDiffs.length} 个文件, ${scopeStr} · 输入 /undo 撤回本轮 | /diff full 展开全部代码)]:`];
+  if (!matched && diffs.length >= 2) {
+    out.push(`  📂 修改文件清单 (输入 /diff <序号或文件名> 可单独展开某文件):`);
+    diffs.forEach((d, i) => out.push(`     [${i + 1}] ${d.file} (${d.isNew ? `新建 +${d.newLines} 行` : `+${d.addedLines} / -${d.removedLines} 行 · ${d.edits} 处修改`})`));
+  }
   for (const d of diffs) {
     out.push(`  📘 ${d.file} (${d.isNew ? `新建文件 · +${d.newLines} 行` : `修改 ${d.edits} 处 · +${d.addedLines} / -${d.removedLines} 行 (${d.oldLines} -> ${d.newLines} 行)`})`);
-    const hList = d.hunksPreview && d.hunksPreview.length > 1 ? d.hunksPreview : [{ removed: d.removedPreview, added: d.addedPreview }];
+    const hList = d.hunksPreview?.length ? d.hunksPreview : [{ removed: d.removedPreview, added: d.addedPreview, totalRemoved: d.removedLines, totalAdded: d.addedLines }];
     hList.forEach((h, idx) => {
-      if (hList.length > 1) out.push(`     \x1b[90m@@ 修改片段 #${idx + 1} @@\x1b[0m`);
+      const tRem = h.totalRemoved ?? h.removed.length, tAdd = h.totalAdded ?? h.added.length;
+      if (hList.length > 1) out.push(`     \x1b[90m@@ 修改片段 #${idx + 1} (-${tRem} / +${tAdd} 行) @@\x1b[0m`);
       for (const r of h.removed) out.push(`     \x1b[31m- ${r}\x1b[0m`);
+      if (tRem > h.removed.length) out.push(`     \x1b[90m  ... (此段其余 ${tRem - h.removed.length} 行删除已折叠，输入 /diff full 查看全部)\x1b[0m`);
       for (const a of h.added) out.push(`     \x1b[32m+ ${a}\x1b[0m`);
+      if (tAdd > h.added.length) out.push(`     \x1b[90m  ... (此段其余 ${tAdd - h.added.length} 行新增已折叠，输入 /diff full 查看全部)\x1b[0m`);
     });
+    if ((d.totalHunks ?? 0) > hList.length) out.push(`     \x1b[90m... (其余 ${(d.totalHunks ?? 0) - hList.length} 处修改片段已折叠，输入 /diff full 查看全部)\x1b[0m`);
   }
   return out.join("\n");
 }

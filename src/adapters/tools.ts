@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { z } from "zod";
 import type { ToolCall, ToolContract, ToolResultMessage } from "../core/contracts.js";
+import { expandHomePath, isPathInside, toPosixRelative } from "./platform.js";
 
 const ReadFileArgsSchema = z.object({
   path: z.string().min(1),
@@ -46,20 +47,12 @@ export function resolveSafePath(
   mode: "read" | "write" = "read",
 ): string {
   const home = os.homedir();
-  const expanded =
-    targetPath === "~"
-      ? home
-      : targetPath.startsWith("~/")
-        ? path.join(home, targetPath.slice(2))
-        : targetPath;
+  const expanded = expandHomePath(targetPath, home);
   const candidate = path.resolve(workspaceRoot, expanded);
   const realCandidate = resolveExistingRealPath(candidate);
   const realRoot = resolveExistingRealPath(workspaceRoot);
 
-  const isInside = (child: string, rootDir: string) =>
-    child === rootDir || child.startsWith(rootDir + path.sep);
-
-  if (isInside(realCandidate, realRoot)) {
+  if (isPathInside(realCandidate, realRoot)) {
     return realCandidate;
   }
 
@@ -71,7 +64,7 @@ export function resolveSafePath(
       path.join(home, ".agents", "skills"),
     ].map(resolveExistingRealPath);
 
-    if (readonlyRoots.some((r) => isInside(realCandidate, r))) {
+    if (readonlyRoots.some((r) => isPathInside(realCandidate, r))) {
       return realCandidate;
     }
   }
@@ -114,7 +107,7 @@ async function runGrepSearch(
     const raw = await fs.readFile(file, "utf-8").catch(() => "");
     if (!raw || raw.includes("\u0000")) continue;
     const lines = raw.split("\n");
-    const rel = path.relative(realRoot, file);
+    const rel = toPosixRelative(realRoot, file);
     lines.forEach((line, idx) => {
       if (regex.test(line)) {
         const start = Math.max(0, idx - ctx);

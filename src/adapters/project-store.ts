@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { SessionEntry } from "../core/contracts.js";
 import { formatSnapshotsDiff } from "./diff-presenter.js";
+import { expandHomePath } from "./platform.js";
 import { loadJsonlEntries, writeFileAtomicSync } from "./store.js";
 import type { FileVersionSnapshot } from "./write-tools.js";
 
@@ -59,6 +60,7 @@ export interface ConversationTurnSummary {
 }
 
 export const SLASH_COMMANDS = [
+  { cmd: "/goal ", label: "/goal <目标>", desc: "长程自治模式 (自动放行写操作 + 50步上限 + 完成前自动验证)" },
   { cmd: "/resume ", label: "/resume", desc: "用 ↑/↓ 方向键选择历史轮次或切换会话" },
   { cmd: "/new", label: "/new", desc: "开启全新对话 (保留旧历史，可随时 /resume 切回)" },
   { cmd: "/model ", label: "/model", desc: "用 ↑/↓ 方向键切换模型 (auto/deepseek/mimo/agy)" },
@@ -113,7 +115,7 @@ export function resolveTargetWorkspace(targetArg: string, currentWorkspaceRoot: 
   if (Number.isInteger(idx) && idx >= 1 && idx <= projects.length) return projects[idx - 1]!.workspaceRoot;
   const byManaged = projects.find((p) => p.projectKey === targetArg || path.basename(p.workspaceRoot) === targetArg || p.projectKey.startsWith(`${targetArg}-`));
   if (byManaged && fs.existsSync(byManaged.workspaceRoot)) return byManaged.workspaceRoot;
-  const expanded = targetArg.startsWith("~/") ? path.join(os.homedir(), targetArg.slice(2)) : targetArg;
+  const expanded = expandHomePath(targetArg);
   for (const candidate of [path.resolve(currentWorkspaceRoot, expanded), path.resolve(currentWorkspaceRoot, "..", targetArg), path.resolve(currentWorkspaceRoot, "../..", targetArg)]) {
     if (fs.existsSync(candidate) && fs.statSync(candidate).isDirectory()) return candidate;
   }
@@ -125,7 +127,7 @@ export function createReplCompleter(getWorkspaceRoot: () => string, getSessionFi
     if (line.startsWith("/cd ")) {
       const rawArg = line.slice(4);
       const managed = listManagedProjects().map((p) => path.basename(p.workspaceRoot)).filter((n) => n.startsWith(rawArg)).map((n) => `/cd ${n}`);
-      const expanded = rawArg.startsWith("~/") ? path.join(os.homedir(), rawArg.slice(2)) : rawArg;
+      const expanded = expandHomePath(rawArg);
       const fullTarget = path.resolve(getWorkspaceRoot(), expanded || ".");
       const searchDir = rawArg.endsWith("/") && fs.existsSync(fullTarget) ? fullTarget : path.dirname(fullTarget);
       const prefix = rawArg.endsWith("/") ? "" : path.basename(expanded);

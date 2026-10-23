@@ -8,7 +8,7 @@ import {
   toOpenAiMessages,
   zodObjectToJsonSchema,
 } from "../src/adapters/router.js";
-import { assembleSsePayloads, createStreamRenderer, formatMarkdownLine } from "../src/adapters/sse-stream.js";
+import { assembleSsePayloads, createStreamRenderer, formatMarkdownLine, readOpenAiSseStream } from "../src/adapters/sse-stream.js";
 import { z } from "zod";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -138,6 +138,16 @@ describe("Step 1.4: src/adapters/router.ts 协议转换与分时路由测试", (
     expect(out).toContain("\x1b[36mmain.py\x1b[0m");
     expect(out).toContain("────────────────────────────────────────");
     expect(formatMarkdownLine("### 1. `.gitignore` 问题", false).text).toContain("▸ 1.");
+
+    // 验证长思考 (>5行) 原地 5 行滚动预览 + 结束时自动收拢为 [已思考 N 字] 摘要
+    const longReasonChunks: string[] = [];
+    const r2 = createStreamRenderer({ write: (s) => longReasonChunks.push(s), columns: 60 });
+    r2.onEvent({ type: "reasoning_delta", text: "第1行思考\n第2行思考\n第3行思考\n第4行思考\n第5行思考\n第6行思考\n第7行思考" });
+    r2.onEvent({ type: "content_delta", text: "最终回答\n" });
+    r2.flush();
+    const longOut = longReasonChunks.join("");
+    expect(longOut).toContain("[思考中");
+    expect(longOut).toContain("[已思考");
   });
 
   it("5. 同会话模型粘性保缓存路由 (auto 续聊锁定上一轮模型，/new 或 /model 显式切换)", () => {
@@ -213,5 +223,34 @@ describe("Step 1.4: src/adapters/router.ts 协议转换与分时路由测试", (
     ]);
     expect(report.totalCostCny).toBe(0);
     expect(report.periodLabel).toContain("Antigravity");
+  });
+
+  it("9. SSE 流式 chunk 空闲看门狗 (readOpenAiSseStream)：连续吐字超时上限不误杀，半途真卡死立即触发空闲超时", async () => {
+    const encoder = new TextEncoder();
+    // Case A: 总耗时 ~90ms (> idleTimeoutMs=50ms)，但每 25ms 持续吐 chunk -> 100% 正常读完不误杀
+    const continuousStream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        for (const word of ["第一段", "第二段", "第三段"]) {
+          await new Promise((r) => setTimeout(r, 25));
+          controller.enqueue(encoder.encode(`data: {"choices":[{"delta":{"content":"${word}"}}]}\n\n`));
+        }
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        controller.close();
+      },
+    });
+    const okRes = new Response(continuousStream, { headers: { "content-type": "text/event-stream" } });
+    const parsed = await readOpenAiSseStream(okRes, undefined, undefined, undefined, 50);
+    expect(parsed.message.content).toBe("第一段第二段第三段");
+
+    // Case B: 吐出第 1 个 chunk 后挂死 90ms (> idleTimeoutMs=35ms) -> 触发 SSE 流空闲超时
+    const stalledStream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"开头"}}]}\n\n'));
+        await new Promise((r) => setTimeout(r, 90));
+        controller.close();
+      },
+    });
+    const stalledRes = new Response(stalledStream, { headers: { "content-type": "text/event-stream" } });
+    await expect(readOpenAiSseStream(stalledRes, undefined, undefined, undefined, 35)).rejects.toThrow("SSE 流空闲超时");
   });
 });

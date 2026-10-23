@@ -1,7 +1,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { padCols, truncateCols } from "./cost-tracker.js";
-import { extractConversationTurns, listManagedProjects, resolveProjectSessionPaths, SLASH_COMMANDS } from "./project-store.js";
+import { summarizeSnapshotsDiff } from "./diff-presenter.js";
+import { extractConversationTurns, listManagedProjects, loadProjectSnapshots, resolveProjectSessionPaths, SLASH_COMMANDS } from "./project-store.js";
 import { loadJsonlEntries } from "./store.js";
 
 export interface DropdownItem {
@@ -58,29 +59,31 @@ export function buildDropdownItems(
     });
     return items;
   }
+  if (line.startsWith("/diff ")) {
+    const filter = line.slice(6).trim().toLowerCase();
+    const snaps = loadProjectSnapshots(resolveProjectSessionPaths(currentWorkspaceRoot, homeBaseDir).snapshotsFile);
+    const top = snaps[snaps.length - 1];
+    const files = summarizeSnapshotsDiff(top?.turnId ? snaps.filter((s) => s.turnId === top.turnId) : snaps, currentWorkspaceRoot, false);
+    const items: DropdownItem[] = files.map((d, i) => ({
+      label: `/diff ${d.file}`,
+      desc: `[#${i + 1}] ${d.isNew ? `新建 +${d.newLines} 行` : `+${d.addedLines} / -${d.removedLines} 行 (${d.edits}处修改)`}`,
+      fillText: `/diff ${d.file}`,
+    }));
+    items.push(
+      { label: "/diff full", desc: "🔍 展开本轮全部修改代码行（不折叠长片段）", fillText: "/diff full" },
+      { label: "/diff all", desc: `📚 查看从第 1 版以来的累计对比 (共 ${snaps.length} 版)`, fillText: "/diff all" },
+    );
+    return items.filter((m) => !filter || m.label.toLowerCase().includes(filter) || m.desc.toLowerCase().includes(filter));
+  }
   if (line.startsWith("/cd ")) {
     const filter = line.slice(4).trim().toLowerCase();
-    const projects = listManagedProjects(homeBaseDir);
-    const sorted = [...projects].sort((a, b) => {
-      const aIsCur = a.workspaceRoot === currentWorkspaceRoot ? 1 : 0;
-      const bIsCur = b.workspaceRoot === currentWorkspaceRoot ? 1 : 0;
-      return aIsCur - bIsCur || a.projectKey.localeCompare(b.projectKey);
-    });
+    const sorted = [...listManagedProjects(homeBaseDir)].sort((a, b) => (a.workspaceRoot === currentWorkspaceRoot ? 1 : 0) - (b.workspaceRoot === currentWorkspaceRoot ? 1 : 0) || a.projectKey.localeCompare(b.projectKey));
     return sorted
-      .filter((p) => {
-        const name = path.basename(p.workspaceRoot).toLowerCase();
-        return !filter || name.includes(filter) || p.projectKey.toLowerCase().includes(filter);
-      })
+      .filter((p) => !filter || path.basename(p.workspaceRoot).toLowerCase().includes(filter) || p.projectKey.toLowerCase().includes(filter))
       .slice(0, 8)
       .map((p) => {
         const name = path.basename(p.workspaceRoot);
-        const curTag = p.workspaceRoot === currentWorkspaceRoot ? "●当前项目" : `${p.entryCount}条记录`;
-        return {
-          label: `/cd ${name}`,
-          desc: `[${curTag}] ${p.workspaceRoot}`,
-          fillText: `/cd ${name}`,
-          expandOnly: false,
-        };
+        return { label: `/cd ${name}`, desc: `[${p.workspaceRoot === currentWorkspaceRoot ? "●当前项目" : `${p.entryCount}条记录`}] ${p.workspaceRoot}`, fillText: `/cd ${name}`, expandOnly: false };
       });
   }
   if (line.startsWith("/") && !line.includes(" ")) {
@@ -88,7 +91,7 @@ export function buildDropdownItems(
       label: c.label,
       desc: c.desc,
       fillText: c.cmd === "/projects" ? "/cd " : c.cmd,
-      expandOnly: c.cmd === "/cd " || c.cmd === "/resume " || c.cmd === "/branch " || c.cmd === "/model " || c.cmd === "/projects",
+      expandOnly: c.cmd.endsWith(" ") || c.cmd === "/projects",
     }));
   }
   return [];
@@ -108,7 +111,7 @@ export function findMethodKey(rl: any, name: string): string | symbol | null {
 
 function formatDropdownRows(items: DropdownItem[], selectedIdx: number, line: string): string {
   const maxCols = Math.max(60, (process.stdout.columns || 100) - 4);
-  const labelWidth = line.startsWith("/cd ") ? 24 : line.startsWith("/resume ") ? 13 : 16;
+  const labelWidth = line.startsWith("/cd ") || line.startsWith("/diff ") ? 24 : line.startsWith("/resume ") ? 13 : 16;
   return items
     .map((item, idx) => {
       const active = idx === selectedIdx;
