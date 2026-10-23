@@ -114,11 +114,11 @@ async function handleCommandPost(req: http.IncomingMessage, res: http.ServerResp
     }
     if (action === "model") {
       const m = arg.trim().toLowerCase();
-      if (m !== "auto" && m !== "deepseek" && m !== "mimo" && m !== "openai") return sendJson(res, 400, { ok: false, error: `不支持的模型模式: ${arg}` });
+      if (m !== "auto" && m !== "deepseek" && m !== "mimo" && m !== "agy" && m !== "openai") return sendJson(res, 400, { ok: false, error: `不支持的模型模式: ${arg}` });
       return sendJson(res, 200, { ok: true, status: ctrl.setModelMode(m) });
     }
     if (action === "diff") return sendJson(res, 200, { ok: true, ...ctrl.getDiff() });
-    if (action === "undo") return sendJson(res, 200, { ok: true, ...(await ctrl.undo(arg.trim() || "1")) });
+    if (action === "undo") return sendJson(res, 200, { ok: true, ...(await ctrl.undo(arg.trim() || "turn")) });
     if (action === "cd") {
       const sw = ctrl.switchWorkspace(arg.trim());
       return sendJson(res, sw.ok ? 200 : 400, sw);

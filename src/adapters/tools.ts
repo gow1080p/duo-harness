@@ -7,7 +7,7 @@ import type { ToolCall, ToolContract, ToolResultMessage } from "../core/contract
 
 const ReadFileArgsSchema = z.object({
   path: z.string().min(1),
-  startLine: z.number().int().positive().optional(),
+  startLine: z.number().int().min(0).optional(),
   endLine: z.number().int().positive().optional(),
   maxLines: z.number().int().positive().optional(),
 });
@@ -19,7 +19,7 @@ const ListDirArgsSchema = z.object({
 const GrepArgsSchema = z.object({
   pattern: z.string().min(1),
   path: z.string().default("."),
-  contextLines: z.number().int().min(0).max(5).optional(),
+  contextLines: z.number().int().min(0).optional(),
 });
 
 function resolveExistingRealPath(targetPath: string): string {
@@ -106,7 +106,7 @@ async function runGrepSearch(
     const escaped = args.pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     regex = new RegExp(escaped, "i");
   }
-  const ctx = args.contextLines ?? 0;
+  const ctx = Math.min(Math.max(0, args.contextLines ?? 0), 15);
   const matches: string[] = [];
   for (const file of files) {
     const stat = await fs.stat(file).catch(() => null);
@@ -182,6 +182,8 @@ export function createBuiltinTools(workspaceRoot: string = process.cwd()): ToolC
             if (!IGNORED_DIRS.has(sub.name)) {
               const relSub = `${e.name}/${sub.name}`;
               lines.push(`  ${sub.isDirectory() ? `${relSub}/` : formatFileWithLineCount(path.join(subPath, sub.name), relSub)}`);
+            } else if (sub.isDirectory() && sub.name !== ".git" && sub.name !== ".sessions") {
+              ignoredFound.push(`${e.name}/${sub.name}/`);
             }
           }
         } else {

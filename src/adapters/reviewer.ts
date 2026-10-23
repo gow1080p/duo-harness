@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import type { LlmProvider } from "../core/contracts.js";
+import { createAgyBridgeProvider, probeAgyQuota } from "./agy-bridge.js";
 import { runAgentSession } from "./cli.js";
 import { resolveSafePath } from "./tools.js";
 
@@ -166,6 +167,15 @@ export async function runCodeReview(
     preloadedSnippets.push(`=== 待审文件: ${file} ===\n${numbered}`);
   }
 
+  let activeProvider = options.provider;
+  let useAgyOneShot = false;
+  if (!activeProvider) {
+    const quota = await probeAgyQuota();
+    if (quota.shouldPreferAgy) {
+      activeProvider = createAgyBridgeProvider();
+      useAgyOneShot = true;
+    }
+  }
   const reviewPrompt = [
     "请对以下目标文件执行独立代码与架构审查。",
     "【全库 RepoMap 符号骨架图 (供跨文件调用定位行号)】:",
@@ -174,16 +184,18 @@ export async function runCodeReview(
     staticViolations.length > 0 ? staticViolations.join("\n") : "0 项静态违规",
     "【待审文件带行号源码】:",
     preloadedSnippets.join("\n\n"),
-    "若待审文件调用了其他未预加载文件中的函数，请先调用 read_file 或 grep 工具核实上下游定义，禁止盲猜。",
+    useAgyOneShot
+      ? "以上已预加载完整待审源码与全库符号骨架，请直接基于现有信息完成单轮审查，切勿调用任何工具。"
+      : "若待审文件调用了其他未预加载文件中的函数，请先调用 read_file 或 grep 工具核实上下游定义，禁止盲猜。",
     '审查完成后，必须只输出符合以下格式的纯 JSON：{"passed":boolean,"staticViolations":string[],"findings":[{"file":string,"line":number,"severity":"error"|"warning"|"info","issue":string,"fix":string}]}',
   ].join("\n\n");
 
   let verifiedReport: ReviewReport | null = null;
   const sessionResult = await runAgentSession(reviewPrompt, {
     workspaceRoot,
-    provider: options.provider,
+    provider: activeProvider,
     enableWriteTools: false,
-    maxSteps: options.maxSteps ?? 6,
+    maxSteps: options.maxSteps ?? (useAgyOneShot ? 2 : 6),
     sessionFile: options.sessionFile,
     systemPrompt:
       "你是严谨的代码与架构审查特工。只允许使用只读工具追查跨文件引用，最终回答必须是严格的 ReviewReport JSON 对象。",

@@ -81,14 +81,11 @@ export function extractUsageFromSseLines(
 }
 
 function resolveUnitRates(model: string, isoTimestamp: string): UnitRates {
+  if (/agy|antigravity|argon|gemini/i.test(model)) {
+    return { inMissPerM: 0, cacheHitPerM: 0, outPerM: 0, minCacheTokens: 0, periodLabel: "Antigravity 订阅额度桥接 (实付 ¥0)" };
+  }
   if (/mimo/i.test(model)) {
-    return {
-      inMissPerM: 2.0,
-      cacheHitPerM: 0.2,
-      outPerM: 6.0,
-      minCacheTokens: 1024,
-      periodLabel: "小米 MiMo 2.6 计费档 (满 1024 tok 起缓)",
-    };
+    return { inMissPerM: 2.0, cacheHitPerM: 0.2, outPerM: 6.0, minCacheTokens: 1024, periodLabel: "小米 MiMo 2.6 计费档 (满 1024 tok 起缓)" };
   }
   const ts = Date.parse(isoTimestamp);
   const bj = new Date((Number.isFinite(ts) ? ts : Date.now()) + 8 * 3600_000);

@@ -32,6 +32,7 @@ export interface RunSessionOptions {
   verifyCompletion?: (finalAnswer: string) => Promise<{ ok: boolean; errorOutput?: string }> | { ok: boolean; errorOutput?: string };
   onStepEvent?: (event: { phase: string; step: number; detail?: string; toolCalls?: ToolCall[]; toolResults?: { toolCallId: string; name: string; content: string; isError?: boolean }[] }) => void;
   onStreamEvent?: (event: LlmStreamEvent) => void;
+  onSnapshotChange?: () => void;
 }
 
 interface SessionCursor {
@@ -52,13 +53,7 @@ function syncNewMessagesToDisk(sessionFile: string | undefined, recordedEntries:
 function filterCallsNeedingApproval(calls: readonly ToolCall[], readonlyMap: Map<string, boolean>): ToolCall[] {
   return calls.filter((c) => {
     if (readonlyMap.get(c.name) !== false) return false;
-    if (
-      c.name === "run_bash" &&
-      isReadonlyBashCommand(String(c.arguments?.command ?? ""), c.arguments?.readonly as boolean | undefined)
-    ) {
-      return false;
-    }
-    return true;
+    return !(c.name === "run_bash" && isReadonlyBashCommand(String(c.arguments?.command ?? ""), c.arguments?.readonly as boolean | undefined));
   });
 }
 
@@ -77,10 +72,7 @@ async function runSingleEffectStep(
     const messagesToSend = compactMessages(rawMessages, options.compactor);
     if (state.step >= state.maxSteps - 1 && messagesToSend.length > 0) {
       const last = messagesToSend[messagesToSend.length - 1]!;
-      messagesToSend[messagesToSend.length - 1] = {
-        ...last,
-        content: `${last.content}\n[系统提示：当前已执行 ${state.step}/${state.maxSteps} 步，请勿再发起只读探索，请立即完成修改或直接输出总结回答。]`,
-      };
+      messagesToSend[messagesToSend.length - 1] = { ...last, content: `${last.content}\n[系统提示：当前已执行 ${state.step}/${state.maxSteps} 步，请勿再发起只读探索，请立即完成修改或直接输出总结回答。]` };
     }
     assertSessionInvariant(messagesToSend);
     let reply;
@@ -88,10 +80,7 @@ async function runSingleEffectStep(
       reply = await provider.chat(messagesToSend, tools, { signal: options.signal, onStreamEvent: options.onStreamEvent });
     } catch (err) {
       if (options.signal?.aborted) {
-        return {
-          state: { ...state, phase: "error", error: "收到外部取消信号 (AbortSignal)" },
-          effect: { type: "ABORT", reason: "收到外部取消信号 (AbortSignal)" },
-        };
+        return { state: { ...state, phase: "error", error: "收到外部取消信号 (AbortSignal)" }, effect: { type: "ABORT", reason: "收到外部取消信号 (AbortSignal)" } };
       }
       throw err;
     }
@@ -111,7 +100,12 @@ async function runSingleEffectStep(
     const writeCalls = filterCallsNeedingApproval(effect.toolCalls, readonlyMap);
     const decision = options.onApprovalRequest ? await options.onApprovalRequest(writeCalls.length > 0 ? writeCalls : effect.toolCalls) : { approved: false, reason: "未配置审批回调，默认拒绝写操作" };
     console.log(decision.approved ? `  🟢 已确认允许执行` : `  🔴 已拒绝执行: ${decision.reason}`);
-    return stepAgentLoop(state, { type: "APPROVAL_RESOLVED", approved: decision.approved, reason: decision.reason });
+    const resolved = stepAgentLoop(state, { type: "APPROVAL_RESOLVED", approved: decision.approved, reason: decision.reason });
+    if (options.signal?.aborted) {
+      const abortReason = decision.reason ?? "用户按 Ctrl+C 中断了本轮操作";
+      return { state: { ...resolved.state, phase: "error", error: abortReason }, effect: { type: "ABORT", reason: abortReason } };
+    }
+    return resolved;
   }
 
   if (effect.type === "EXECUTE_TOOLS") {
@@ -138,13 +132,20 @@ function initSessionContext(userPrompt: string, workspaceRoot: string, options: 
     } catch {}
   }
   const rawPrior = existingEntries.length > 0 && options.leafId ? projectToMessages(existingEntries, options.leafId) : [];
-  const existingSystem = rawPrior[0]?.role === "system" ? rawPrior[0].content : undefined;
+  const existingSystem = rawPrior.length > 1 && rawPrior[0]?.role === "system" ? rawPrior[0].content : undefined;
   const systemPrompt = options.systemPrompt ?? existingSystem ?? buildDefaultSystemPrompt(workspaceRoot);
+  if (rawPrior.length === 1 && rawPrior[0]?.role === "system" && rawPrior[0].content !== systemPrompt && existingEntries[0]?.message.role === "system") {
+    rawPrior[0] = { role: "system", content: systemPrompt };
+    existingEntries[0] = { ...existingEntries[0], message: rawPrior[0] };
+    if (options.sessionFile) appendJsonlEntries(options.sessionFile, existingEntries, true);
+  }
   const baseState = createInitialState({ systemPrompt, maxSteps: options.maxSteps ?? 20 });
   const priorMessages = repairDanglingToolCalls(rawPrior.length > 0 ? rawPrior : baseState.messages);
   while (priorMessages.length > 0 && priorMessages[priorMessages.length - 1]!.role === "user") priorMessages.pop();
+  if (options.systemPrompt && priorMessages[0]?.role === "system" && priorMessages[0].content !== systemPrompt) {
+    priorMessages[0] = { role: "system", content: systemPrompt };
+  }
   const wasHealed = existingEntries.length > 0 && (priorMessages.length !== rawPrior.length || priorMessages.some((m, i) => m !== rawPrior[i]));
-  if (options.systemPrompt && priorMessages[0]?.role === "system") priorMessages[0] = { role: "system", content: systemPrompt };
   const recordedEntries: SessionEntry[] = wasHealed
     ? buildSessionEntries([], priorMessages, Date.now(), null)
     : existingEntries;
@@ -170,7 +171,7 @@ export async function runAgentSession(
   const provider = isReplay ? createReplayProvider(loadJsonlEntries(options.replayFromFile!)) : (options.provider ?? createRouterProvider(wireLogFile));
   const defaultTools = [
     ...createBuiltinTools(workspaceRoot),
-    ...(options.enableWriteTools ? createWriteTools(workspaceRoot, snapshots, options.signal) : []),
+    ...(options.enableWriteTools ? createWriteTools(workspaceRoot, snapshots, options.signal, options.onSnapshotChange) : []),
   ];
   const tools = options.tools ?? defaultTools;
   const readonlyMap = new Map(tools.map((t) => [t.name, t.readonly]));
@@ -182,18 +183,20 @@ export async function runAgentSession(
   let { stepRes, recordedEntries, cursor } = initSessionContext(userPrompt, workspaceRoot, options);
 
   while (true) {
-    if (options.signal?.aborted) {
+    if (options.signal?.aborted && stepRes.effect.type !== "ABORT") {
       stepRes = {
         state: { ...stepRes.state, phase: "error", error: "收到外部取消信号 (AbortSignal)" },
         effect: { type: "ABORT", reason: "收到外部取消信号 (AbortSignal)" },
       };
     }
     if (stepRes.effect.type === "ABORT") {
-      syncNewMessagesToDisk(options.sessionFile, recordedEntries, stepRes.state.messages, cursor, false);
+      syncNewMessagesToDisk(options.sessionFile, recordedEntries, repairDanglingToolCalls(stepRes.state.messages), cursor, false);
       const turnSnapCount = snapshots.length - snapStartIdx;
-      if (turnSnapCount > 0) {
-        const rb = await rollbackFileSnapshots(workspaceRoot, snapshots, turnSnapCount);
+      if (turnSnapCount > 0 && !options.signal?.aborted) {
+        const rb = await rollbackFileSnapshots(workspaceRoot, snapshots, turnSnapCount, options.onSnapshotChange);
         console.warn(`🔄 [任务熔断自动回滚] 已自动还原 ${rb.rolledBackCount} 个版本修改 (${rb.touchedPaths.join(", ")})`);
+      } else if (turnSnapCount > 0 && options.suppressFinalEcho) {
+        console.log(formatCompactTurnFooter(wireLogFile, stepRes.state.step, isReplay, snapshots.slice(snapStartIdx), workspaceRoot));
       }
       printCostIfEnabled(options, wireLogFile, isReplay);
       console.error(`\n❌ [循环熔断终止] ${stepRes.effect.reason}`);
@@ -232,14 +235,8 @@ export async function runAgentSession(
 
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
 if (isMain) {
-  const prompt =
-    process.argv.slice(2).join(" ").trim() ||
-    "请先用 list_dir 查看当前目录有哪些文件，再读取 package.json 告诉我这个项目的名称和 dependencies。";
-  runAgentSession(prompt, {
-    sessionFile: ".sessions/ask-latest.jsonl",
-    enableWriteTools: true,
-    showCostReport: true,
-  }).catch((err) => {
+  const prompt = process.argv.slice(2).join(" ").trim() || "请先用 list_dir 查看当前目录有哪些文件，再读取 package.json 告诉我这个项目的名称和 dependencies。";
+  runAgentSession(prompt, { sessionFile: ".sessions/ask-latest.jsonl", enableWriteTools: true, showCostReport: true }).catch((err) => {
     console.error("运行出错:", err instanceof Error ? err.message : err);
     process.exit(1);
   });

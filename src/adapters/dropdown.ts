@@ -32,6 +32,7 @@ export function buildDropdownItems(
       { label: "/model auto", desc: "⚡ 智能模式 (新对话按高峰MiMo/低谷DS路由，续聊自动保持原模型防缓存失效)", fillText: "/model auto" },
       { label: "/model deepseek", desc: "🧠 锁定 DeepSeek (deepseek-reasoner · 深度中文推理)", fillText: "/model deepseek" },
       { label: "/model mimo", desc: "🚀 锁定 小米 MiMo (mimo-v2.6-pro · 高速主力模型)", fillText: "/model mimo" },
+      { label: "/model agy", desc: "🪐 桥接 Antigravity (本机官方 language_server · 白嫖 5h 刷新额度)", fillText: "/model agy" },
     ];
     return modes.filter((m) => !filter || m.label.includes(filter));
   }

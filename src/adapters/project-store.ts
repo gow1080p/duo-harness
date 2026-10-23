@@ -3,16 +3,19 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { SessionEntry } from "../core/contracts.js";
-import { loadJsonlEntries } from "./store.js";
-import { shortenWorkspaceText, summarizeSnapshotsDiff } from "./ui-logger.js";
+import { formatSnapshotsDiff } from "./diff-presenter.js";
+import { loadJsonlEntries, writeFileAtomicSync } from "./store.js";
 import type { FileVersionSnapshot } from "./write-tools.js";
+
+export { formatSnapshotsDiff };
 
 export interface ProjectMetaState {
   projectKey: string;
   workspaceRoot: string;
   updatedAt: string;
   activeLeafId?: string | null;
-  modelMode?: "auto" | "deepseek" | "mimo" | "openai";
+  modelMode?: "auto" | "deepseek" | "mimo" | "agy" | "openai";
+  lastUndoNotice?: string | null;
 }
 
 export function loadProjectMeta(metaFile: string): Partial<ProjectMetaState> {
@@ -23,8 +26,7 @@ export function loadProjectMeta(metaFile: string): Partial<ProjectMetaState> {
 export function saveProjectMeta(metaFile: string, patch: Partial<ProjectMetaState>): void {
   try {
     const prev = loadProjectMeta(metaFile);
-    fs.mkdirSync(path.dirname(metaFile), { recursive: true });
-    fs.writeFileSync(metaFile, JSON.stringify({ ...prev, ...patch, updatedAt: new Date().toISOString() }, null, 2), "utf-8");
+    writeFileAtomicSync(metaFile, JSON.stringify({ ...prev, ...patch, updatedAt: new Date().toISOString() }, null, 2));
   } catch {}
 }
 
@@ -59,10 +61,10 @@ export interface ConversationTurnSummary {
 export const SLASH_COMMANDS = [
   { cmd: "/resume ", label: "/resume", desc: "用 ↑/↓ 方向键选择历史轮次或切换会话" },
   { cmd: "/new", label: "/new", desc: "开启全新对话 (保留旧历史，可随时 /resume 切回)" },
-  { cmd: "/model ", label: "/model", desc: "用 ↑/↓ 方向键切换模型 (auto/deepseek/mimo)" },
+  { cmd: "/model ", label: "/model", desc: "用 ↑/↓ 方向键切换模型 (auto/deepseek/mimo/agy)" },
   { cmd: "/history", label: "/history", desc: "查看当前项目所有历史问答列表" },
   { cmd: "/diff", label: "/diff", desc: "查看文件修改对比 (-删除 / +新增)" },
-  { cmd: "/undo", label: "/undo", desc: "撤回修改 (/undo 撤1步 | /undo all 全部撤回)" },
+  { cmd: "/undo", label: "/undo", desc: "撤回修改 (/undo 撤上一轮 | /undo N 撤N步 | /undo all 全部撤回)" },
   { cmd: "/cd ", label: "/cd <项目>", desc: "切换项目工作区 (按回车直接展开项目列表)" },
   { cmd: "/projects", label: "/projects", desc: "查看本机已管理的所有项目列表" },
   { cmd: "/xray", label: "/xray", desc: "查看每步耗时、缓存命中与费用账单" },
@@ -162,8 +164,20 @@ export function loadProjectSnapshots(snapshotsFile: string): FileVersionSnapshot
 
 export function saveProjectSnapshots(snapshotsFile: string, snapshots: readonly FileVersionSnapshot[]): void {
   try {
-    fs.mkdirSync(path.dirname(snapshotsFile), { recursive: true });
-    fs.writeFileSync(snapshotsFile, JSON.stringify(snapshots.slice(-40), null, 2), "utf-8");
+    let toSave = [...snapshots];
+    if (toSave.length > 80) {
+      const earliestBefore = new Map<string, string | null>();
+      for (const s of toSave) if (!earliestBefore.has(s.path)) earliestBefore.set(s.path, s.beforeContent);
+      toSave = toSave.slice(-80).map((s) => ({ ...s }));
+      const patched = new Set<string>();
+      for (const s of toSave) {
+        if (!patched.has(s.path) && earliestBefore.has(s.path)) {
+          s.beforeContent = earliestBefore.get(s.path)!;
+          patched.add(s.path);
+        }
+      }
+    }
+    writeFileAtomicSync(snapshotsFile, JSON.stringify(toSave, null, 2));
   } catch {}
 }
 
@@ -228,16 +242,4 @@ export function formatRecentHistoryRecap(entries: readonly SessionEntry[], maxTu
     lines.push(`  #${t.turnIndex} ${badge}👤 ${uShort}\n               🤖 \x1b[2m[${t.toolSteps}步] ${rShort}\x1b[0m`);
   }
   return lines.join("\n");
-}
-
-export function formatSnapshotsDiff(snapshots: readonly FileVersionSnapshot[], workspaceRoot: string): string {
-  const diffs = summarizeSnapshotsDiff(snapshots, workspaceRoot);
-  if (diffs.length === 0) return "ℹ️ 当前没有未撤回的文件修改记录。";
-  const out = [`\n🔍 [文件修改审核对比 (共 ${diffs.length} 个文件, ${snapshots.length} 个快照版本 · 输入 /undo [步数|all] 可撤回)]:`];
-  for (const d of diffs) {
-    out.push(`  📘 ${d.file} (${d.isNew ? "新建文件" : `修改 ${d.edits} 次 · ${d.oldLines} -> ${d.newLines} 行`})`);
-    for (const r of d.removedPreview) out.push(`     \x1b[31m- ${r.slice(0, 84)}\x1b[0m`);
-    for (const a of d.addedPreview) out.push(`     \x1b[32m+ ${a.slice(0, 84)}\x1b[0m`);
-  }
-  return out.join("\n");
 }

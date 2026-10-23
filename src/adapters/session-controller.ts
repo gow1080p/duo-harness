@@ -70,7 +70,7 @@ function syncStateFromDisk(st: ControllerMutableState): SessionEntry[] {
   const entries = loadDiskEntries(st.paths.sessionFile);
   const meta = loadProjectMeta(st.paths.metaFile);
   st.modelMode =
-    meta.modelMode === "auto" || meta.modelMode === "deepseek" || meta.modelMode === "mimo" || meta.modelMode === "openai"
+    meta.modelMode === "auto" || meta.modelMode === "deepseek" || meta.modelMode === "mimo" || meta.modelMode === "agy" || meta.modelMode === "openai"
       ? meta.modelMode
       : "auto";
   if (meta.activeLeafId === "__root__") {
@@ -107,9 +107,17 @@ function buildStatusSummary(st: ControllerMutableState): SessionStatusSummary {
 
 async function executeControllerAsk(st: ControllerMutableState, prompt: string, runOpts: Partial<RunSessionOptions> = {}): Promise<TurnExecutionSummary> {
   syncStateFromDisk(st);
+  const meta = loadProjectMeta(st.paths.metaFile);
+  const effectivePrompt = meta.lastUndoNotice ? `${prompt}\n\n[系统提示：${meta.lastUndoNotice}，请以磁盘最新文件内容为准]` : prompt;
+  saveProjectMeta(st.paths.metaFile, { activeLeafId: null, ...(meta.lastUndoNotice ? { lastUndoNotice: null } : {}) });
   const snapStart = st.snapshots.length;
+  const turnId = `turn_${Date.now()}`;
+  const persistTurnSnapshots = () => {
+    for (let i = snapStart; i < st.snapshots.length; i++) if (!st.snapshots[i]!.turnId) st.snapshots[i]!.turnId = turnId;
+    saveProjectSnapshots(st.paths.snapshotsFile, st.snapshots);
+  };
   try {
-    const res = await runAgentSession(prompt, {
+    const res = await runAgentSession(effectivePrompt, {
       ...runOpts,
       workspaceRoot: st.paths.workspaceRoot,
       sessionFile: st.paths.sessionFile,
@@ -117,12 +125,14 @@ async function executeControllerAsk(st: ControllerMutableState, prompt: string, 
       leafId: st.leafId ?? undefined,
       provider: runOpts.provider ?? st.provider,
       snapshots: st.snapshots,
+      onSnapshotChange: persistTurnSnapshots,
       enableWriteTools: runOpts.enableWriteTools ?? true,
       showCostReport: runOpts.showCostReport ?? false,
     });
     st.leafId = res.leafId;
     saveProjectMeta(st.paths.metaFile, { activeLeafId: res.leafId });
     const turnSnaps = st.snapshots.slice(snapStart);
+    persistTurnSnapshots();
     const m = computeTurnMetrics(st.paths.wireLogFile, res.stepsUsed);
     const status = buildStatusSummary(st);
     return {
@@ -136,8 +146,32 @@ async function executeControllerAsk(st: ControllerMutableState, prompt: string, 
       modifiedFiles: summarizeSnapshotsDiff(turnSnaps, st.paths.workspaceRoot),
     };
   } finally {
-    saveProjectSnapshots(st.paths.snapshotsFile, st.snapshots);
+    persistTurnSnapshots();
   }
+}
+
+async function executeControllerUndo(st: ControllerMutableState, arg = "turn") {
+  syncStateFromDisk(st);
+  let stepsBack = 1;
+  if (arg === "all") stepsBack = st.snapshots.length;
+  else if (arg === "turn" || arg === "") {
+    const top = st.snapshots[st.snapshots.length - 1];
+    if (top?.turnId) {
+      let cnt = 0;
+      for (let i = st.snapshots.length - 1; i >= 0 && st.snapshots[i]?.turnId === top.turnId; i--) cnt++;
+      stepsBack = Math.max(1, cnt);
+    }
+  } else {
+    const n = Number(arg);
+    if (!Number.isInteger(n) || n < 1) return { rolledBackCount: 0, remainingVersions: st.snapshots.length, touchedPaths: [] };
+    stepsBack = n;
+  }
+  const flushSnapshots = () => saveProjectSnapshots(st.paths.snapshotsFile, st.snapshots);
+  const rb = await rollbackFileSnapshots(st.paths.workspaceRoot, st.snapshots, stepsBack, flushSnapshots);
+  const touchedPaths = [...new Set(rb.touchedPaths)];
+  flushSnapshots();
+  if (rb.rolledBackCount > 0) saveProjectMeta(st.paths.metaFile, { lastUndoNotice: `用户刚才执行了 /undo，已撤回 ${rb.rolledBackCount} 处文件修改 (${touchedPaths.join(", ")})` });
+  return { rolledBackCount: rb.rolledBackCount, remainingVersions: rb.currentVersion, touchedPaths };
 }
 
 export function createSessionController(options: SessionControllerOptions = {}) {
@@ -174,7 +208,8 @@ export function createSessionController(options: SessionControllerOptions = {}) 
       }
       st.leafId = resolvedId;
       saveProjectMeta(st.paths.metaFile, { activeLeafId: resolvedId });
-      return { ok: true, status: buildStatusSummary(st), recapText: formatRecentHistoryRecap(entries, 1, st.leafId) };
+      const snapHint = st.snapshots.length > 0 ? `\n💡 提示：工作区当前有 ${st.snapshots.length} 处未撤回的文件修改（可输入 /diff 查看或 /undo 撤回代码）。` : "";
+      return { ok: true, status: buildStatusSummary(st), recapText: `${formatRecentHistoryRecap(entries, 1, st.leafId)}${snapHint}` };
     },
     setModelMode: (mode: ModelMode): SessionStatusSummary => {
       st.modelMode = mode;
@@ -185,13 +220,7 @@ export function createSessionController(options: SessionControllerOptions = {}) 
       syncStateFromDisk(st);
       return { files: summarizeSnapshotsDiff(st.snapshots, st.paths.workspaceRoot), totalSnapshots: st.snapshots.length, formattedText: formatSnapshotsDiff(st.snapshots, st.paths.workspaceRoot) };
     },
-    undo: async (arg = "1") => {
-      syncStateFromDisk(st);
-      const stepsBack = arg === "all" ? st.snapshots.length : Math.max(1, Number(arg) || 1);
-      const rb = await rollbackFileSnapshots(st.paths.workspaceRoot, st.snapshots, stepsBack);
-      saveProjectSnapshots(st.paths.snapshotsFile, st.snapshots);
-      return { rolledBackCount: rb.rolledBackCount, remainingVersions: rb.currentVersion, touchedPaths: [...new Set(rb.touchedPaths)] };
-    },
+    undo: (arg = "turn") => executeControllerUndo(st, arg),
     switchWorkspace: (targetArg: string) => {
       const candidate = resolveTargetWorkspace(targetArg, st.paths.workspaceRoot, path.dirname(st.paths.projectDir));
       if (!candidate) return { ok: false, error: `未找到项目或目录 "${targetArg}"`, status: buildStatusSummary(st), entryCount: 0, recapText: "" };

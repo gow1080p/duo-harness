@@ -4,33 +4,32 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { z } from "zod";
 import type { ToolContract } from "../core/contracts.js";
+import { extractChangedHunk } from "./diff-presenter.js";
+import { writeFileAtomicSync } from "./store.js";
 import { resolveSafePath } from "./tools.js";
 import { isReadonlyBashCommand } from "./ui-logger.js";
 
 const SEATBELT_READONLY_PROFILE =
-  '(version 1)(allow default)(deny file-write*)(allow file-write* (literal "/dev/null") (literal "/private/dev/null") (subpath "/dev/fd"))';
+  '(version 1)(allow default)(deny file-write*)(allow file-write* (literal "/dev/null") (literal "/private/dev/null") (subpath "/dev/fd"))(allow process-exec (literal "/bin/ps") (with no-sandbox))';
 
-const SingleEditItemSchema = z.object({
-  oldText: z.string(),
-  newText: z.string(),
-});
-
+const SingleEditItemSchema = z.object({ oldText: z.string(), newText: z.string() });
 const EditFileArgsSchema = z.object({
   path: z.string().min(1),
   oldText: z.string().optional(),
   newText: z.string().optional(),
-  edits: z.array(SingleEditItemSchema).optional(),
+  edits: z.preprocess((val) => {
+    if (typeof val === "string") {
+      try { return JSON.parse(val); } catch { return val; }
+    }
+    return val;
+  }, z.array(SingleEditItemSchema).optional()),
 });
-
 const RunBashArgsSchema = z.object({
   command: z.string().min(1),
   timeoutMs: z.number().int().positive().optional(),
   readonly: z.boolean().optional(),
 });
-
-const RollbackVersionArgsSchema = z.object({
-  stepsBack: z.number().int().positive().max(100).default(1),
-});
+const RollbackVersionArgsSchema = z.object({ stepsBack: z.number().int().positive().max(100).default(1) });
 
 export interface FileVersionSnapshot {
   version: number;
@@ -38,37 +37,29 @@ export interface FileVersionSnapshot {
   beforeContent: string | null;
   afterContent: string;
   timestamp: number;
+  turnId?: string;
+  hunkCount?: number;
 }
 
-/**
- * 按逆序回滚最近 stepsBack 个文件版本快照（beforeContent 为 null 表示原本不存在，回滚时直接删除）
- */
+/** 按逆序回滚最近 stepsBack 个文件版本快照（beforeContent 为 null 表示原本不存在，回滚时直接删除） */
 export async function rollbackFileSnapshots(
   workspaceRoot: string,
   snapshots: FileVersionSnapshot[],
   stepsBack = 1,
+  onSnapshotChange?: () => void,
 ): Promise<{ rolledBackCount: number; currentVersion: number; touchedPaths: string[] }> {
   const count = Math.min(Math.max(0, stepsBack), snapshots.length);
   const touchedPaths: string[] = [];
-
   for (let i = 0; i < count; i++) {
     const snap = snapshots[snapshots.length - 1]!;
     const fullPath = resolveSafePath(workspaceRoot, snap.path, "write");
-    if (snap.beforeContent === null) {
-      await fs.rm(fullPath, { force: true });
-    } else {
-      await fs.mkdir(path.dirname(fullPath), { recursive: true });
-      await fs.writeFile(fullPath, snap.beforeContent, "utf-8");
-    }
+    if (snap.beforeContent === null) await fs.rm(fullPath, { force: true });
+    else writeFileAtomicSync(fullPath, snap.beforeContent);
     snapshots.pop();
+    onSnapshotChange?.();
     touchedPaths.push(snap.path);
   }
-
-  return {
-    rolledBackCount: count,
-    currentVersion: snapshots.length,
-    touchedPaths,
-  };
+  return { rolledBackCount: count, currentVersion: snapshots.length, touchedPaths };
 }
 
 export function killProcessGroup(pid: number | undefined): void {
@@ -78,9 +69,7 @@ export function killProcessGroup(pid: number | undefined): void {
   } catch {
     try {
       process.kill(pid, "SIGKILL");
-    } catch {
-      // 进程已退出
-    }
+    } catch {}
   }
 }
 
@@ -96,100 +85,120 @@ export function runCommandInSandbox(
     const useSeatbelt = readonly && process.platform === "darwin" && fsSync.existsSync("/usr/bin/sandbox-exec");
     const spawnBin = useSeatbelt ? "/usr/bin/sandbox-exec" : shellBin;
     const spawnArgs = useSeatbelt ? ["-p", SEATBELT_READONLY_PROFILE, shellBin, "-c", command] : ["-c", command];
-    const child = spawn(spawnBin, spawnArgs, {
-      cwd,
-      detached: true,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    const child = spawn(spawnBin, spawnArgs, { cwd, detached: true, stdio: ["ignore", "pipe", "pipe"] });
 
     let combined = "";
     const appendChunk = (chunk: Buffer) => {
       if (combined.length < 16_000) combined += chunk.toString("utf-8");
     };
-
     child.stdout.on("error", () => {});
     child.stderr.on("error", () => {});
     child.stdout.on("data", appendChunk);
     child.stderr.on("data", appendChunk);
 
     let finished = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let exitTimer: ReturnType<typeof setTimeout> | undefined;
+    const onAbort = () => {
+      killProcessGroup(child.pid);
+      finish(130, "[收到取消信号已终止进程组]\n");
+    };
     const finish = (exitCode: number, prefix = "") => {
       if (finished) return;
       finished = true;
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
+      if (exitTimer) clearTimeout(exitTimer);
+      signal?.removeEventListener("abort", onAbort);
       child.stdout.destroy();
       child.stderr.destroy();
-      const text = (prefix + combined).trim().slice(0, 8_000);
+      let text = (prefix + combined).trim().slice(0, 8_000);
+      if (useSeatbelt && exitCode !== 0 && /Operation not permitted|No usable temporary directory|Read-only file system/i.test(text)) {
+        text += "\n[沙箱提示：该命令在只读沙箱中运行，禁止写入任何磁盘或临时文件；若需写盘请传 readonly: false]";
+      }
       resolve({ exitCode, output: text || "(无输出)" });
     };
 
     if (signal) {
-      if (signal.aborted) {
-        killProcessGroup(child.pid);
-        finish(130, "[收到取消信号已终止进程组]\n");
-        return;
-      }
-      signal.addEventListener("abort", () => {
-        killProcessGroup(child.pid);
-        finish(130, "[收到取消信号已终止进程组]\n");
-      }, { once: true });
+      if (signal.aborted) return onAbort();
+      signal.addEventListener("abort", onAbort, { once: true });
     }
-
-    const timer = setTimeout(() => {
+    timer = setTimeout(() => {
       killProcessGroup(child.pid);
       finish(124, `[命令超时 (${timeoutMs}ms) 已强制终止进程组]\n`);
     }, timeoutMs);
 
     child.on("error", (err) => finish(1, `启动命令失败: ${err.message}\n`));
+    child.on("exit", (code) => {
+      exitTimer = setTimeout(() => {
+        if (readonly) killProcessGroup(child.pid);
+        finish(code ?? 1);
+      }, 150);
+    });
     child.on("close", (code) => finish(code ?? 1));
   });
+}
+
+function replaceSingleItem(workingContent: string, oldText: string, newText: string, filePath: string, wasCreatedEmpty: boolean): string {
+  if (wasCreatedEmpty && workingContent === "") throw new Error(`文件不存在，无法替换 oldText: ${filePath}`);
+  const exactCount = workingContent.split(oldText).length - 1;
+  if (exactCount === 1) return workingContent.replace(oldText, () => newText);
+  if (exactCount > 1) throw new Error(`oldText 在 ${filePath} 中出现了 ${exactCount} 次，请补充前后几行保证唯一匹配`);
+  const eol = workingContent.includes("\r\n") ? "\r\n" : "\n";
+  const normOld = oldText.replace(/\r\n/g, "\n").split("\n").join(eol);
+  const normNew = newText.replace(/\r\n/g, "\n").split("\n").join(eol);
+  const eolCount = normOld !== oldText ? workingContent.split(normOld).length - 1 : 0;
+  if (eolCount === 1) return workingContent.replace(normOld, () => normNew);
+  if (eolCount > 1) throw new Error(`oldText 在 ${filePath} 中出现了 ${eolCount} 次，请补充前后几行保证唯一匹配`);
+  const wLines = workingContent.split(/\r?\n/), oLines = oldText.split(/\r?\n/);
+  const matchIdxs: number[] = [];
+  for (let i = 0; i <= wLines.length - oLines.length; i++) {
+    if (oLines.every((ol, j) => wLines[i + j]?.trimEnd() === ol.trimEnd())) matchIdxs.push(i);
+  }
+  if (matchIdxs.length === 1) {
+    const idx = matchIdxs[0]!;
+    return [...wLines.slice(0, idx), ...normNew.split(/\r?\n/), ...wLines.slice(idx + oLines.length)].join(eol);
+  }
+  if (matchIdxs.length > 1) throw new Error(`oldText 在 ${filePath} 中出现了 ${matchIdxs.length} 次，请补充前后几行保证唯一匹配`);
+  throw new Error(`在 ${filePath} 中未找到匹配的 oldText，请先用 read_file 确认原文件内容`);
 }
 
 async function applyFileEdit(
   workspaceRoot: string,
   snapshots: FileVersionSnapshot[],
   args: z.infer<typeof EditFileArgsSchema>,
+  onSnapshotChange?: () => void,
 ): Promise<string> {
   const fullPath = resolveSafePath(workspaceRoot, args.path, "write");
   const existed = fsSync.existsSync(fullPath);
   const beforeContent = existed ? await fs.readFile(fullPath, "utf-8") : null;
-  await fs.mkdir(path.dirname(fullPath), { recursive: true });
 
   const hasBatch = Array.isArray(args.edits) && args.edits.length > 0;
   if (!hasBatch && (args.oldText === undefined || args.newText === undefined)) {
     throw new Error(`edit_file 参数缺失：必须提供 oldText/newText 或非空 edits 数组`);
   }
   const editList = hasBatch ? args.edits! : [{ oldText: args.oldText!, newText: args.newText! }];
+  if (editList.length > 1 && editList.some((item) => item.oldText === "")) {
+    throw new Error(`批量 edits 中禁止混入 oldText 为空串的全量覆盖项: ${args.path}`);
+  }
 
   let workingContent = beforeContent ?? "";
   for (const item of editList) {
     if (item.oldText === "") {
       workingContent = item.newText;
     } else {
-      if (beforeContent === null && workingContent === "") {
-        throw new Error(`文件不存在，无法替换 oldText: ${args.path}`);
-      }
-      const occurrences = workingContent.split(item.oldText).length - 1;
-      if (occurrences === 0) {
-        throw new Error(`在 ${args.path} 中未找到匹配的 oldText，请先用 read_file 确认原文件内容`);
-      }
-      if (occurrences > 1) {
-        throw new Error(`oldText 在 ${args.path} 中出现了 ${occurrences} 次，请补充前后几行保证唯一匹配`);
-      }
-      workingContent = workingContent.replace(item.oldText, () => item.newText);
+      workingContent = replaceSingleItem(workingContent, item.oldText, item.newText, args.path, beforeContent === null);
     }
   }
 
-  await fs.writeFile(fullPath, workingContent, "utf-8");
+  writeFileAtomicSync(fullPath, workingContent);
+  const relPath = path.relative(resolveSafePath(workspaceRoot, ".", "read"), fullPath) || args.path;
   const version = snapshots.length + 1;
-  snapshots.push({
-    version,
-    path: args.path,
-    beforeContent,
-    afterContent: workingContent,
-    timestamp: Date.now(),
-  });
-  return `已写入文件: ${args.path} (共应用 ${editList.length} 处修改，当前版本 v${version})`;
+  snapshots.push({ version, path: relPath, beforeContent, afterContent: workingContent, timestamp: Date.now(), hunkCount: editList.length });
+  onSnapshotChange?.();
+  const hunks = editList.map((e) => extractChangedHunk(e.oldText, e.newText));
+  const added = beforeContent === null ? workingContent.split(/\r?\n/).length : hunks.reduce((a, h) => a + h.added.length, 0);
+  const removed = beforeContent === null ? 0 : hunks.reduce((a, h) => a + h.removed.length, 0);
+  return `已写入文件: ${relPath} (共应用 ${editList.length} 处修改 · +${added} / -${removed} 行，当前版本 v${version})`;
 }
 
 /**
@@ -199,13 +208,14 @@ export function createWriteTools(
   workspaceRoot: string = process.cwd(),
   snapshots: FileVersionSnapshot[] = [],
   signal?: AbortSignal,
+  onSnapshotChange?: () => void,
 ): ToolContract<any>[] {
   const editFileTool: ToolContract<z.infer<typeof EditFileArgsSchema>> = {
     name: "edit_file",
     description: "修改或新建工作区内的文件（oldText 为空表示新建/覆盖文件，非空则唯一替换 oldText 为 newText）",
     parameters: EditFileArgsSchema,
     readonly: false,
-    execute: (args) => applyFileEdit(workspaceRoot, snapshots, args),
+    execute: (args) => applyFileEdit(workspaceRoot, snapshots, EditFileArgsSchema.parse(args), onSnapshotChange),
   };
 
   const rollbackVersionTool: ToolContract<z.infer<typeof RollbackVersionArgsSchema>> = {
@@ -215,7 +225,7 @@ export function createWriteTools(
     readonly: false,
     async execute(args) {
       if (snapshots.length === 0) return "当前没有任何可回滚的文件修改记录";
-      const res = await rollbackFileSnapshots(workspaceRoot, snapshots, args.stepsBack);
+      const res = await rollbackFileSnapshots(workspaceRoot, snapshots, args.stepsBack, onSnapshotChange);
       return `已成功回退 ${res.rolledBackCount} 个版本（当前回到 v${res.currentVersion} 状态），还原文件: ${res.touchedPaths.join(", ")}`;
     },
   };

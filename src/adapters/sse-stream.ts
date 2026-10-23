@@ -187,7 +187,7 @@ export function createStreamRenderer(stream: { write: (s: string) => unknown; co
     onReasoning(chunk: string) {
       clearToolProgress();
       if (!inReasoning) { stream.write("\n💭 \x1b[2m\x1b[3m"); inReasoning = true; }
-      stream.write(chunk.replace(/\r?\n/g, "\n   "));
+      stream.write(chunk.replace(/(?:\r?\n)+/g, "\n   "));
     },
     onToolCall(name?: string, argsDelta = "") {
       finishReasoning();

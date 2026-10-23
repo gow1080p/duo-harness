@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+import { buildBridgePrompt, evaluateAgyQuotaSurplus, parseBridgeReply, stripAgyFooter } from "../src/adapters/agy-bridge.js";
+import { summarizeWireCost } from "../src/adapters/cost-tracker.js";
 import {
   parseOpenAiAssistantMessage,
   resolveActiveModelTarget,
@@ -75,16 +77,28 @@ describe("Step 1.4: src/adapters/router.ts 协议转换与分时路由测试", (
     });
   });
 
-  it("3. Zod 参数对象自动转为 JSON Schema (识别必填与可选字段)", () => {
+  it("3. Zod 参数对象自动转为 JSON Schema (识别必填、可选字段及嵌套数组/对象)", () => {
     const schema = z.object({
       path: z.string(),
       maxLines: z.number().optional(),
+      edits: z.array(z.object({ oldText: z.string(), newText: z.string() })).optional(),
     });
     expect(zodObjectToJsonSchema(schema)).toEqual({
       type: "object",
       properties: {
         path: { type: "string" },
         maxLines: { type: "number" },
+        edits: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              oldText: { type: "string" },
+              newText: { type: "string" },
+            },
+            required: ["oldText", "newText"],
+          },
+        },
       },
       required: ["path"],
     });
@@ -148,8 +162,56 @@ describe("Step 1.4: src/adapters/router.ts 协议转换与分时路由测试", (
     // 显式指定 /model mimo：无视历史强制切换
     const forced = resolveActiveModelTarget(wireFile, true, "mimo", monPeakUtc);
     expect(forced.model).toBe("mimo-v2.6-pro");
+
+    // 显式指定 /model agy：走本机 Antigravity 订阅额度桥接
+    const agyTarget = resolveActiveModelTarget(wireFile, true, "agy", monPeakUtc);
+    expect(agyTarget.model).toBe("gemini-4-argon-agy");
+    expect(agyTarget.shortLabel).toContain("Argon");
+
     fs.rmSync(tmpDir, { recursive: true, force: true });
     if (prevDs === undefined) delete process.env.DEEPSEEK_API_KEY; else process.env.DEEPSEEK_API_KEY = prevDs;
     if (prevMimo === undefined) delete process.env.MIMO_API_KEY; else process.env.MIMO_API_KEY = prevMimo;
+  });
+
+  it("8. Antigravity 5h 临期额度感知公式、尾注字数守恒剥离与 ¥0 订阅计费档测试", () => {
+    // 周剩余 < 25% 时一律保守留存，禁止白嫖烧穿周额度
+    expect(evaluateAgyQuotaSurplus(90, 15, 20)).toBe(false);
+    // 周剩余充足 (41.6%) 且 5h 剩余 >= 50%、距刷新 <= 90 分钟时，优先白嫖即将刷新的 5h 额度
+    expect(evaluateAgyQuotaSurplus(74.6, 8, 41.6)).toBe(true);
+    // 5h 剩余 60% 但距刷新还有 180 分钟 (< 75% 且非临期) 时不主动抢跑
+    expect(evaluateAgyQuotaSurplus(60, 180, 41.6)).toBe(false);
+
+    // 剥离尾注且保护正文与 --- 分隔线
+    const rawWithFooter = '这是第一段正文\n---\n这是第二段正文\n<details data-agy-footer="1"><summary>统计</summary></details>';
+    expect(stripAgyFooter(rawWithFooter)).toBe("这是第一段正文\n---\n这是第二段正文");
+    expect(stripAgyFooter('<details data-agy-footer="1">仅尾注时保留防空</details>')).toContain("data-agy-footer");
+
+    // 验证 Agy 桥接提示词注入宿主工具列表（含参数签名）并能将带嵌套数组/前置文字的返回 JSON 解析为 AssistantMessage.toolCalls
+    const bridgePrompt = buildBridgePrompt(
+      [{ role: "user", content: "看下我代码" }],
+      [{ name: "grep", description: "搜索代码", parameters: z.object({ pattern: z.string(), path: z.string().optional() }), readonly: true, execute: () => "" }],
+    );
+    expect(bridgePrompt).toContain("grep(pattern, path?)");
+    const parsedToolReply = parseBridgeReply(
+      '好的，我先修改文件：\n```json\n{"content":"我先改文件","toolCalls":[{"name":"edit_file","arguments":{"path":"a.ts","edits":[{"oldText":"a","newText":"b"}]}}]}\n```',
+      "先改文件",
+    );
+    expect(parsedToolReply.toolCalls).toHaveLength(1);
+    expect(parsedToolReply.toolCalls?.[0]?.name).toBe("edit_file");
+    expect((parsedToolReply.toolCalls?.[0]?.arguments as any)?.edits).toHaveLength(1);
+    expect(parsedToolReply.reasoningContent).toBe("先改文件");
+
+    // cost-tracker 对 gemini-4-argon-agy 计为 ¥0
+    const report = summarizeWireCost([
+      {
+        roundTimestamp: "2026-10-22T10:30:00.000Z",
+        apiUrl: "agy://local-language-server",
+        requestBody: { model: "gemini-4-argon-agy", messages: [{ role: "user", content: "hi" }] },
+        rawSseLines: ['data: {"model":"gemini-4-argon-agy","usage":{"prompt_tokens":3000,"completion_tokens":500,"prompt_cache_hit_tokens":0,"prompt_cache_miss_tokens":3000}}'],
+        assembledMessage: { role: "assistant", content: "ok" },
+      },
+    ]);
+    expect(report.totalCostCny).toBe(0);
+    expect(report.periodLabel).toContain("Antigravity");
   });
 });

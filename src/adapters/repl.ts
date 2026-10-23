@@ -14,6 +14,7 @@ import {
   SLASH_COMMANDS,
 } from "./project-store.js";
 import { resolveRouteTier } from "./router.js";
+import { probeAgyQuota } from "./agy-bridge.js";
 import { createSessionController, type SessionController } from "./session-controller.js";
 import { formatApprovalBox } from "./ui-logger.js";
 
@@ -47,15 +48,16 @@ async function handleSlashCommand(rawCmd: string, ctrl: SessionController): Prom
   }
   if (cmd === "/model" || cmd.startsWith("/model ")) {
     const arg = cmd.slice("/model".length).trim().toLowerCase();
-    if (arg === "auto" || arg === "deepseek" || arg === "mimo" || arg === "openai") {
+    if (arg === "auto" || arg === "deepseek" || arg === "mimo" || arg === "agy" || arg === "openai") {
       const st = ctrl.setModelMode(arg);
       console.log(`🤖 已切换模型策略为 [${arg}] (当前生效: ${st.activeModel})`);
-    } else console.log(`💡 用法: /model auto | /model deepseek | /model mimo (当前: ${ctrl.getStatus().modelMode})`);
+    } else console.log(`💡 用法: /model auto | /model deepseek | /model mimo | /model agy (当前: ${ctrl.getStatus().modelMode})`);
     return true;
   }
   if (cmd === "/xray" || cmd === "/tree") {
-    const { costText, xrayText } = ctrl.getXrayReport();
+    const [{ costText, xrayText }, agyQuota] = await Promise.all([Promise.resolve(ctrl.getXrayReport()), probeAgyQuota()]);
     if (costText) console.log(costText);
+    console.log(`🪐 [反重力订阅额度雷达]: ${agyQuota.summaryLabel}`);
     console.log(xrayText);
     return true;
   }
@@ -74,8 +76,8 @@ async function handleSlashCommand(rawCmd: string, ctrl: SessionController): Prom
     return true;
   }
   if (cmd === "/undo" || cmd.startsWith("/undo ")) {
-    const rb = await ctrl.undo(cmd.slice("/undo".length).trim() || "1");
-    console.log(rb.rolledBackCount > 0 ? `🔄 已撤回 ${rb.rolledBackCount} 步修改 (剩余可撤回 ${rb.remainingVersions} 步): ${rb.touchedPaths.join(", ")}` : "ℹ️ 当前没有可撤回的修改。");
+    const rb = await ctrl.undo(cmd.slice("/undo".length).trim() || "turn");
+    console.log(rb.rolledBackCount > 0 ? `🔄 已撤回 ${rb.rolledBackCount} 处修改 (剩余可撤回 ${rb.remainingVersions} 步): ${rb.touchedPaths.join(", ")}` : "ℹ️ 当前没有可撤回的修改。");
     return true;
   }
   if (cmd === "/projects" || cmd === "/cd") {
@@ -108,24 +110,31 @@ export async function startInteractiveRepl(options: { workspaceRoot?: string; ho
   console.log(`💡 输入 / 用 ↑/↓ 方向键选择命令或切换历史 (/resume 选轮次 | /new 新对话 | /model 切模型 | /diff 看修改 | /undo 撤回)`);
   const recap = formatRecentHistoryRecap(ctrl.loadEntries(), 1, ctrl.getLeafId());
   if (recap) console.log(recap);
+  const diff0 = ctrl.getDiff();
+  if (diff0.totalSnapshots > 0) console.log(`📋 [检测到未撤回修改] 当前工作区有 ${diff0.files.length} 个已修改文件 (${diff0.totalSnapshots} 步快照 · 输入 /diff 查看 | /undo 撤回)`);
 
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-    completer: createReplCompleter(() => ctrl.getPaths().workspaceRoot, () => ctrl.getPaths().sessionFile),
-  });
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout, completer: createReplCompleter(() => ctrl.getPaths().workspaceRoot, () => ctrl.getPaths().sessionFile) });
   const detachDropdown = attachLiveSlashDropdown(rl, () => inMainPrompt, () => getPromptVisualCols(formatPrompt(ctrl)), () => ctrl.getPaths().workspaceRoot, options.homeBaseDir, () => ctrl.getLeafId());
 
+  let turnAbort: AbortController | null = null;
+  const onTerminateSignal = () => turnAbort?.abort();
+  process.on("SIGHUP", onTerminateSignal);
+  process.on("SIGTERM", onTerminateSignal);
   const askApproval = async (toolCalls: ToolCall[]) => {
     if (autoApprove) return { approved: true };
     inMainPrompt = false;
     console.log(formatApprovalBox(toolCalls, ctrl.getPaths().workspaceRoot));
     try {
-      const ans = (await rl.question(`└─ 是否允许执行？[直接回车/y=允许本次 | a=本轮全自动放行 | n=拒绝] > `)).trim().toLowerCase();
+      const promptStr = `└─ 是否允许执行？[直接回车/y=允许本次 | a=本轮全自动放行 | n=拒绝] > `;
+      const ans = (await rl.question(promptStr, turnAbort ? { signal: turnAbort.signal } : {})).trim().toLowerCase();
       if (ans === "a") autoApprove = true;
-      return ans === "" || ans === "y" || ans === "yes" || ans === "a" ? { approved: true } : { approved: false, reason: "用户在终端拒绝了该操作" };
+      return ans === "" || ans === "y" || ans === "yes" || ans === "a"
+        ? { approved: true }
+        : { approved: false, reason: "用户在终端拒绝了该操作（请立即停止尝试其他替代命令或启动服务，直接向用户汇报并等待指示）" };
     } catch {
-      return { approved: false, reason: "用户按 Ctrl+C 取消了该操作" };
+      process.stdout.write("\n");
+      turnAbort?.abort();
+      return { approved: false, reason: "用户按 Ctrl+C 中断了本轮操作" };
     }
   };
 
@@ -150,13 +159,21 @@ export async function startInteractiveRepl(options: { workspaceRoot?: string; ho
         break;
       }
       if (await handleSlashCommand(line, ctrl)) continue;
+      turnAbort = new AbortController();
+      const onSigint = () => turnAbort?.abort();
+      rl.on("SIGINT", onSigint);
       try {
-        await ctrl.ask(line, { suppressFinalEcho: true, onApprovalRequest: askApproval });
+        await ctrl.ask(line, { suppressFinalEcho: true, onApprovalRequest: askApproval, signal: turnAbort.signal });
       } catch (err) {
         console.error(`\n❌ 本轮运行异常: ${err instanceof Error ? err.message : String(err)}`);
+      } finally {
+        rl.off("SIGINT", onSigint);
+        turnAbort = null;
       }
     }
   } finally {
+    process.off("SIGHUP", onTerminateSignal);
+    process.off("SIGTERM", onTerminateSignal);
     detachDropdown();
     rl.close();
   }

@@ -12,6 +12,7 @@ import {
   type ToolCall,
   type ToolContract,
 } from "../core/contracts.js";
+import { createAgyBridgeProvider } from "./agy-bridge.js";
 import { createStreamRenderer, readOpenAiSseStream, recordHttpWireLog } from "./sse-stream.js";
 
 export type RouteTier = "tier0_replay" | "tier1_mimo_peak" | "tier2_deepseek_offpeak" | "tier3_gemini_cli";
@@ -59,27 +60,28 @@ export function resolveRouteTier(utcTimestampMs: number, options: RouteOptions =
   };
 }
 
-export function zodObjectToJsonSchema(schema: z.ZodTypeAny): Record<string, unknown> {
-  if (!(schema instanceof z.ZodObject)) {
-    return { type: "object", properties: {} };
+function zodTypeToJsonSchema(fieldSchema: z.ZodTypeAny): { schema: Record<string, unknown>; isOptional: boolean } {
+  let current: z.ZodTypeAny = fieldSchema;
+  let isOptional = false;
+  while (current instanceof z.ZodOptional || current instanceof z.ZodDefault || current instanceof z.ZodEffects) {
+    if (current instanceof z.ZodOptional || current instanceof z.ZodDefault) isOptional = true;
+    current = current instanceof z.ZodEffects ? current._def.schema : current._def.innerType;
   }
-  const shape = schema.shape as Record<string, z.ZodTypeAny>;
-  const properties: Record<string, unknown> = {};
-  const required: string[] = [];
+  if (current instanceof z.ZodArray) return { schema: { type: "array", items: zodTypeToJsonSchema(current._def.type).schema }, isOptional };
+  if (current instanceof z.ZodObject) return { schema: zodObjectToJsonSchema(current), isOptional };
+  const typeName = current instanceof z.ZodNumber ? "number" : current instanceof z.ZodBoolean ? "boolean" : "string";
+  return { schema: { type: typeName }, isOptional };
+}
 
+export function zodObjectToJsonSchema(schema: z.ZodTypeAny): Record<string, unknown> {
+  if (!(schema instanceof z.ZodObject)) return { type: "object", properties: {} };
+  const shape = schema.shape as Record<string, z.ZodTypeAny>;
+  const properties: Record<string, unknown> = {}, required: string[] = [];
   for (const [key, fieldSchema] of Object.entries(shape)) {
-    let current: z.ZodTypeAny = fieldSchema;
-    let isOptional = false;
-    while (current instanceof z.ZodOptional || current instanceof z.ZodDefault) {
-      isOptional = true;
-      current = current._def.innerType;
-    }
-    const typeName =
-      current instanceof z.ZodNumber ? "number" : current instanceof z.ZodBoolean ? "boolean" : "string";
-    properties[key] = { type: typeName };
+    const { schema: propSchema, isOptional } = zodTypeToJsonSchema(fieldSchema);
+    properties[key] = propSchema;
     if (!isOptional) required.push(key);
   }
-
   return { type: "object", properties, ...(required.length > 0 ? { required } : {}) };
 }
 
@@ -163,9 +165,10 @@ function loadApiKey(envName: string, dotFileName: string): string {
   return readKeyFromFile(path.join(os.homedir(), ".gemini", "antigravity", dotFileName), envName, true);
 }
 
-export type ModelMode = "auto" | "deepseek" | "mimo" | "openai";
+export type ModelMode = "auto" | "deepseek" | "mimo" | "agy" | "openai";
 
 export function resolveActiveModelTarget(wireLogFile?: string, hasPriorAssistant = false, mode: ModelMode = "auto", nowUtcMs = Date.now()): { apiUrl: string; model: string; apiKey: string; shortLabel: string } {
+  if (mode === "agy") return { apiUrl: "agy://local-language-server", model: "gemini-4-argon-agy", apiKey: "local-agy", shortLabel: "Argon·反重力" };
   const openaiKey = loadApiKey("OPENAI_API_KEY", ".openai_key");
   const mimoKey = loadApiKey("MIMO_API_KEY", ".mimo_key");
   const deepseekKey = loadApiKey("DEEPSEEK_API_KEY", ".deepseek_key");
@@ -173,8 +176,7 @@ export function resolveActiveModelTarget(wireLogFile?: string, hasPriorAssistant
   if (mode === "auto" && hasPriorAssistant && wireLogFile && fs.existsSync(wireLogFile)) {
     try {
       const arr = JSON.parse(fs.readFileSync(wireLogFile, "utf-8"));
-      const last = arr[arr.length - 1];
-      const lastModel = String(last?.requestBody?.model ?? last?.model ?? "");
+      const lastModel = String(arr[arr.length - 1]?.requestBody?.model ?? arr[arr.length - 1]?.model ?? "");
       if (lastModel.startsWith("deepseek") && deepseekKey) stickyProvider = "deepseek";
       else if (lastModel.startsWith("mimo") && mimoKey) stickyProvider = "mimo";
     } catch {}
@@ -193,21 +195,19 @@ export function resolveActiveModelTarget(wireLogFile?: string, hasPriorAssistant
   return { apiUrl, model, apiKey, shortLabel };
 }
 
-/** 5. 创建真实 HTTP 大模型调用器（原生支持 OpenAI / Codex、DeepSeek 与小米 MiMo 2.6 + 同会话缓存粘性） */
-export function createRouterProvider(
-  wireLogFile = ".sessions/http-wire.json",
-  appendExistingWire = false,
-  getModelMode?: () => ModelMode,
-): LlmProvider {
+export function createRouterProvider(wireLogFile = ".sessions/http-wire.json", appendExistingWire = false, getModelMode?: () => ModelMode): LlmProvider {
   let roundCount = 0;
+  let agyDelegate: LlmProvider | null = null;
   return {
-    async chat(
-      messages: Message[],
-      tools: ToolContract<any>[] = [],
-      options: { signal?: AbortSignal; onStreamEvent?: (event: LlmStreamEvent) => void } = {},
-    ): Promise<AssistantMessage> {
+    async chat(messages: Message[], tools: ToolContract<any>[] = [], options: { signal?: AbortSignal; onStreamEvent?: (event: LlmStreamEvent) => void } = {}): Promise<AssistantMessage> {
+      const mode = getModelMode?.() ?? "auto";
+      if (mode === "agy") {
+        agyDelegate ??= createAgyBridgeProvider(wireLogFile, appendExistingWire || roundCount > 0);
+        roundCount += 1;
+        return agyDelegate.chat(messages, tools, options);
+      }
       const hasPrior = messages.some((m) => m.role === "assistant");
-      const { apiUrl, model, apiKey } = resolveActiveModelTarget(wireLogFile, hasPrior, getModelMode?.() ?? "auto");
+      const { apiUrl, model, apiKey } = resolveActiveModelTarget(wireLogFile, hasPrior, mode);
       if (!apiKey) throw new Error("未检测到 OPENAI_API_KEY、DEEPSEEK_API_KEY 或 MIMO_API_KEY");
 
       const openAiTools = tools.map((t) => ({

@@ -9,6 +9,18 @@ import {
 } from "../core/contracts.js";
 import { assertSessionInvariant, projectToMessages } from "../core/session-tree.js";
 
+export function writeFileAtomicSync(filePath: string, content: string): void {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const tmpFile = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    fs.writeFileSync(tmpFile, content, "utf-8");
+    fs.renameSync(tmpFile, filePath);
+  } catch (err) {
+    try { if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile); } catch {}
+    throw err;
+  }
+}
+
 /**
  * 1. 把会话节点按行追加写入硬盘上的 .jsonl 文件
  */
@@ -18,11 +30,11 @@ export function appendJsonlEntries(
   overwrite = false,
 ): void {
   if (entries.length === 0) return;
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
   const lines = entries.map((e) => JSON.stringify(SessionEntrySchema.parse(e))).join("\n") + "\n";
   if (overwrite) {
-    fs.writeFileSync(filePath, lines, "utf-8");
+    writeFileAtomicSync(filePath, lines);
   } else {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
     fs.appendFileSync(filePath, lines, "utf-8");
   }
 }

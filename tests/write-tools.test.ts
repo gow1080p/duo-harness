@@ -65,7 +65,14 @@ describe("Stage 3: 写工具 (edit_file/run_bash/rollback_version)、暂停审�
     expect(fs.existsSync(path.join(tmpRoot, "logger.ts"))).toBe(false); // v3 新建的文件被自动清理
     expect(fs.readFileSync(path.join(tmpRoot, "math.ts"), "utf-8")).toContain("export const a = 1;"); // v2 修改被还原回 v1
 
-    // 5) run_bash 正常执行命令
+    // 5) 兼容模型将 edits 传为 JSON 字符串的场景，不报 invalid_type 错误
+    await editTool!.execute({
+      path: "math.ts",
+      edits: JSON.stringify([{ oldText: "export const b = 1;", newText: "export const b = 99;" }]) as any,
+    });
+    expect(fs.readFileSync(path.join(tmpRoot, "math.ts"), "utf-8")).toContain("export const b = 99;");
+
+    // 6) run_bash 正常执行命令
     const out = await bashTool!.execute({ command: "echo hello-stage3" });
     expect(out).toBe("hello-stage3");
 
@@ -246,7 +253,23 @@ describe("Stage 3: 写工具 (edit_file/run_bash/rollback_version)、暂停审�
     // 严防绕过测试
     expect(isReadonlyBashCommand("sed -i 's/a/b/g' app.ts")).toBe(false);
     expect(isReadonlyBashCommand("sed -Ei 's/a/b/g' app.ts")).toBe(false);
+    expect(isReadonlyBashCommand("env sed -i 's/a/b/g' app.ts")).toBe(false);
+    expect(isReadonlyBashCommand("LC_ALL=C sort -o out.txt a.txt")).toBe(false);
     expect(isReadonlyBashCommand("sed 's/a/b/w out.txt' app.ts")).toBe(false);
+    expect(isReadonlyBashCommand("sed 's#a#b#w out.txt' app.ts")).toBe(false);
+    expect(isReadonlyBashCommand("sed 's/a/b/pw out.txt' app.ts")).toBe(false);
+    expect(isReadonlyBashCommand("sed 's/a/b/;w out.txt' app.ts")).toBe(false);
+    expect(isReadonlyBashCommand("sed 'w out.txt' app.ts")).toBe(false);
+    expect(isReadonlyBashCommand("sed -n '1,5w out.txt' app.ts")).toBe(false);
+    expect(isReadonlyBashCommand("sed '1e rm -rf dist' app.ts")).toBe(false);
+    expect(isReadonlyBashCommand("sed w out.txt app.ts")).toBe(false);
+    expect(isReadonlyBashCommand("sed 's/=.*/=***/' .env && [ -d app/w ]")).toBe(true);
+    expect(
+      isReadonlyBashCommand(
+        'sed \'s/=.*/=***已设置***/\' .env && echo && echo \'=== 端口占用 ===\' && for p in 8000 10086; do echo -n "端口 $p: "; lsof -ti:$p >/dev/null && echo "占用" || echo "空闲"; done',
+      ),
+    ).toBe(true);
+    expect(isReadonlyBashCommand("for p in 8000 10086; do kill $p; done")).toBe(false);
     expect(isReadonlyBashCommand("sed 's/a/b/e' app.ts")).toBe(false);
     expect(isReadonlyBashCommand("find . -name '*.tmp' -delete")).toBe(false);
     expect(isReadonlyBashCommand("sort a.txt -o b.txt")).toBe(false);
@@ -259,42 +282,180 @@ describe("Stage 3: 写工具 (edit_file/run_bash/rollback_version)、暂停审�
     expect(isReadonlyBashCommand("ls > out.txt")).toBe(false);
     expect(isReadonlyBashCommand("rm -rf dist")).toBe(false);
     expect(isReadonlyBashCommand("git status", false)).toBe(false);
+    expect(isReadonlyBashCommand('cd "/Volumes/T7 Shield/code/kids-essay-copilot" && venv/bin/pip install -q "httpx[socks]"')).toBe(false);
+    expect(isReadonlyBashCommand("venv/bin/python -c 'import socksio'")).toBe(false);
+    expect(isReadonlyBashCommand("env/bin/pip install requests")).toBe(false);
+    expect(isReadonlyBashCommand("uvicorn main:app --port 8000")).toBe(false);
+    expect(isReadonlyBashCommand("nohup python3 -m http.server 8000 &")).toBe(false);
+    expect(isReadonlyBashCommand("cd /tmp")).toBe(false);
+    expect(isReadonlyBashCommand("echo $'\\''; rm -rf dist; echo $'\\''")).toBe(false);
+    expect(isReadonlyBashCommand('find . "-delete"')).toBe(false);
+    expect(isReadonlyBashCommand("sort -oout.txt a.txt")).toBe(false);
+    expect(isReadonlyBashCommand('sort "-o" out.txt a.txt')).toBe(false);
+    expect(isReadonlyBashCommand("xxd a.txt b.txt")).toBe(false);
+    expect(isReadonlyBashCommand("uniq a.txt b.txt")).toBe(false);
+    expect(isReadonlyBashCommand("rg --pre sh pattern")).toBe(false);
+    expect(isReadonlyBashCommand("sort --compress-program=sh a.txt")).toBe(false);
+    expect(isReadonlyBashCommand("file -C -m magic")).toBe(false);
+    expect(isReadonlyBashCommand('GIT_EXTERNAL_DIFF="sh -c id" git diff')).toBe(false);
+    expect(isReadonlyBashCommand("git reflog delete HEAD@{0}")).toBe(false);
+    expect(isReadonlyBashCommand('for f in app.ts; do sed -i "s/a/b/g" $f; done')).toBe(false);
+    expect(isReadonlyBashCommand("for f in a.txt; do sort -o b.txt $f; done")).toBe(false);
+    expect(isReadonlyBashCommand("curl -o /tmp/evil.sh http://127.0.0.1:8000/docs")).toBe(false);
+    expect(isReadonlyBashCommand('curl -4o "/tmp/evil.sh" http://127.0.0.1:8000/docs')).toBe(false);
+    expect(isReadonlyBashCommand("curl -X POST http://127.0.0.1:8000/api")).toBe(false);
+    expect(isReadonlyBashCommand("curl --json '{\"a\":1}' http://127.0.0.1:8000/api")).toBe(false);
+    expect(isReadonlyBashCommand("curl http://example.com/api")).toBe(false);
+    expect(isReadonlyBashCommand('echo "http://127.0.0.1" && curl "example.com/shell.sh"')).toBe(false);
+    expect(isReadonlyBashCommand('curl "http://localhost.evil.com/?ref=http://localhost"')).toBe(false);
+    expect(isReadonlyBashCommand("curl -s -m 5 http://127.0.0.1:8000/health")).toBe(true);
+    expect(
+      isReadonlyBashCommand(
+        'sleep 2 && tail -15 /tmp/kids-essay-backend.log && pgrep -fl "uvicorn main:app" || echo "uvicorn 进程不存在" && curl -s -o /dev/null -w "backend http_code=%{http_code}" http://127.0.0.1:8000/docs',
+      ),
+    ).toBe(true);
+    expect(isReadonlyBashCommand("lsof -i :8000 >/dev/null 2>&1 && git --no-pager log -n 1 && go version")).toBe(true);
+    expect(isReadonlyBashCommand('if [ -d web-ui/node_modules ]; then echo "exists"; else echo "missing"; fi')).toBe(true);
+    expect(isReadonlyBashCommand('for p in 8000 10086; do echo -n "端口 $p: "; lsof -i :$p -t 2>/dev/null || echo "无进程"; done')).toBe(true);
+    expect(
+      isReadonlyBashCommand(
+        "echo '=== .env 变量名(隐藏值) ===' && sed 's/=.*/=***/' .env && echo && echo '=== node/pnpm ===' && node -v 2>&1; pnpm -v 2>&1; npm -v 2>&1; echo '=== node_modules 是否存在 ===' && [ -d web-ui/node_modules ] && echo '存在' || echo '不存在'",
+      ),
+    ).toBe(true);
 
-    // 验证 macOS Seatbelt 只读沙箱物理阻断文件写入，而正常只读查询通过
+    // 验证 macOS Seatbelt 只读沙箱物理阻断文件写入并附带沙箱提示，而正常只读查询（含 /bin/ps）通过
     const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "duo-seatbelt-"));
     fs.writeFileSync(path.join(tmpRoot, "a.py"), "print(1)\nprint(2)\n", "utf-8");
     fs.mkdirSync(path.join(tmpRoot, "venv"));
-    const roOk = await runCommandInSandbox("wc -l a.py 2>/dev/null", tmpRoot, 5_000, undefined, true);
+    const roOk = await runCommandInSandbox("wc -l a.py 2>/dev/null && ps -p $$ >/dev/null", tmpRoot, 5_000, undefined, true);
     expect(roOk.exitCode).toBe(0);
+    const abortedRes = await runCommandInSandbox("echo should-not-run", tmpRoot, 5_000, AbortSignal.abort(), true);
+    expect(abortedRes.exitCode).toBe(130);
     if (process.platform === "darwin" && fs.existsSync("/usr/bin/sandbox-exec")) {
       const roBlocked = await runCommandInSandbox("touch hacked.txt", tmpRoot, 5_000, undefined, true);
       expect(roBlocked.exitCode).not.toBe(0);
+      expect(roBlocked.output).toContain("沙箱提示");
       expect(fs.existsSync(path.join(tmpRoot, "hacked.txt"))).toBe(false);
     }
+
+    // 验证启动后台常驻进程（即使子进程继承了 stdout/stderr 管道未关闭）在主 Shell exit 后 150ms 内返回，不挂死满超时且进程存活
+    const t0 = Date.now();
+    const bgRes = await runCommandInSandbox(
+      'node -e "setInterval(() => {}, 1000)" & bg_pid=$!; echo "BG_PID=$bg_pid"',
+      tmpRoot,
+      5_000,
+      undefined,
+      false,
+    );
+    const elapsed = Date.now() - t0;
+    expect(bgRes.exitCode).toBe(0);
+    expect(elapsed).toBeLessThan(1_500);
+    const pidMatch = bgRes.output.match(/BG_PID=(\d+)/);
+    const bgPid = pidMatch ? Number(pidMatch[1]) : 0;
+    expect(bgPid).toBeGreaterThan(0);
+    try {
+      process.kill(bgPid, 0); // 验证后台进程未被超时误杀，依然存活
+    } finally {
+      if (bgPid) {
+        try {
+          process.kill(bgPid, "SIGKILL");
+        } catch {}
+      }
+    }
+    fs.mkdirSync(path.join(tmpRoot, "web-ui", "node_modules"), { recursive: true });
     const [ , listDirTool] = createBuiltinTools(tmpRoot);
     const dirTree = await listDirTool!.execute({ path: "." });
     expect(dirTree).toContain("a.py (3 lines)");
-    expect(dirTree).toContain("[已过滤忽略目录: venv/]");
+    expect(dirTree).toContain("[已过滤忽略目录: venv/, web-ui/node_modules/]");
     fs.rmSync(tmpRoot, { recursive: true, force: true });
 
     // 验证 System Prompt 注入工作区路径且审批框严格区分修改文件与运行命令（含 -/+ 代码对比预览）
     expect(buildDefaultSystemPrompt("/tmp/my-ai-kb")).toContain("/tmp/my-ai-kb");
     const editBox = formatApprovalBox([
-      { id: "1", name: "edit_file", arguments: { path: "a.ts", oldText: "a\nb", newText: "a\nb\nc" } },
+      { id: "1", name: "edit_file", arguments: { path: "a.ts", oldText: "a\nb_old", newText: "a\nb_new\nc" } },
     ]);
     expect(editBox).toContain("申请修改文件");
-    expect(editBox).toContain("-2 行 / +3 行");
-    expect(editBox).toContain("- a");
-    expect(editBox).toContain("+ a");
-    const bashBox = formatApprovalBox([{ id: "2", name: "run_bash", arguments: { command: "pytest" } }]);
+    expect(editBox).toContain("-1 行 / +2 行");
+    expect(editBox).not.toContain("- a");
+    expect(editBox).toContain("- b_old");
+    expect(editBox).toContain("+ b_new");
+    expect(editBox).toContain("+ c");
+    const bashBox = formatApprovalBox([
+      {
+        id: "2",
+        name: "run_bash",
+        arguments: {
+          command:
+            "echo '=== .env ===' && sed -i 's/a/b/g' .env && echo && echo '=== 端口 ===' && for p in 8000 10086; do echo -n \"端口 $p: \"; kill $p; done",
+        },
+      },
+    ]);
     expect(bashBox).toContain("申请执行终端命令");
+    expect(bashBox).not.toContain("$ & ");
+    expect(bashBox).not.toContain("echo '=== .env ==='");
+    expect(bashBox).toContain("$ sed -i 's/a/b/g' .env");
     const stepTree = formatStepToolCalls(
       1,
-      [{ id: "3", name: "read_file", arguments: { path: "README.md", startLine: 1, endLine: 50 } }],
-      new Map([["read_file", true]]),
+      [
+        { id: "3", name: "read_file", arguments: { path: "README.md", startLine: 1, endLine: 50 } },
+        {
+          id: "4",
+          name: "run_bash",
+          arguments: {
+            command:
+              "cd \"web-ui\" && cat package.json && echo \"---\" && echo '--- node_modules 是否存在 ---' && [ -d node_modules ]",
+          },
+        },
+      ],
+      new Map([["read_file", true], ["run_bash", false]]),
     );
     expect(stepTree).toContain("正在探索与读取项目");
     expect(stepTree).toContain("README.md (第 1~50 行)");
+    expect(stepTree).toContain("cd \"web-ui\" · cat package.json · [ -d node_modules ]");
+    expect(stepTree).not.toContain("· &");
+    expect(stepTree).not.toContain("node_modules 是否存在");
+    const mixedWriteTree = formatStepToolCalls(
+      3,
+      [
+        {
+          id: "5",
+          name: "run_bash",
+          arguments: {
+            command:
+              "ls web-ui/node_modules >/dev/null 2>&1 && echo \"node_modules: OK\" || echo \"node_modules: MISSING\"; venv/bin/python -c \"import fastapi\"",
+          },
+        },
+      ],
+      new Map([["run_bash", false]]),
+    );
+    expect(mixedWriteTree).toContain("💻 运行终端命令: venv/bin/python -c \"import fastapi\"");
+
+    // 验证用户在审批框按 Ctrl+C (signal.abort) 时立即终止本轮循环，绝不继续发起后续 LLM 请求，且闭合 tool_calls
+    let llmCallCount = 0;
+    const turnAbort = new AbortController();
+    const ctrlCRes = await runAgentSession("请帮我启动服务", {
+      workspaceRoot: process.cwd(),
+      enableWriteTools: true,
+      suppressFinalEcho: true,
+      signal: turnAbort.signal,
+      provider: {
+        async chat() {
+          llmCallCount++;
+          return {
+            role: "assistant",
+            content: "准备执行命令",
+            toolCalls: [{ id: "tc_ctrlc", name: "run_bash", arguments: { command: "uvicorn main:app" } }],
+          };
+        },
+      },
+      async onApprovalRequest() {
+        turnAbort.abort();
+        return { approved: false, reason: "用户按 Ctrl+C 中断了本轮操作" };
+      },
+    });
+    expect(llmCallCount).toBe(1);
+    expect(ctrlCRes.finalAnswer).toContain("[ABORT] 用户按 Ctrl+C 中断了本轮操作");
+    expect(ctrlCRes.entries[ctrlCRes.entries.length - 1]?.message.role).toBe("tool");
 
     // 验证 run_bash timeoutMs > 30000 不会触发 Zod 拒单，且 formatRecentHistoryRecap / formatSnapshotsDiff 正常展示
     const [, , bashTool] = createWriteTools(process.cwd());
@@ -307,10 +468,161 @@ describe("Stage 3: 写工具 (edit_file/run_bash/rollback_version)、暂停审�
     expect(recap).toContain("检查项目合理性");
     expect(recap).toContain("项目整体清晰");
     const diffOut = formatSnapshotsDiff(
-      [{ version: 1, path: "main.py", beforeContent: "old_line = 1\n", afterContent: "new_line = 2\n", timestamp: 1 }],
+      [
+        {
+          version: 1,
+          path: "main.py",
+          beforeContent: "def foo():\n  return null\n",
+          afterContent: "def foo():\n  return null\ndef bar():\n  return null\n",
+          timestamp: 1,
+        },
+      ],
       process.cwd(),
     );
-    expect(diffOut).toContain("- old_line = 1");
-    expect(diffOut).toContain("+ new_line = 2");
+    // LCS 差异提取：即便文件中原本已有 return null，新增的重复行 return null 也不会被吞掉（且保留相对缩进）
+    expect(diffOut).toContain("+ def bar():");
+    expect(diffOut).toContain("+   return null");
+
+    // 验证 formatStepToolCalls 同文件合并 & formatApprovalBox 剥离未修改上下文行（如 Volume2, Square）并展示修改点
+    const stepCalls = [
+      {
+        id: "e1",
+        name: "edit_file",
+        arguments: {
+          path: "web-ui/src/App.tsx",
+          oldText: "  Volume2,\n  Square,\n} from 'lucide-react';",
+          newText: "  Volume2,\n  Square,\n  Sparkles,\n  PenTool,\n} from 'lucide-react';",
+        },
+      },
+      {
+        id: "e2",
+        name: "edit_file",
+        arguments: {
+          path: "web-ui/src/App.tsx",
+          oldText: "            <h1 className=\"title\">小作家助手</h1>",
+          newText: "            <h1 className=\"title\">小作家创作乐园</h1>",
+        },
+      },
+    ];
+    const stepTreeText = formatStepToolCalls(6, stepCalls, new Map([["edit_file", false]]), process.cwd());
+    expect(stepTreeText).toContain("📝 修改文件: web-ui/src/App.tsx (2 处修改)");
+    const boxText = formatApprovalBox(stepCalls, process.cwd());
+    expect(boxText).toContain("共 2 处修改");
+    expect(boxText).not.toContain("- Volume2");
+    expect(boxText).toContain("+ Sparkles,");
+    expect(boxText).toContain("@@ 修改点 #1");
+    expect(boxText).toContain("@@ 修改点 #2");
+
+    // 验证只读 tsc --noEmit 自动放行，而会写 .tsbuildinfo 的 tsc -b 必须走写审批；cleanDisplayBash 自动过滤末尾 echo exit
+    const { cleanDisplayBash, formatToolResultLine } = await import("../src/adapters/ui-logger.js");
+    expect(isReadonlyBashCommand('cd web-ui && npx tsc --noEmit 2>&1 | tail -5; echo "tsc exit: $?"', true)).toBe(true);
+    expect(isReadonlyBashCommand('cd web-ui && npx tsc -b 2>&1 | tail -5; echo "tsc exit: $?"', true)).toBe(false);
+    expect(cleanDisplayBash('cd web-ui && npx tsc -b 2>&1 | tail -5; echo "tsc exit: $?"')).toEqual([
+      "cd web-ui",
+      "npx tsc -b | tail -5",
+    ]);
+    expect(
+      formatToolResultLine({
+        role: "tool",
+        toolCallId: "t1",
+        name: "edit_file",
+        content: "已写入文件: web-ui/src/App.tsx (共应用 5 处修改 · +53 / -18 行，当前版本 v2)",
+        isError: false,
+      }),
+    ).toContain("↳ ✏️  已写入文件: web-ui/src/App.tsx (共应用 5 处修改 · +53 / -18 行，当前版本 v2)");
+
+    // 验证 SessionController.ask 结束后 snapshots.json 不会被 buildStatusSummary 覆盖清空，/diff 与 /undo 正常工作
+    const { createSessionController } = await import("../src/adapters/session-controller.js");
+    const tmpWs = fs.mkdtempSync(path.join(os.tmpdir(), "duo-ctrl-ws-"));
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "duo-ctrl-home-"));
+    fs.writeFileSync(path.join(tmpWs, "index.html"), "<title>旧标题</title>\n", "utf-8");
+    const ctrl = createSessionController({
+      workspaceRoot: tmpWs,
+      homeBaseDir: tmpHome,
+      provider: {
+        async chat(msgs) {
+          if (msgs[msgs.length - 1]?.role === "tool") return { role: "assistant", content: "已完成标题修改" };
+          return {
+            role: "assistant",
+            content: "修改标题",
+            toolCalls: [
+              {
+                id: "c_html",
+                name: "edit_file",
+                arguments: { path: "index.html", edits: [{ oldText: "<title>旧标题</title>", newText: "<title>新标题</title>" }] },
+              },
+            ],
+          };
+        },
+      },
+    });
+    const askRes = await ctrl.ask("改标题", { suppressFinalEcho: true, onApprovalRequest: () => ({ approved: true }) });
+    expect(askRes.modifiedFiles).toHaveLength(1);
+    expect(askRes.modifiedFiles[0]?.addedLines).toBe(1);
+    expect(askRes.modifiedFiles[0]?.removedLines).toBe(1);
+    const diffAfterAsk = ctrl.getDiff();
+    expect(diffAfterAsk.totalSnapshots).toBe(1);
+    expect(diffAfterAsk.formattedText).toContain("index.html");
+    expect(diffAfterAsk.formattedText).toContain("+ <title>新标题</title>");
+    const undoInvalid = await ctrl.undo("invalid_arg");
+    expect(undoInvalid.rolledBackCount).toBe(0);
+    const undoOk = await ctrl.undo("turn");
+    expect(undoOk.rolledBackCount).toBe(1);
+    expect(fs.readFileSync(path.join(tmpWs, "index.html"), "utf-8")).toContain("<title>旧标题</title>");
+
+    // 验证半途断电/进程强退时：第 1 步刚改完文件（第 2 步还没开始）磁盘 snapshots.json 已实时原子落盘，重启新 Controller 后可立即 /diff 与 /undo
+    let snapshotsFlushedMidTurn = 0;
+    const crashCtrl = createSessionController({
+      workspaceRoot: tmpWs,
+      homeBaseDir: tmpHome,
+      provider: {
+        async chat(msgs) {
+          if (msgs[msgs.length - 1]?.role === "tool") {
+            const rawSnap = JSON.parse(fs.readFileSync(ctrl.getPaths().snapshotsFile, "utf-8"));
+            snapshotsFlushedMidTurn = Array.isArray(rawSnap) ? rawSnap.length : 0;
+            throw new Error("模拟半途进程断电/网络致命异常");
+          }
+          return {
+            role: "assistant",
+            content: "先改一步",
+            toolCalls: [
+              {
+                id: "c_crash_1",
+                name: "edit_file",
+                arguments: { path: "index.html", oldText: "<title>旧标题</title>", newText: "<title>半途修改标题</title>" },
+              },
+            ],
+          };
+        },
+      },
+    });
+    await expect(crashCtrl.ask("半途崩溃测试", { suppressFinalEcho: true, onApprovalRequest: () => ({ approved: true }) })).rejects.toThrow("模拟半途进程断电");
+    expect(snapshotsFlushedMidTurn).toBe(1);
+    const restartedCtrl = createSessionController({ workspaceRoot: tmpWs, homeBaseDir: tmpHome });
+    expect(restartedCtrl.getDiff().totalSnapshots).toBe(1);
+    const resumed = restartedCtrl.resumeTurn("#1");
+    expect(resumed.ok).toBe(true);
+    expect(resumed.recapText).toContain("未撤回的文件修改");
+    // 验证模型在下一轮通过内置工具 rollback_version 回退上一轮快照时，磁盘 snapshots.json 同步清空且不复活
+    const toolRollbackCtrl = createSessionController({
+      workspaceRoot: tmpWs,
+      homeBaseDir: tmpHome,
+      provider: {
+        async chat(msgs) {
+          if (msgs[msgs.length - 1]?.role === "tool") return { role: "assistant", content: "已通过工具回退" };
+          return {
+            role: "assistant",
+            content: "调用回退工具",
+            toolCalls: [{ id: "c_rb_tool", name: "rollback_version", arguments: { stepsBack: 1 } }],
+          };
+        },
+      },
+    });
+    await toolRollbackCtrl.ask("把刚才改的回退掉", { suppressFinalEcho: true, onApprovalRequest: () => ({ approved: true }) });
+    expect(toolRollbackCtrl.getDiff().totalSnapshots).toBe(0);
+    expect(fs.readFileSync(path.join(tmpWs, "index.html"), "utf-8")).toContain("<title>旧标题</title>");
+
+    fs.rmSync(tmpWs, { recursive: true, force: true });
+    fs.rmSync(tmpHome, { recursive: true, force: true });
   });
 });
