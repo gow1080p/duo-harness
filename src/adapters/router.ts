@@ -3,17 +3,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
-import {
-  AssistantMessageSchema,
-  type AssistantMessage,
-  type LlmProvider,
-  type LlmStreamEvent,
-  type Message,
-  type ToolCall,
-  type ToolContract,
-} from "../core/contracts.js";
+import type { AssistantMessage, LlmProvider, LlmStreamEvent, Message, ToolContract } from "../core/contracts.js";
 import { createAgyBridgeProvider } from "./agy-bridge.js";
-import { createStreamRenderer, readOpenAiSseStream, recordHttpWireLog } from "./sse-stream.js";
+import { createStreamRenderer, parseOpenAiAssistantMessage, readOpenAiSseStream, recordHttpWireLog } from "./sse-stream.js";
+
+export { parseOpenAiAssistantMessage };
 
 export type RouteTier = "tier0_replay" | "tier1_mimo_peak" | "tier2_deepseek_offpeak" | "tier3_gemini_cli";
 
@@ -34,30 +28,11 @@ export function resolveRouteTier(utcTimestampMs: number, options: RouteOptions =
   const day = beijingDate.getUTCDay();
   const beijingHour = beijingDate.getUTCHours();
   const isWorkday = day >= 1 && day <= 5;
-
-  if (options.isReplay) {
-    return { tier: "tier0_replay", beijingHour, isWorkday, reason: "离线录像回放模式 (¥0)" };
-  }
-  if (options.forceGeminiCli) {
-    return { tier: "tier3_gemini_cli", beijingHour, isWorkday, reason: "显式指定 Gemini CLI 桥接" };
-  }
-
-  const isPeakHour = (beijingHour >= 9 && beijingHour < 12) || (beijingHour >= 14 && beijingHour < 18);
-  if (isWorkday && isPeakHour) {
-    return {
-      tier: "tier1_mimo_peak",
-      beijingHour,
-      isWorkday,
-      reason: `工作日高峰时段 (${beijingHour}:00 · 自动路由高速主力模型)`,
-    };
-  }
-
-  return {
-    tier: "tier2_deepseek_offpeak",
-    beijingHour,
-    isWorkday,
-    reason: `低谷优惠时段 (${isWorkday ? "工作日午休/夜间" : "周末"} ${beijingHour}:00 · 自动路由 DeepSeek)`,
-  };
+  if (options.isReplay) return { tier: "tier0_replay", beijingHour, isWorkday, reason: "离线录像回放模式 (¥0)" };
+  if (options.forceGeminiCli) return { tier: "tier3_gemini_cli", beijingHour, isWorkday, reason: "显式指定 Gemini CLI 桥接兜底 (¥0)" };
+  const isPeakHour = isWorkday && ((beijingHour >= 9 && beijingHour < 12) || (beijingHour >= 14 && beijingHour < 18));
+  if (isPeakHour) return { tier: "tier1_mimo_peak", beijingHour, isWorkday, reason: `工作日高峰时段 (${beijingHour}:00 · 自动路由高速主力模型)` };
+  return { tier: "tier2_deepseek_offpeak", beijingHour, isWorkday, reason: `低谷优惠时段 (${isWorkday ? "工作日午休/夜间" : "周末"} ${beijingHour}:00 · 自动路由 DeepSeek)` };
 }
 
 function zodTypeToJsonSchema(fieldSchema: z.ZodTypeAny): { schema: Record<string, unknown>; isOptional: boolean } {
@@ -76,7 +51,8 @@ function zodTypeToJsonSchema(fieldSchema: z.ZodTypeAny): { schema: Record<string
 export function zodObjectToJsonSchema(schema: z.ZodTypeAny): Record<string, unknown> {
   if (!(schema instanceof z.ZodObject)) return { type: "object", properties: {} };
   const shape = schema.shape as Record<string, z.ZodTypeAny>;
-  const properties: Record<string, unknown> = {}, required: string[] = [];
+  const properties: Record<string, unknown> = {};
+  const required: string[] = [];
   for (const [key, fieldSchema] of Object.entries(shape)) {
     const { schema: propSchema, isOptional } = zodTypeToJsonSchema(fieldSchema);
     properties[key] = propSchema;
@@ -85,7 +61,7 @@ export function zodObjectToJsonSchema(schema: z.ZodTypeAny): Record<string, unkn
   return { type: "object", properties, ...(required.length > 0 ? { required } : {}) };
 }
 
-export function toOpenAiMessages(messages: Message[]): Record<string, unknown>[] {
+export function toOpenAiMessages(messages: Message[], workspaceRoot = process.cwd()): Record<string, unknown>[] {
   const lastUserIdx = messages.map((m) => m.role).lastIndexOf("user");
   return messages.map((msg, idx) => {
     if (msg.role === "assistant") {
@@ -109,65 +85,48 @@ export function toOpenAiMessages(messages: Message[]): Record<string, unknown>[]
     if (msg.role === "tool") {
       return { role: "tool", tool_call_id: msg.toolCallId, name: msg.name, content: msg.content };
     }
-    return { role: msg.role, content: msg.content };
-  });
-}
-
-export function parseOpenAiAssistantMessage(rawMsg: Record<string, any>): AssistantMessage {
-  const rawToolCalls = Array.isArray(rawMsg.tool_calls) ? rawMsg.tool_calls : [];
-  const toolCalls: ToolCall[] = rawToolCalls.map((tc: any, idx: number) => {
-    let parsedArgs: Record<string, unknown> = {};
-    const rawArgsStr = tc?.function?.arguments ?? "{}";
-    try {
-      const parsed = JSON.parse(rawArgsStr);
-      parsedArgs = typeof parsed === "object" && parsed !== null ? parsed : { _value: parsed };
-    } catch {
-      parsedArgs = { _invalidJson: String(rawArgsStr) };
+    if (msg.role === "user" && msg.images && msg.images.length > 0) {
+      const parts: Record<string, unknown>[] = [{ type: "text", text: msg.content }];
+      for (const img of msg.images) {
+        const abs = path.isAbsolute(img.path) ? img.path : path.resolve(workspaceRoot, img.path);
+        if (fs.existsSync(abs)) {
+          const b64 = fs.readFileSync(abs).toString("base64");
+          parts.push({ type: "image_url", image_url: { url: `data:${img.mimeType};base64,${b64}` } });
+        }
+      }
+      if (parts.length > 1) return { role: "user", content: parts };
     }
-    return {
-      id: String(tc?.id || `call_${idx}`),
-      name: String(tc?.function?.name || "unknown"),
-      arguments: parsedArgs,
-    };
-  });
-
-  return AssistantMessageSchema.parse({
-    role: "assistant",
-    content: rawMsg.content ?? "",
-    ...(toolCalls.length > 0 ? { toolCalls } : {}),
-    ...(typeof (rawMsg.reasoning_content ?? rawMsg.reasoning) === "string"
-      ? { reasoningContent: rawMsg.reasoning_content ?? rawMsg.reasoning }
-      : {}),
+    return { role: msg.role, content: msg.content };
   });
 }
 
 function readKeyFromFile(filePath: string, envName: string, allowBareFirstLine = true): string {
   if (!fs.existsSync(filePath)) return "";
   const raw = fs.readFileSync(filePath, "utf-8").trim();
-  const regex = new RegExp(`^(?:export\\s+)?${envName}\\s*=\\s*(.+)$`, "m");
-  const match = raw.match(regex);
-  if (match?.[1]) {
-    return match[1].trim().replace(/^['"]|['"]$/g, "");
-  }
+  const match = raw.match(new RegExp(`^(?:export\\s+)?${envName}\\s*=\\s*(.+)$`, "m"));
+  if (match?.[1]) return match[1].trim().replace(/^['"]|['"]$/g, "");
   if (!allowBareFirstLine) return "";
   const firstLine = raw.split("\n").map((l) => l.trim()).find((l) => l && !l.startsWith("#")) ?? "";
   return firstLine.includes("=") ? "" : firstLine.replace(/^['"]|['"]$/g, "");
 }
 
 function loadApiKey(envName: string, dotFileName: string): string {
-  if (process.env[envName]?.trim()) {
-    return process.env[envName]!.trim();
-  }
+  if (process.env[envName]?.trim()) return process.env[envName]!.trim();
   const cwdEnv = readKeyFromFile(path.resolve(process.cwd(), ".env.local"), envName, false);
   if (cwdEnv) return cwdEnv;
   const harnessRootEnv = readKeyFromFile(path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../.env.local"), envName, false);
-  if (harnessRootEnv) return harnessRootEnv;
-  return readKeyFromFile(path.join(os.homedir(), ".gemini", "antigravity", dotFileName), envName, true);
+  return harnessRootEnv || readKeyFromFile(path.join(os.homedir(), ".gemini", "antigravity", dotFileName), envName, true);
 }
 
 export type ModelMode = "auto" | "deepseek" | "mimo" | "agy" | "openai";
 
-export function resolveActiveModelTarget(wireLogFile?: string, hasPriorAssistant = false, mode: ModelMode = "auto", nowUtcMs = Date.now()): { apiUrl: string; model: string; apiKey: string; shortLabel: string } {
+export function resolveActiveModelTarget(
+  wireLogFile?: string,
+  hasPriorAssistant = false,
+  mode: ModelMode = "auto",
+  nowUtcMs = Date.now(),
+  hasImages = false,
+): { apiUrl: string; model: string; apiKey: string; shortLabel: string } {
   if (mode === "agy") return { apiUrl: "agy://local-language-server", model: "gemini-4-argon-agy", apiKey: "local-agy", shortLabel: "Argon·反重力" };
   const openaiKey = loadApiKey("OPENAI_API_KEY", ".openai_key");
   const mimoKey = loadApiKey("MIMO_API_KEY", ".mimo_key");
@@ -183,7 +142,10 @@ export function resolveActiveModelTarget(wireLogFile?: string, hasPriorAssistant
   }
   const decision = resolveRouteTier(nowUtcMs);
   const useOpenAi = mode === "openai" || (mode === "auto" && openaiKey.length > 0 && ((!mimoKey && !deepseekKey) || process.env.LLM_PROVIDER === "openai"));
-  const useMimo = !useOpenAi && (mode === "mimo" || (mode === "auto" && (stickyProvider ? stickyProvider === "mimo" : decision.tier === "tier1_mimo_peak" && mimoKey.length > 0)));
+  const useMimo = !useOpenAi && (mode === "mimo" || (mode === "auto" && ((hasImages && mimoKey.length > 0) || (stickyProvider ? stickyProvider === "mimo" : decision.tier === "tier1_mimo_peak" && mimoKey.length > 0))));
+  if (hasImages && !useOpenAi && !useMimo) {
+    throw new Error("当前会话包含未折叠的图片附件，但 DeepSeek 官方接口不支持视觉输入 (image_url)；请配置 MIMO_API_KEY / 执行 /model mimo 切换到支持视觉的模型，或执行 /compact 折叠历史图片后再试。");
+  }
   const isTokenPlan = mimoKey.startsWith("tp-") || mimoKey.startsWith("ttp-");
   const openaiBaseUrl = (process.env.OPENAI_BASE_URL?.trim() || "https://api.openai.com/v1").replace(/\/$/, "");
   const mimoBaseUrl = process.env.MIMO_BASE_URL?.trim() || (isTokenPlan ? "https://token-plan-cn.xiaomimimo.com/v1" : "https://api.xiaomimimo.com/v1");
@@ -191,15 +153,17 @@ export function resolveActiveModelTarget(wireLogFile?: string, hasPriorAssistant
   const model = useOpenAi ? process.env.OPENAI_MODEL?.trim() || "gpt-5-codex" : useMimo ? process.env.MIMO_MODEL?.trim() || "mimo-v2.6-pro" : process.env.DEEPSEEK_MODEL?.trim() || "deepseek-reasoner";
   const apiKey = useOpenAi ? openaiKey : useMimo ? mimoKey : deepseekKey;
   const baseTag = useOpenAi ? "OpenAI" : useMimo ? "MiMo-2.6" : "DeepSeek";
-  const shortLabel = mode !== "auto" ? `${baseTag}·锁` : stickyProvider ? `${baseTag}·保缓存` : baseTag;
+  const shortLabel = mode !== "auto" ? `${baseTag}·锁` : hasImages && useMimo ? `${baseTag}·视觉` : stickyProvider ? `${baseTag}·保缓存` : baseTag;
   return { apiUrl, model, apiKey, shortLabel };
 }
+
+const RETRYABLE_ERR_RE = /^LLM HTTP (?:408|429|500|502|503|504)\b|fetch failed|terminated|ECONNRESET|ETIMEDOUT|socket|超时/i;
 
 export function createRouterProvider(wireLogFile = ".sessions/http-wire.json", appendExistingWire = false, getModelMode?: () => ModelMode): LlmProvider {
   let roundCount = 0;
   let agyDelegate: LlmProvider | null = null;
   return {
-    async chat(messages: Message[], tools: ToolContract<any>[] = [], options: { signal?: AbortSignal; onStreamEvent?: (event: LlmStreamEvent) => void } = {}): Promise<AssistantMessage> {
+    async chat(messages: Message[], tools: ToolContract<any>[] = [], options: { signal?: AbortSignal; onStreamEvent?: (event: LlmStreamEvent) => void; workspaceRoot?: string } = {}): Promise<AssistantMessage> {
       const mode = getModelMode?.() ?? "auto";
       if (mode === "agy") {
         agyDelegate ??= createAgyBridgeProvider(wireLogFile, appendExistingWire || roundCount > 0);
@@ -207,8 +171,9 @@ export function createRouterProvider(wireLogFile = ".sessions/http-wire.json", a
         return agyDelegate.chat(messages, tools, options);
       }
       const hasPrior = messages.some((m) => m.role === "assistant");
-      const { apiUrl, model, apiKey } = resolveActiveModelTarget(wireLogFile, hasPrior, mode);
-      if (!apiKey) throw new Error("未检测到 OPENAI_API_KEY、DEEPSEEK_API_KEY 或 MIMO_API_KEY");
+      const hasImages = messages.some((m) => m.role === "user" && Boolean(m.images && m.images.length > 0));
+      const { apiUrl, model, apiKey } = resolveActiveModelTarget(wireLogFile, hasPrior, mode, Date.now(), hasImages);
+      if (!apiKey) throw new Error(`未检测到模型密钥，请配置 DEEPSEEK_API_KEY / MIMO_API_KEY 或 ~/.gemini/antigravity/.deepseek_key`);
 
       const openAiTools = tools.map((t) => ({
         type: "function",
@@ -216,31 +181,45 @@ export function createRouterProvider(wireLogFile = ".sessions/http-wire.json", a
       }));
       const requestBody: Record<string, unknown> = {
         model,
-        messages: toOpenAiMessages(messages),
+        messages: toOpenAiMessages(messages, options.workspaceRoot),
         ...(openAiTools.length > 0 ? { tools: openAiTools } : {}),
         ...(model.includes("reasoner") ? {} : { temperature: 0 }),
         stream: true,
       };
-      const connectCtrl = new AbortController();
-      const connectTimer = setTimeout(() => connectCtrl.abort(new Error("LLM 首包连接超时 (45s)")), 45_000);
-      const signal = options.signal ? AbortSignal.any([options.signal, connectCtrl.signal]) : connectCtrl.signal;
-      const res = await fetch(apiUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-        body: JSON.stringify(requestBody),
-        signal,
-      }).finally(() => clearTimeout(connectTimer));
-      if (!res.ok) throw new Error(`LLM HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
-
-      const fallbackRenderer = options.onStreamEvent ? null : createStreamRenderer();
+      const fallbackRenderer = options.onStreamEvent ? null : createStreamRenderer(process.stdout);
       const handleEvent = options.onStreamEvent ?? ((evt: LlmStreamEvent) => fallbackRenderer?.onEvent(evt));
-      const { message, rawSseLines } = await readOpenAiSseStream(res, undefined, undefined, handleEvent, 45_000);
-      fallbackRenderer?.flush();
 
-      const entry = { roundTimestamp: new Date().toISOString(), apiUrl, requestBody, rawSseLines, assembledMessage: message };
-      recordHttpWireLog(entry, wireLogFile, roundCount === 0 && !appendExistingWire);
-      roundCount += 1;
-      return message;
+      for (let attempt = 0; ; attempt++) {
+        let emitted = false;
+        const onEvt = (evt: LlmStreamEvent) => { emitted = true; handleEvent(evt); };
+        const connectCtrl = new AbortController();
+        const connectTimer = setTimeout(() => connectCtrl.abort(new Error("LLM 首包连接超时 (45s)")), 45_000);
+        const signal = options.signal ? AbortSignal.any([options.signal, connectCtrl.signal]) : connectCtrl.signal;
+        try {
+          const res = await fetch(apiUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+            body: JSON.stringify(requestBody),
+            signal,
+          }).finally(() => clearTimeout(connectTimer));
+          if (!res.ok) throw new Error(`LLM HTTP ${res.status}: ${(await res.text().catch(() => "")).slice(0, 300)}`);
+          const { message, rawSseLines } = await readOpenAiSseStream(res, undefined, undefined, onEvt, 45_000);
+          fallbackRenderer?.flush();
+          recordHttpWireLog({ roundTimestamp: new Date().toISOString(), apiUrl, requestBody, rawSseLines, assembledMessage: message }, wireLogFile, roundCount === 0 && !appendExistingWire);
+          roundCount += 1;
+          return message;
+        } catch (err) {
+          fallbackRenderer?.flush();
+          const msg = err instanceof Error ? err.message : String(err);
+          if (attempt < 2 && !emitted && !options.signal?.aborted && RETRYABLE_ERR_RE.test(msg)) {
+            await new Promise((r) => setTimeout(r, process.env.VITEST ? 10 : 800 * (attempt + 1)));
+            continue;
+          }
+          recordHttpWireLog({ roundTimestamp: new Date().toISOString(), apiUrl, requestBody, rawSseLines: [`[ERROR] ${msg}`], assembledMessage: { role: "assistant", content: `[请求异常: ${msg}]` } }, wireLogFile, roundCount === 0 && !appendExistingWire);
+          roundCount += 1;
+          throw err;
+        }
+      }
     },
   };
 }

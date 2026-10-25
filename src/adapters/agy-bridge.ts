@@ -7,7 +7,6 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { AssistantMessageSchema, type AssistantMessage, type LlmProvider, type LlmStreamEvent, type Message, type ToolContract } from "../core/contracts.js";
 import { discoverOsLsProcess, querySqliteFirstValue, resolveAntigravityLsBin } from "./platform.js";
-import { zodObjectToJsonSchema } from "./router.js";
 import { createStreamRenderer, recordHttpWireLog } from "./sse-stream.js";
 
 const execFileAsync = promisify(execFile);
@@ -95,9 +94,8 @@ export function buildBridgePrompt(messages: Message[], tools: ToolContract<any>[
   }
   if (tools.length > 0) {
     const toolDesc = tools.map((t) => {
-      const schema = (t.inputSchema ?? zodObjectToJsonSchema(t.parameters)) as { properties?: Record<string, unknown>; required?: string[] };
-      const reqSet = new Set(schema.required ?? []);
-      const keys = Object.keys(schema.properties ?? {}).map((k) => (reqSet.has(k) ? k : `${k}?`)).join(", ");
+      const shape = (t.parameters as any)?.shape as Record<string, any> | undefined;
+      const keys = shape ? Object.keys(shape).map((k) => (typeof shape[k]?.isOptional === "function" && shape[k].isOptional() ? `${k}?` : k)).join(", ") : "";
       return `- ${t.name}(${keys}): ${t.description}`;
     }).join("\n");
     parts.push(`【Duo-Harness 桥接协议：严禁直接调用 Antigravity IDE 自身内置工具（严禁调 IDE 的 view_file/read_file/run_command/get-metrics.mjs 或拉起子代理）！若需查看目录、读取文件或执行命令，请从以下 Duo-Harness 宿主工具中选择，并直接输出且仅输出一行纯 JSON（不要加 markdown 代码块包裹）：\n{"content":"","toolCalls":[{"name":"工具名","arguments":{"参数名":"..."}}]}\n可用宿主工具列表：\n${toolDesc}\n若当前上下文已足够回答用户问题，请直接输出最终中文 Markdown 回答】`);

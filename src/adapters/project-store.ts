@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { SessionEntry } from "../core/contracts.js";
+import { stripAttachedFiles } from "./context-mention.js";
 import { formatSnapshotsDiff } from "./diff-presenter.js";
 import { expandHomePath } from "./platform.js";
 import { loadJsonlEntries, writeFileAtomicSync } from "./store.js";
@@ -11,12 +12,8 @@ import type { FileVersionSnapshot } from "./write-tools.js";
 export { formatSnapshotsDiff };
 
 export interface ProjectMetaState {
-  projectKey: string;
-  workspaceRoot: string;
-  updatedAt: string;
-  activeLeafId?: string | null;
-  modelMode?: "auto" | "deepseek" | "mimo" | "agy" | "openai";
-  lastUndoNotice?: string | null;
+  projectKey: string; workspaceRoot: string; updatedAt: string; activeLeafId?: string | null;
+  modelMode?: "auto" | "deepseek" | "mimo" | "agy" | "openai"; lastUndoNotice?: string | null;
 }
 
 export function loadProjectMeta(metaFile: string): Partial<ProjectMetaState> {
@@ -32,44 +29,33 @@ export function saveProjectMeta(metaFile: string, patch: Partial<ProjectMetaStat
 }
 
 export interface ProjectSessionPaths {
-  projectKey: string;
-  workspaceRoot: string;
-  projectDir: string;
-  sessionFile: string;
-  wireLogFile: string;
-  snapshotsFile: string;
-  metaFile: string;
+  projectKey: string; workspaceRoot: string; projectDir: string; sessionFile: string; wireLogFile: string; snapshotsFile: string; metaFile: string;
 }
 
 export interface ManagedProjectSummary {
-  projectKey: string;
-  workspaceRoot: string;
-  updatedAt: string;
-  entryCount: number;
-  lastLeafId: string | null;
+  projectKey: string; workspaceRoot: string; updatedAt: string; entryCount: number; lastLeafId: string | null;
 }
 
 export interface ConversationTurnSummary {
-  turnIndex: number;
-  userEntryId: string;
-  leafEntryId: string;
-  userText: string;
-  replyText: string;
-  toolSteps: number;
-  isCurrentLeaf: boolean;
+  turnIndex: number; userEntryId: string; leafEntryId: string; userText: string; replyText: string; toolSteps: number; isCurrentLeaf: boolean;
 }
 
 export const SLASH_COMMANDS = [
   { cmd: "/goal ", label: "/goal <目标>", desc: "长程自治模式 (自动放行写操作 + 50步上限 + 完成前自动验证)" },
+  { cmd: "/skill ", label: "/skill <名称>", desc: "按需加载扩展技能规范 (按 ↑/↓ 选择本机或项目 SKILL.md)" },
   { cmd: "/resume ", label: "/resume", desc: "用 ↑/↓ 方向键选择历史轮次或切换会话" },
   { cmd: "/new", label: "/new", desc: "开启全新对话 (保留旧历史，可随时 /resume 切回)" },
   { cmd: "/model ", label: "/model", desc: "用 ↑/↓ 方向键切换模型 (auto/deepseek/mimo/agy)" },
   { cmd: "/history", label: "/history", desc: "查看当前项目所有历史问答列表" },
-  { cmd: "/diff", label: "/diff", desc: "查看文件修改对比 (-删除 / +新增)" },
+  { cmd: "/diff", label: "/diff", desc: "查看文件修改对比 (/diff 空格可按 ↑/↓ 选文件)" },
+  { cmd: "/open", label: "/open [文件]", desc: "用系统默认浏览器/应用打开最新修改文件或指定路径 (/open 空格可选文件)" },
+  { cmd: "/shot", label: "/shot [文件]", desc: "用本机无头 Edge/Chrome 截取网页或 HTML 预览图 (.debug/shot.png)" },
   { cmd: "/undo", label: "/undo", desc: "撤回修改 (/undo 撤上一轮 | /undo N 撤N步 | /undo all 全部撤回)" },
+  { cmd: "/redo", label: "/redo", desc: "重做恢复 (/redo 恢复上次撤回 | /redo all 恢复全部撤回)" },
   { cmd: "/cd ", label: "/cd <项目>", desc: "切换项目工作区 (按回车直接展开项目列表)" },
   { cmd: "/projects", label: "/projects", desc: "查看本机已管理的所有项目列表" },
   { cmd: "/xray", label: "/xray", desc: "查看每步耗时、缓存命中与费用账单" },
+  { cmd: "/compact", label: "/compact", desc: "折叠历史大文件输出与 @引用块，释放上下文体积并重建精简缓存前缀" },
   { cmd: "/branch ", label: "/branch <id>", desc: "从指定历史节点分叉重聊" },
   { cmd: "/clear", label: "/clear", desc: "彻底清空当前项目磁盘历史记录" },
   { cmd: "/exit", label: "/exit", desc: "退出交互终端" },
@@ -158,13 +144,20 @@ export function loadProjectSnapshots(snapshotsFile: string): FileVersionSnapshot
   if (!fs.existsSync(snapshotsFile)) return [];
   try {
     const parsed = JSON.parse(fs.readFileSync(snapshotsFile, "utf-8"));
-    return Array.isArray(parsed) ? (parsed as FileVersionSnapshot[]) : [];
-  } catch {
-    return [];
-  }
+    if (Array.isArray(parsed)) return parsed as FileVersionSnapshot[];
+    return Array.isArray(parsed?.snapshots) ? (parsed.snapshots as FileVersionSnapshot[]) : [];
+  } catch { return []; }
 }
 
-export function saveProjectSnapshots(snapshotsFile: string, snapshots: readonly FileVersionSnapshot[]): void {
+export function loadProjectRedoBatches(snapshotsFile: string): FileVersionSnapshot[][] {
+  if (!fs.existsSync(snapshotsFile)) return [];
+  try {
+    const parsed = JSON.parse(fs.readFileSync(snapshotsFile, "utf-8"));
+    return Array.isArray(parsed?.redoBatches) ? (parsed.redoBatches as FileVersionSnapshot[][]) : [];
+  } catch { return []; }
+}
+
+export function saveProjectSnapshots(snapshotsFile: string, snapshots: readonly FileVersionSnapshot[], redoBatches: readonly FileVersionSnapshot[][] = []): void {
   try {
     let toSave = [...snapshots];
     if (toSave.length > 80) {
@@ -179,12 +172,14 @@ export function saveProjectSnapshots(snapshotsFile: string, snapshots: readonly 
         }
       }
     }
-    writeFileAtomicSync(snapshotsFile, JSON.stringify(toSave, null, 2));
+    const cleanRedo = redoBatches.filter((b) => Array.isArray(b) && b.length > 0).slice(-40);
+    writeFileAtomicSync(snapshotsFile, JSON.stringify(cleanRedo.length > 0 ? { snapshots: toSave, redoBatches: cleanRedo } : toSave, null, 2));
   } catch {}
 }
 
 function cleanPreviewText(raw: string): string {
-  return raw
+  return stripAttachedFiles(raw)
+    .replace(/\s*\[系统提示：[\s\S]*?\]/g, "")
     .replace(/```[\s\S]*?```/g, "[代码块]")
     .replace(/#{1,6}\s*/g, "")
     .replace(/\*\*([^*]+)\*\*/g, "$1")

@@ -1,13 +1,35 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { AssistantMessage, LlmStreamEvent } from "../core/contracts.js";
-import { parseOpenAiAssistantMessage } from "./router.js";
+import { AssistantMessageSchema, type AssistantMessage, type LlmStreamEvent, type ToolCall } from "../core/contracts.js";
+import type { HttpWireLogEntry } from "./cost-tracker.js";
+import { compactWireLogEntry, writeFileAtomicSync } from "./store.js";
 import { formatMarkdownLine, getVisualCols, wrapReasoningLines } from "./ui-logger.js";
+import { syncXrayCacheSnapshot } from "./xray.js";
 
-export { formatMarkdownLine, getVisualCols, wrapReasoningLines };
+export { formatMarkdownLine, getVisualCols, type HttpWireLogEntry, wrapReasoningLines };
 
-export interface HttpWireLogEntry {
-  roundTimestamp: string; apiUrl: string; requestBody: Record<string, unknown>; rawSseLines: string[]; assembledMessage: AssistantMessage;
+export function parseOpenAiAssistantMessage(rawMsg: Record<string, any>): AssistantMessage {
+  const rawToolCalls = Array.isArray(rawMsg.tool_calls) ? rawMsg.tool_calls : [];
+  const toolCalls: ToolCall[] = rawToolCalls.map((tc: any, idx: number) => {
+    let parsedArgs: Record<string, unknown> = {};
+    const rawArgsStr = tc?.function?.arguments ?? "{}";
+    try {
+      const parsed = JSON.parse(rawArgsStr);
+      parsedArgs = typeof parsed === "object" && parsed !== null ? parsed : { _value: parsed };
+    } catch {
+      parsedArgs = { _invalidJson: String(rawArgsStr) };
+    }
+    return { id: String(tc?.id || `call_${idx}`), name: String(tc?.function?.name || "unknown"), arguments: parsedArgs };
+  });
+
+  return AssistantMessageSchema.parse({
+    role: "assistant",
+    content: rawMsg.content ?? "",
+    ...(toolCalls.length > 0 ? { toolCalls } : {}),
+    ...(typeof (rawMsg.reasoning_content ?? rawMsg.reasoning) === "string"
+      ? { reasoningContent: rawMsg.reasoning_content ?? rawMsg.reasoning }
+      : {}),
+  });
 }
 
 export function assembleSsePayloads(dataPayloads: readonly string[]): AssistantMessage {
@@ -36,19 +58,15 @@ export function assembleSsePayloads(dataPayloads: readonly string[]): AssistantM
     }
   }
   const rawToolCalls = Array.from(toolMap.entries()).sort(([a], [b]) => a - b).map(([idx, acc]) => ({
-    id: acc.id || `call_${idx}`,
-    type: "function",
-    function: { name: acc.name || "unknown", arguments: acc.argsRaw || "{}" },
+    id: acc.id || `call_${idx}`, type: "function", function: { name: acc.name || "unknown", arguments: acc.argsRaw || "{}" },
   }));
-  return parseOpenAiAssistantMessage({ content, ...(hasReasoning ? { reasoning_content: reasoning } : {}), ...(rawToolCalls.length > 0 ? { tool_calls: rawToolCalls } : {}) });
+  return parseOpenAiAssistantMessage({
+    content, ...(hasReasoning ? { reasoning_content: reasoning } : {}), ...(rawToolCalls.length > 0 ? { tool_calls: rawToolCalls } : {}),
+  });
 }
 
 export async function readOpenAiSseStream(
-  res: Response,
-  onDeltaText?: (text: string) => void,
-  onReasoningDelta?: (text: string) => void,
-  onStreamEvent?: (event: LlmStreamEvent) => void,
-  idleTimeoutMs = 45_000,
+  res: Response, onDeltaText?: (text: string) => void, onReasoningDelta?: (text: string) => void, onStreamEvent?: (event: LlmStreamEvent) => void, idleTimeoutMs = 45_000,
 ): Promise<{ message: AssistantMessage; rawSseLines: string[] }> {
   const emitReasoning = (text: string) => { onReasoningDelta?.(text); onStreamEvent?.({ type: "reasoning_delta", text }); };
   const emitContent = (text: string) => { onDeltaText?.(text); onStreamEvent?.({ type: "content_delta", text }); };
@@ -117,35 +135,33 @@ export async function readOpenAiSseStream(
   return { message: assembleSsePayloads(dataPayloads), rawSseLines };
 }
 
+function slicePreviewText(text: string, startCols: number, maxCols: number): { out: string; nextCols: number } {
+  if (startCols >= maxCols) return { out: "", nextCols: startCols };
+  let out = "", cols = startCols;
+  for (const ch of text) {
+    const w = (ch.codePointAt(0) ?? 0) > 0xff ? 2 : 1;
+    if (cols + w > maxCols) break;
+    out += ch; cols += w;
+  }
+  return { out, nextCols: cols };
+}
+
 export function createStreamRenderer(stream: { write: (s: string) => unknown; columns?: number } = process.stdout) {
   let inReasoning = false, hasStartedContent = false, inCodeBlock = false;
   let currentLine = "", linePrefix = "", previewCols = 0, toolName = "", toolChars = 0, reasoningRaw = "", reasoningRows = 0;
+
   const clearToolProgress = () => {
-    if (!toolChars && !toolName) return;
-    stream.write("\r\x1b[K"); toolName = ""; toolChars = 0;
+    if (toolChars || toolName) { stream.write("\r\x1b[K"); toolName = ""; toolChars = 0; }
   };
   const eraseReasoningBox = () => {
-    if (reasoningRows <= 0) return;
-    stream.write(`${reasoningRows > 1 ? `\x1b[${reasoningRows - 1}A` : ""}\r\x1b[J`); reasoningRows = 0;
+    if (reasoningRows > 0) { stream.write(`${reasoningRows > 1 ? `\x1b[${reasoningRows - 1}A` : ""}\r\x1b[J`); reasoningRows = 0; }
   };
   const finishReasoning = () => {
     if (!inReasoning) return;
     const allLines = wrapReasoningLines(reasoningRaw, Math.max(20, (stream.columns ?? 80) - 6));
-    if (allLines.length > 5) {
-      eraseReasoningBox(); stream.write(`💭 \x1b[2m[已思考 ${reasoningRaw.length} 字]\x1b[0m\n`);
-    } else stream.write("\x1b[0m\n");
+    if (allLines.length > 5) { eraseReasoningBox(); stream.write(`💭 \x1b[2m[已思考 ${reasoningRaw.length} 字]\x1b[0m\n`); }
+    else stream.write("\x1b[0m\n");
     inReasoning = false; reasoningRaw = ""; reasoningRows = 0;
-  };
-  const writePreviewSlice = (text: string) => {
-    const maxCols = Math.max(20, (stream.columns ?? 80) - 8);
-    if (previewCols >= maxCols) return;
-    let out = "";
-    for (const ch of text) {
-      const w = (ch.codePointAt(0) ?? 0) > 0xff ? 2 : 1;
-      if (previewCols + w > maxCols) break;
-      out += ch; previewCols += w;
-    }
-    if (out) stream.write(out);
   };
   const commitCurrentLine = (withNewline: boolean) => {
     const { text: formatted, nextInCodeBlock } = formatMarkdownLine(currentLine, inCodeBlock);
@@ -153,6 +169,7 @@ export function createStreamRenderer(stream: { write: (s: string) => unknown; co
     stream.write(`\r\x1b[K${linePrefix}${formatted}${withNewline ? "\n" : ""}`);
     currentLine = linePrefix = ""; previewCols = 0;
   };
+
   return {
     onReasoning(chunk: string) {
       clearToolProgress();
@@ -161,7 +178,8 @@ export function createStreamRenderer(stream: { write: (s: string) => unknown; co
       const allLines = wrapReasoningLines(reasoningRaw, Math.max(20, (stream.columns ?? 80) - 6));
       eraseReasoningBox();
       if (allLines.length <= 5) {
-        stream.write(`💭 \x1b[2m\x1b[3m${allLines.join("\n   ")}`); reasoningRows = allLines.length;
+        stream.write(`💭 \x1b[2m\x1b[3m${allLines.join("\n   ")}`);
+        reasoningRows = allLines.length;
       } else {
         const tail = allLines.slice(-5);
         stream.write(`💭 \x1b[2m[思考中 ${reasoningRaw.length} 字 · 实时滚动]\x1b[0m\n   \x1b[2m\x1b[3m${tail.join("\n   ")}\x1b[0m`);
@@ -175,14 +193,22 @@ export function createStreamRenderer(stream: { write: (s: string) => unknown; co
       stream.write(`\r\x1b[K\x1b[2m⏳ 正在生成工具调用 ${toolName || "..."} (${toolChars} 字符)...\x1b[0m`);
     },
     onContent(chunk: string) {
-      finishReasoning(); clearToolProgress();
+      finishReasoning();
+      clearToolProgress();
       if (!hasStartedContent) {
-        linePrefix = "💬 "; previewCols = getVisualCols(linePrefix);
-        stream.write(`\n${linePrefix}`); hasStartedContent = true;
+        linePrefix = "💬 ";
+        previewCols = getVisualCols(linePrefix);
+        stream.write(`\n${linePrefix}`);
+        hasStartedContent = true;
       }
       const parts = chunk.split("\n");
       for (let i = 0; i < parts.length; i++) {
-        if (parts[i]) { writePreviewSlice(parts[i]!); currentLine += parts[i]!; }
+        if (parts[i]) {
+          const slice = slicePreviewText(parts[i]!, previewCols, Math.max(20, (stream.columns ?? 80) - 8));
+          if (slice.out) stream.write(slice.out);
+          previewCols = slice.nextCols;
+          currentLine += parts[i]!;
+        }
         if (i < parts.length - 1) commitCurrentLine(true);
       }
     },
@@ -192,7 +218,8 @@ export function createStreamRenderer(stream: { write: (s: string) => unknown; co
       else if (evt.type === "tool_call_delta") this.onToolCall(evt.name, evt.argsDelta);
     },
     flush() {
-      finishReasoning(); clearToolProgress();
+      finishReasoning();
+      clearToolProgress();
       if (currentLine.length > 0) commitCurrentLine(false);
       if (hasStartedContent) stream.write("\x1b[0m\n");
     },
@@ -200,14 +227,14 @@ export function createStreamRenderer(stream: { write: (s: string) => unknown; co
 }
 
 export function recordHttpWireLog(entry: HttpWireLogEntry, wireFilePath = ".sessions/http-wire.json", resetFile = false): void {
-  fs.mkdirSync(path.dirname(wireFilePath), { recursive: true });
   let existing: HttpWireLogEntry[] = [];
   if (!resetFile && fs.existsSync(wireFilePath)) {
     try {
       const parsed = JSON.parse(fs.readFileSync(wireFilePath, "utf-8"));
-      if (Array.isArray(parsed)) existing = parsed;
+      if (Array.isArray(parsed)) existing = parsed.map(compactWireLogEntry);
     } catch {}
   }
-  existing.push(entry);
-  fs.writeFileSync(wireFilePath, JSON.stringify(existing, null, 2), "utf-8");
+  existing.push(compactWireLogEntry(entry));
+  writeFileAtomicSync(wireFilePath, JSON.stringify(existing, null, 2));
+  syncXrayCacheSnapshot(wireFilePath);
 }

@@ -1,43 +1,17 @@
-import {
-  AgentStateSchema,
-  type AgentState,
-  type AssistantMessage,
-  type LoopEvent,
-  type LoopStepResult,
-  type Message,
-  type ToolResultMessage,
-} from "./contracts.js";
+import { AgentStateSchema, type AgentState, type AssistantMessage, type LoopEvent, type LoopStepResult, type Message, type ToolResultMessage } from "./contracts.js";
 
-export interface InitialStateConfig {
-  systemPrompt?: string;
-  maxSteps?: number;
-}
+export interface InitialStateConfig { systemPrompt?: string; maxSteps?: number }
 
 export function createInitialState(config: InitialStateConfig = {}): AgentState {
-  const messages: Message[] = [];
-  if (config.systemPrompt) {
-    messages.push({ role: "system", content: config.systemPrompt });
-  }
-  return AgentStateSchema.parse({
-    phase: "idle",
-    messages,
-    step: 0,
-    maxSteps: config.maxSteps ?? 20,
-  });
+  const messages: Message[] = config.systemPrompt ? [{ role: "system", content: config.systemPrompt }] : [];
+  return AgentStateSchema.parse({ phase: "idle", messages, step: 0, maxSteps: config.maxSteps ?? 20 });
 }
 
 function abortLoop(state: AgentState, reason: string, messages = state.messages): LoopStepResult {
-  return {
-    state: { ...state, phase: "error", messages, error: reason },
-    effect: { type: "ABORT", reason },
-  };
+  return { state: { ...state, phase: "error", messages, error: reason }, effect: { type: "ABORT", reason } };
 }
 
-function handleLlmReplied(
-  state: AgentState,
-  message: AssistantMessage,
-  requiresApproval = false,
-): LoopStepResult {
+function handleLlmReplied(state: AgentState, message: AssistantMessage, requiresApproval = false): LoopStepResult {
   const nextMessages: Message[] = [...state.messages, message];
   const toolCalls = message.toolCalls ?? [];
 
@@ -129,10 +103,12 @@ export function stepAgentLoop(state: AgentState, event: LoopEvent): LoopStepResu
 
   switch (event.type) {
     case "START": {
-      const nextMessages: Message[] = [
-        ...state.messages,
-        { role: "user", content: event.userPrompt },
-      ];
+      const userMsg: Message = {
+        role: "user",
+        content: event.userPrompt,
+        ...(event.images && event.images.length > 0 ? { images: event.images } : {}),
+      };
+      const nextMessages: Message[] = [...state.messages, userMsg];
       return {
         state: { ...state, phase: "thinking", messages: nextMessages },
         effect: { type: "REQUEST_LLM", messages: nextMessages },

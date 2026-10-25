@@ -1,10 +1,12 @@
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
 import { z } from "zod";
 import type { ToolCall, ToolContract, ToolResultMessage } from "../core/contracts.js";
-import { expandHomePath, isPathInside, toPosixRelative } from "./platform.js";
+import { toPosixRelative } from "./platform.js";
+import { resolveSafePath, type SandboxGrants } from "./sandbox-policy.js";
+
+export { resolveSafePath, type SandboxGrants };
 
 const ReadFileArgsSchema = z.object({
   path: z.string().min(1),
@@ -23,64 +25,16 @@ const GrepArgsSchema = z.object({
   contextLines: z.number().int().min(0).optional(),
 });
 
-function resolveExistingRealPath(targetPath: string): string {
-  let curr = path.resolve(targetPath);
-  const tailSegments: string[] = [];
-  while (!fsSync.existsSync(curr)) {
-    const parent = path.dirname(curr);
-    if (parent === curr) break;
-    tailSegments.unshift(path.basename(curr));
-    curr = parent;
-  }
-  const realBase = fsSync.existsSync(curr) ? fsSync.realpathSync(curr) : curr;
-  return path.join(realBase, ...tailSegments);
-}
-
-/**
- * 校验并解析安全路径：
- * - write 模式：100% 锁死在 workspaceRoot 内（含软链接真实路径还原与多层新建目录回溯）
- * - read 模式：允许 workspaceRoot 及全局只读 Skill 白名单目录
- */
-export function resolveSafePath(
-  workspaceRoot: string,
-  targetPath: string,
-  mode: "read" | "write" = "read",
-): string {
-  const home = os.homedir();
-  const expanded = expandHomePath(targetPath, home);
-  const candidate = path.resolve(workspaceRoot, expanded);
-  const realCandidate = resolveExistingRealPath(candidate);
-  const realRoot = resolveExistingRealPath(workspaceRoot);
-
-  if (isPathInside(realCandidate, realRoot)) {
-    return realCandidate;
-  }
-
-  if (mode === "read") {
-    const readonlyRoots = [
-      path.join(home, ".duo-harness", "skills"),
-      path.join(home, ".gemini", "config", "plugins"),
-      path.join(home, ".codex", "skills"),
-      path.join(home, ".agents", "skills"),
-    ].map(resolveExistingRealPath);
-
-    if (readonlyRoots.some((r) => isPathInside(realCandidate, r))) {
-      return realCandidate;
-    }
-  }
-
-  throw new Error(`禁止访问工作区以外的路径 (${mode}): ${targetPath}`);
-}
-
-const IGNORED_DIRS = new Set([".git", "node_modules", ".sessions", "venv", ".venv", "__pycache__", "dist", "build", ".next"]);
-const BINARY_EXT_RE = /\.(png|jpe?g|gif|webp|ico|pdf|zip|tar|gz|woff2?|ttf|eot|mp[34]|mov|pyc|so|dylib|dll|exe|db|sqlite3?|lock)$/i;
+export const IGNORED_DIRS = new Set([".git", "node_modules", ".sessions", "venv", ".venv", "__pycache__", "dist", "build", ".next"]);
+export const BINARY_EXT_RE = /\.(png|jpe?g|gif|webp|ico|pdf|zip|tar|gz|woff2?|ttf|eot|mp[34]|mov|pyc|so|dylib|dll|exe|db|sqlite3?|lock)$/i;
 
 async function runGrepSearch(
   workspaceRoot: string,
   args: z.infer<typeof GrepArgsSchema>,
+  grants?: SandboxGrants,
 ): Promise<string> {
-  const realRoot = resolveSafePath(workspaceRoot, ".", "read");
-  const fullPath = resolveSafePath(workspaceRoot, args.path, "read");
+  const realRoot = resolveSafePath(workspaceRoot, ".", "read", grants);
+  const fullPath = resolveSafePath(workspaceRoot, args.path, "read", grants);
   const stat = await fs.stat(fullPath);
   const files = stat.isDirectory()
     ? (await fs.readdir(fullPath, { recursive: true, withFileTypes: true }))
@@ -136,14 +90,14 @@ function formatFileWithLineCount(fullFilePath: string, displayName: string): str
   }
 }
 
-export function createBuiltinTools(workspaceRoot: string = process.cwd()): ToolContract<any>[] {
+export function createBuiltinTools(workspaceRoot: string = process.cwd(), grants?: SandboxGrants): ToolContract<any>[] {
   const readFileTool: ToolContract<z.infer<typeof ReadFileArgsSchema>> = {
     name: "read_file",
     description: "读取指定文件的文本内容（支持 startLine/endLine 行区间切片，附带行号）",
     parameters: ReadFileArgsSchema,
     readonly: true,
     async execute(args) {
-      const fullPath = resolveSafePath(workspaceRoot, args.path, "read");
+      const fullPath = resolveSafePath(workspaceRoot, args.path, "read", grants);
       const lines = (await fs.readFile(fullPath, "utf-8")).split("\n");
       const startIdx = Math.max(0, (args.startLine ?? 1) - 1);
       const endIdx = args.endLine ? Math.min(lines.length, args.endLine) : startIdx + (args.maxLines ?? lines.length);
@@ -158,7 +112,7 @@ export function createBuiltinTools(workspaceRoot: string = process.cwd()): ToolC
     parameters: ListDirArgsSchema,
     readonly: true,
     async execute(args) {
-      const fullPath = resolveSafePath(workspaceRoot, args.path, "read");
+      const fullPath = resolveSafePath(workspaceRoot, args.path, "read", grants);
       const entries = await fs.readdir(fullPath, { withFileTypes: true });
       const lines: string[] = [];
       const ignoredFound: string[] = [];
@@ -193,7 +147,7 @@ export function createBuiltinTools(workspaceRoot: string = process.cwd()): ToolC
     description: "在指定文件或目录中递归搜索包含关键词的行（支持 contextLines 附带上下文行）",
     parameters: GrepArgsSchema,
     readonly: true,
-    execute: (args) => runGrepSearch(workspaceRoot, args),
+    execute: (args) => runGrepSearch(workspaceRoot, args, grants),
   };
 
   return [readFileTool, listDirTool, grepTool];

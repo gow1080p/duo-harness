@@ -1,28 +1,43 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { pathToFileURL } from "node:url";
-import type { ToolResultMessage } from "../core/contracts.js";
-import { summarizeWireCost } from "./cost-tracker.js";
-import { type FileDiffSummaryItem, formatApprovalBox, formatStepToolCalls, normalizeEditsArray, summarizeSnapshotsDiff } from "./diff-presenter.js";
-import { toPosixPath } from "./platform.js";
-import type { HttpWireLogEntry } from "./sse-stream.js";
+import type { ToolCall, ToolResultMessage } from "../core/contracts.js";
+import { buildDefaultSystemPrompt, cleanDisplayBash, isReadonlyBashCommand } from "./bash-policy.js";
+import { computeTurnMetrics, type TurnMetricsSummary } from "./cost-tracker.js";
+import {
+  extractChangedHunk,
+  type FileDiffSummaryItem,
+  normalizeEditsArray,
+  summarizeSnapshotsDiff,
+  truncateVisualCols,
+} from "./diff-presenter.js";
+import { formatClickablePath, getVisualCols, shortenWorkspaceText } from "./platform.js";
 
-export { type FileDiffSummaryItem, formatApprovalBox, formatStepToolCalls, normalizeEditsArray, summarizeSnapshotsDiff };
-
-export function getVisualCols(s: string): number {
-  let w = 0;
-  for (const ch of s.replace(/\x1b\[[0-9;]*m/g, "")) w += (ch.codePointAt(0) ?? 0) > 0xff ? 2 : 1;
-  return w;
-}
+export {
+  buildDefaultSystemPrompt,
+  cleanDisplayBash,
+  computeTurnMetrics,
+  type FileDiffSummaryItem,
+  getVisualCols,
+  isReadonlyBashCommand,
+  normalizeEditsArray,
+  shortenWorkspaceText,
+  summarizeSnapshotsDiff,
+  type TurnMetricsSummary,
+};
 
 function formatInlineMarkdown(line: string): string {
-  return line.replace(/`([^`]+)`/g, "\x1b[36m$1\x1b[0m").replace(/\*\*([^*]+)\*\*/g, "\x1b[1;97m$1\x1b[0m").replace(/(^|[^*])\*([^*]+)\*(?!\*)/g, "$1\x1b[3m$2\x1b[0m");
+  return line
+    .replace(/`([^`]+)`/g, "\x1b[36m$1\x1b[0m")
+    .replace(/\*\*([^*]+)\*\*/g, "\x1b[1;97m$1\x1b[0m")
+    .replace(/(^|[^*])\*([^*]+)\*(?!\*)/g, "$1\x1b[3m$2\x1b[0m");
 }
 
 export function formatMarkdownLine(rawLine: string, inCodeBlock: boolean): { text: string; nextInCodeBlock: boolean } {
   const fenceMatch = rawLine.match(/^\s*```(\w*)\s*$/);
   if (fenceMatch) {
-    return inCodeBlock ? { text: "\x1b[90m  ╰────────────────────────\x1b[0m", nextInCodeBlock: false } : { text: `\x1b[90m  ╭── ${fenceMatch[1] || "code"} ────────────────\x1b[0m`, nextInCodeBlock: true };
+    return inCodeBlock
+      ? { text: "\x1b[90m  ╰────────────────────────\x1b[0m", nextInCodeBlock: false }
+      : { text: `\x1b[90m  ╭── ${fenceMatch[1] || "code"} ────────────────\x1b[0m`, nextInCodeBlock: true };
   }
   if (inCodeBlock) return { text: `\x1b[90m  │ \x1b[0m\x1b[32m${rawLine}\x1b[0m`, nextInCodeBlock: true };
   if (/^\s*(?:---+|\*\*\*+)\s*$/.test(rawLine)) return { text: "\x1b[90m  ────────────────────────────────────────\x1b[0m", nextInCodeBlock: false };
@@ -48,109 +63,126 @@ export function formatMarkdownLine(rawLine: string, inCodeBlock: boolean): { tex
 export function wrapReasoningLines(raw: string, maxCols: number): string[] {
   const out: string[] = [];
   for (const para of raw.split(/\r?\n/)) {
-    if (!para) { out.push(""); continue; }
-    let line = "", cols = 0;
+    if (!para) {
+      out.push("");
+      continue;
+    }
+    let line = "";
+    let cols = 0;
     for (const ch of para) {
       const w = (ch.codePointAt(0) ?? 0) > 0xff ? 2 : 1;
-      if (cols + w > maxCols) { out.push(line); line = ch; cols = w; } else { line += ch; cols += w; }
+      if (cols + w > maxCols) {
+        out.push(line);
+        line = ch;
+        cols = w;
+      } else {
+        line += ch;
+        cols += w;
+      }
     }
     if (line) out.push(line);
   }
   return out.length > 0 ? out : [""];
 }
 
-const SAFE_READONLY_VERBS_RE =
-  /^(?:ls|cat|head|tail|wc|grep|egrep|fgrep|rg|ag|find|stat|file|du|df|pwd|realpath|dirname|basename|which|whereis|type|echo|printf|tr|cut|sort|uniq|diff|comm|cmp|md5|shasum|sha256sum|xxd|hexdump|strings|tree|uname|whoami|id|hostname|date|uptime|printenv|ps|lsof|pgrep|sed|curl|test|true|false)(?:\s|$)/;
-
-const GIT_READONLY_SUBCMD_RE =
-  /^git\s+(?:(?:--no-pager|-C\s+(?:"__STR__"|\S+))\s+)*(?:(?:status|diff|log|show|rev-parse|ls-files|ls-tree|cat-file|describe|shortlog|blame|var)(?:\s|$)|reflog(?:\s+show)?\s*$|branch(?:\s+(?:-(?:a|r|v|vv)|--(?:all|remotes|list|show-current|contains|merged|no-merged)))*\s*$|remote(?:\s+(?:-v|--verbose))*\s*$|tag(?:\s+(?:-l|--list)(?:\s+\S+)*)?\s*$|config\s+(?:--(?:get|get-all|list)|-l)(?:\s|$)|(?:-v|--version)\s*$)/;
-
-const RUNTIME_VERSION_RE =
-  /^(?:(?:node|python3?|pip3?|npm|pnpm|yarn|bun|tsc|cargo|rustc|uvicorn|vite)\s+(?:-v|--version|-V)|go\s+version|(?:(?:npx|pnpm|yarn|bunx?)\s+)?tsc(?:\s+(?:--noEmit|--pretty(?:\s+(?:true|false))?|--skipLibCheck|--strict|-p\s+(?:"__STR__"|\S+)|--project\s+(?:"__STR__"|\S+)))*\s+--noEmit(?:\s+(?:--pretty(?:\s+(?:true|false))?|--skipLibCheck|--strict|-p\s+(?:"__STR__"|\S+)|--project\s+(?:"__STR__"|\S+)))*)\s*$/;
-
-export function shortenWorkspaceText(raw: string, workspaceRoot?: string): string {
-  if (!raw) return raw;
-  let res = raw;
-  if (workspaceRoot) {
-    for (const rootVariant of [workspaceRoot.replace(/[\\/]+$/, ""), toPosixPath(workspaceRoot).replace(/\/+$/, "")]) {
-      if (rootVariant) {
-        res = res.split(`${rootVariant}/`).join("").split(`${rootVariant}\\`).join("").split(rootVariant).join(".");
-      }
+export function formatStepToolCalls(step: number, calls: readonly ToolCall[], readonlyMap: Map<string, boolean>, workspaceRoot?: string): string {
+  const editCounts = new Map<string, { count: number; isNew: boolean }>();
+  for (const c of calls) {
+    if (c.name !== "edit_file") continue;
+    const args = (c.arguments ?? {}) as Record<string, unknown>;
+    const rel = shortenWorkspaceText(String(args.path ?? ""), workspaceRoot);
+    const edits = normalizeEditsArray(args.edits);
+    const fullPath = workspaceRoot ? path.resolve(workspaceRoot, String(args.path ?? "")) : "";
+    const isNew = !args.oldText && (edits.length === 0 || edits.every((e) => !e.oldText)) && (!fullPath || !fs.existsSync(fullPath));
+    const prev = editCounts.get(rel);
+    editCounts.set(rel, { count: (prev?.count ?? 0) + Math.max(1, edits.length), isNew: prev ? prev.isNew && isNew : isNew });
+  }
+  const seenEdits = new Set<string>();
+  const items: { isWrite: boolean; text: string }[] = [];
+  for (const call of calls) {
+    const args = (call.arguments ?? {}) as Record<string, unknown>;
+    const relPath = shortenWorkspaceText(String(args.path || "."), workspaceRoot);
+    if (call.name === "edit_file") {
+      const rel = shortenWorkspaceText(String(args.path ?? ""), workspaceRoot);
+      if (seenEdits.has(rel)) continue;
+      seenEdits.add(rel);
+      const info = editCounts.get(rel)!;
+      const suffix = !info.isNew && info.count > 1 ? ` (${info.count} 处修改)` : "";
+      items.push({ isWrite: true, text: `📝 ${info.isNew ? "新建文件" : "修改文件"}: ${rel}${suffix}` });
+    } else if (call.name === "list_dir") items.push({ isWrite: false, text: `📂 查看目录: ${relPath}` });
+    else if (call.name === "read_file") {
+      const range = args.startLine || args.endLine ? ` (第 ${args.startLine ?? 1}~${args.endLine ?? "末"} 行)` : "";
+      items.push({ isWrite: false, text: `📘 读取文件: ${shortenWorkspaceText(String(args.path ?? ""), workspaceRoot)}${range}` });
+    } else if (call.name === "grep") items.push({ isWrite: false, text: `🔍 搜索代码: "${String(args.pattern ?? "")}" (${relPath})` });
+    else if (call.name === "rollback_version") items.push({ isWrite: true, text: `🔄 回退版本: 撤回最近 ${String(args.stepsBack ?? 1)} 步修改` });
+    else if (call.name === "run_bash") {
+      const rawCmd = String(args.command ?? "").trim();
+      const isRo = isReadonlyBashCommand(rawCmd, args.readonly as boolean | undefined, workspaceRoot);
+      const parts = cleanDisplayBash(rawCmd, workspaceRoot);
+      const ordered = !isRo && parts.length > 1 ? [...parts.filter((p) => !isReadonlyBashCommand(p, undefined, workspaceRoot)), ...parts.filter((p) => isReadonlyBashCommand(p, undefined, workspaceRoot))] : parts;
+      items.push({ isWrite: !isRo, text: `${isRo ? "📊 统计/查询命令" : "💻 运行终端命令"}: ${truncateVisualCols(ordered.join(" · "), 64)}` });
+    } else {
+      items.push({ isWrite: readonlyMap.get(call.name) === false, text: `🔧 调用工具 ${call.name}: ${truncateVisualCols(JSON.stringify(args), 54)}` });
     }
   }
-  return res.replace(/^\s*cd\s+(?:"\."|'\.'|\.)\s*(?:&&|;)\s*/, "");
+  const header = items.some((i) => i.isWrite) ? `\n🔧 [第 ${step} 步 · 准备执行修改或命令]` : `\n🔍 [第 ${step} 步 · 正在探索与读取项目]`;
+  return [header, ...items.map((item, idx) => `${idx === items.length - 1 ? "  └─ " : "  ├─ "}${item.text}`)].join("\n");
 }
 
-export function cleanDisplayBash(rawCmd: string, workspaceRoot?: string): string[] {
-  const short = shortenWorkspaceText(rawCmd.trim(), workspaceRoot);
-  const rawParts = short.match(/(?:\s*&&\s*echo\s+(?!(?:['"]?(?:===+|---+)))(?:[^;&'"]|'[^']*'|"(?:[^"\\]|\\.)*")+|'[^']*'|"(?:[^"\\]|\\.)*"|\b(?:for|while|until)\b(?:[^'"]|'[^']*'|"(?:[^"\\]|\\.)*")+?\bdone\b|\bif\b(?:[^'"]|'[^']*'|"(?:[^"\\]|\\.)*")+?\bfi\b|[^;&'"]+|(?<!&)&(?!&))+/g) ?? [short];
-  const parts = rawParts
-    .map((s) => s.trim().replace(/\s+2>&1(?=\s*$|\s*\|)/g, ""))
-    .filter((s) => s && !/^echo(?:\s+(?:'(?:===+|---+)(?:.*(?:===+|---+))?'|"(?:===+|---+)(?:.*(?:===+|---+))?"|---+|===+))?$/.test(s))
-    .filter((s, _, arr) => !(arr.length > 1 && /^echo\s+['"]?[^'"]*(?:exit|\$\?)[^'"]*['"]?$/i.test(s)));
-  return parts.length > 0 ? parts : [short];
-}
-
-export function buildDefaultSystemPrompt(workspaceRoot: string): string {
-  return [
-    `你是运行在 Duo-Harness 宿主环境中的本地编程智能体（全程必须使用简明中文思考与回答，第 1 步起 reasoning 严禁输出英文 Let me...；严禁自称 Claude 或 Anthropic 模型，当用户询问模型身份时请如实回答底层模型如 DeepSeek 或小米 MiMo）。`,
-    `- 当前工作区根目录 (workspaceRoot): ${workspaceRoot} (操作系统: ${process.platform})`,
-    `- 工具使用纪律（必须严格遵守）：`,
-    `  1. 查看目录与文件行数必须直接调用 list_dir（已自带 2 层目录树、代码文件行数及顶层/二级 [已过滤忽略目录] 如 venv/、web-ui/node_modules/），读文件调 read_file（1000 行内直接一次读完，多个文件同轮并发读取），搜索代码调 grep；严禁调用未注册的 glob、find_by_name 或 write_file 工具（找文件只用 list_dir/grep，新建与修改文件统一用 edit_file）；严禁调用 run_bash 执行 cat/find/grep/ls/wc，也严禁用 ls node_modules 或 python -c "import ..." 试探依赖。`,
-    `  2. 调用工具时 path 参数请直接传相对于工作区根目录的简短相对路径（如 "."、"README.md"、"src/index.ts"），不要重复拼接长绝对路径。`,
-    `  3. run_bash 默认已在工作区根目录 (${workspaceRoot}) 下启动，严禁在命令开头拼接 cd "${workspaceRoot}" &&；前端/TS 类型检查请统一用只读命令 npx tsc --noEmit（自动免确认放行，勿用会写缓存的 tsc -b）；只读环境检查严禁与写操作或 python -c 混写在同一条 run_bash 中；启动常驻服务（如 uvicorn/vite/npm run dev）必须用后台方式（nohup ... > /tmp/xxx.log 2>&1 </dev/null &）并在同条命令内 sleep 1~2 后检查端口或日志，严禁前台裸跑常驻进程。`,
-    `  4. 修改同一个文件的多处内容时，请使用 edit_file 的 edits 批量数组在单次调用中完成（或同一步并发调用多个 edit_file）；从 0 到 1 初始化或搭建多文件项目（Vibe Coding）时，必须采用「分批小步落盘」：每一步最多新建或修改 1~3 个文件（先写 package.json/基础配置 -> 安装依赖或写核心逻辑 -> 写页面/入口并验证），严禁在单步 tool_calls 中一口气塞入超过 3 个大文件的完整代码；严禁通过 run_bash 调用 sed -i 或脚本改写源码文件。`,
-    `  5. 思考过程（reasoning）必须全程使用简明中文，调工具取证阶段思考控制在 100 字以内，聚焦下一步动作；当用户要求“拉起/启动项目”时，第 1~2 步用 list_dir 与 read_file 读齐入口配置（如 README.md、main.py、package.json、vite.config.ts）后立即在下一步直接启动服务，禁止超过 2 步纯探索。`,
-  ].join("\n");
-}
-
-export function isReadonlyBashCommand(cmd: string, explicitReadonly?: boolean): boolean {
-  if (explicitReadonly === false) return false;
-  const raw = cmd.trim();
-  if (!raw || /`|\$\(|\$'|\$\{|[\n\r]/.test(raw)) return false;
-  const unquoted = raw.replace(/['"]/g, "").replace(/(?:^|\s)(?:-o\s*|--output(?:=|\s+))\/dev\/null(?=\s|$|;|\||&)/g, " ");
-  if (
-    /(?:^|\s)(?:-(?:delete|exec|execdir|ok|okdir|fprint|fprint0|fprintf|fls)\b|--(?:output|output-dir|in-place|file|ext-diff|textconv|pre|pre-glob|compress-program|data\S*|form\S*|upload-file|request|remote-name\S*|json|url\S*|next|config|dump-header|trace\S*)\b)/.test(unquoted) ||
-    /(?:^|[;&|]\s*)(?:(?:\w+=\S+|env|command|do|then|elif|else|if|while|until)\s+)*(?:(?:sort|tree|git|rg|xxd)\b[^;&|]*\s-[a-zA-Z]*o|curl\b[^;&|]*\s-[a-zA-Z0-9#]*[oOdDFTPXK]|file\b[^;&|]*\s-[a-zA-Z]*C|sed\b[^;&|]*\s-[a-zA-Z]*[if])/.test(unquoted)
-  ) {
-    return false;
+export function formatApprovalBox(toolCalls: readonly ToolCall[], workspaceRoot?: string, expandAll = false, escalatedReasons: readonly string[] = []): string {
+  const groupedEdits = new Map<string, { rawPath: string; hunks: { oldText: string; newText: string }[] }>();
+  let totalHunks = 0, bashCount = 0;
+  for (const c of toolCalls) {
+    const args = (c.arguments ?? {}) as Record<string, unknown>;
+    if (c.name === "edit_file") {
+      const rawPath = String(args.path ?? ""), rel = shortenWorkspaceText(rawPath, workspaceRoot);
+      const parsed = normalizeEditsArray(args.edits);
+      const list = parsed.length > 0 ? parsed : [{ oldText: String(args.oldText ?? ""), newText: String(args.newText ?? "") }];
+      const entry = groupedEdits.get(rel) ?? { rawPath, hunks: [] };
+      for (const h of list) entry.hunks.push({ oldText: String(h.oldText ?? ""), newText: String(h.newText ?? "") });
+      groupedEdits.set(rel, entry);
+      totalHunks += list.length;
+    } else if (c.name === "run_bash") bashCount++;
   }
-  const maskedQuotes = raw.replace(/(?:'[^']*'|"(?:[^"\\]|\\.)*")/g, (m) => {
-    const inner = m.slice(1, -1);
-    if (/^https?:\/\/(?:127\.0\.0\.1|localhost)(?::\d+)?(?:\/[^'"]*)?$/.test(inner)) return '"__LOCAL_URL__"';
-    const body = inner.replace(/\bs([^\w\s])(?:\\.|(?!\1).)*\1(?:\\.|(?!\1).)*\1/g, "/").replace(/\/(?:\\.|[^/])*\//g, "/");
-    return /\/[gIimMp0-9]*[ewW]|(?:^|[;{}!\s$0-9])[ewW](?:\s|$)/.test(body) ? '"__SED_UNSAFE__"' : '"__STR__"';
-  });
-  if (/['"]/.test(maskedQuotes.replace(/"__(?:STR|LOCAL_URL|SED_UNSAFE)__"/g, ""))) return false;
-  const cleaned = maskedQuotes.replace(/(?:^|\s)(?:[12]?>\s*\/dev\/null|<\s*\/dev\/null|(?:-o\s*|--output(?:=|\s+))\/dev\/null|2>&1|1>&2)(?=\s|$|;|\||&)/g, " ").trim();
-  if (!cleaned || /[><]|(?:^|[^&])&(?:[^&]|$)/.test(cleaned)) return false;
-  const segments = cleaned.split(/\s*(?:\|\||&&|;|\|)\s*/);
-  let hasReadVerb = false;
-  return (
-    segments.every((seg) => {
-      const core = seg.trim().replace(/^(?:(?:LC_ALL|LANG|TZ|TERM|COLORTERM)=(?:"__STR__"|\S+)\s+|(?:env|command|do|if|then|elif|else)\s+)*/, "");
-      if (!core) return false;
-      if (/^(?:cd(?:\s+(?:"__STR__"|\S+))?|sleep\s+\d+(?:\.\d+)?|for\s+[a-zA-Z_]\w*\s+in(?:\s+(?:"__STR__"|\S+))+|done|fi)$/.test(core)) return true;
-      if (/^(?:\[\s+.+\s+\]|\[\[\s+.+\s+\]\])$/.test(core)) {
-        hasReadVerb = true;
-        return true;
+  const scopeParts = [
+    ...(groupedEdits.size > 0 ? [`申请修改文件 ${groupedEdits.size} 个 (共 ${totalHunks} 处)`] : []),
+    ...(bashCount > 0 ? [`申请执行终端命令 ${bashCount} 条`] : []),
+  ];
+  const isEsc = escalatedReasons.length > 0;
+  const icon = isEsc ? "🚨" : groupedEdits.size > 0 && bashCount > 0 ? "⚠️ " : groupedEdits.size > 0 ? "📝" : "💻";
+  const lines: string[] = [`\n┌─ ${icon} [${isEsc ? "跨界/系统级提权确认：" : "待确认：本次"}${scopeParts.join(" · ") || "申请执行工具操作"}${expandAll ? " · 已展开全部明细" : ""}] ──────────────`];
+  for (const r of escalatedReasons) lines.push(`│ \x1b[33m⚠️ 提权原因: ${r}\x1b[0m`);
+  const maxHunks = expandAll ? 1000 : 4, maxLines = expandAll ? 120 : 2, maxCols = expandAll ? 140 : 66;
+  for (const [rel, { rawPath, hunks }] of groupedEdits.entries()) {
+    const existed = Boolean(workspaceRoot && fs.existsSync(path.resolve(workspaceRoot, rawPath)));
+    const diffs = hunks.map((h) => extractChangedHunk(h.oldText, h.newText));
+    const oldLines = diffs.reduce((a, d) => a + d.removed.length, 0), newLines = diffs.reduce((a, d) => a + d.added.length, 0);
+    const diffSummary = hunks.every((h) => !h.oldText) ? (existed ? `覆盖文件 (+${newLines} 行)` : `新建文件 (+${newLines} 行)`) : `${hunks.length > 1 ? `共 ${hunks.length} 处修改 · ` : ""}替换内容 (-${oldLines} 行 / +${newLines} 行)`;
+    lines.push(`│ 📘 目标文件: ${rel} (${diffSummary})`);
+    for (let i = 0; i < Math.min(diffs.length, maxHunks); i++) {
+      const d = diffs[i]!;
+      if (diffs.length > 1) lines.push(`│   \x1b[90m@@ 修改点 #${i + 1} (-${d.removed.length} / +${d.added.length} 行) @@\x1b[0m`);
+      for (const l of d.removed.slice(0, maxLines)) lines.push(`│   \x1b[31m- ${truncateVisualCols(l, maxCols)}\x1b[0m`);
+      if (d.removed.length > maxLines) lines.push(`│   \x1b[90m  ... (此段其余 ${d.removed.length - maxLines} 行删除已折叠，输入 d 展开)\x1b[0m`);
+      for (const l of d.added.slice(0, maxLines)) lines.push(`│   \x1b[32m+ ${truncateVisualCols(l, maxCols)}\x1b[0m`);
+      if (d.added.length > maxLines) lines.push(`│   \x1b[90m  ... (此段其余 ${d.added.length - maxLines} 行新增已折叠，输入 d 展开)\x1b[0m`);
+    }
+    if (diffs.length > maxHunks) lines.push(`│   \x1b[90m... (其余 ${diffs.length - maxHunks} 处修改已折叠，输入 d 展开全部 ${diffs.length} 处详情)\x1b[0m`);
+  }
+  for (const c of toolCalls) {
+    if (c.name === "edit_file") continue;
+    const args = (c.arguments ?? {}) as Record<string, unknown>;
+    if (c.name === "run_bash") {
+      const parts = cleanDisplayBash(String(args.command ?? ""), workspaceRoot), maxBash = expandAll ? 100 : 6;
+      if (parts.length === 1 && getVisualCols(parts[0]!) <= 58) lines.push(`│ 💻 待执行命令: ${parts[0]}`);
+      else {
+        lines.push(`│ 💻 待执行命令 (共 ${parts.length} 步):`);
+        for (const p of parts.slice(0, maxBash)) lines.push(`│   $ ${truncateVisualCols(p, maxCols)}`);
+        if (parts.length > maxBash) lines.push(`│   \x1b[90m... (其余 ${parts.length - maxBash} 步已折叠，输入 d 展开)\x1b[0m`);
       }
-      const tokens = core.split(/\s+/);
-      const first = tokens[0] ?? "";
-      if (!first || first.includes("/") || first === '"__STR__"' || first === '"__LOCAL_URL__"' || first === '"__SED_UNSAFE__"') return false;
-      if (first === "sed" && (core.includes('"__SED_UNSAFE__"') || tokens.find((t, i) => i > 0 && !t.startsWith("-")) !== '"__STR__"')) return false;
-      if (first === "curl") {
-        const curlPos = core.slice(4).replace(/\s+(?:-(?:w|H|A|e|m)|--(?:write-out|header|user-agent|referer|max-time|connect-timeout|retry))\s+(?:"__(?:STR|LOCAL_URL)__"|\S+)/g, "").trim().split(/\s+/).filter((t) => t && !t.startsWith("-"));
-        if (curlPos.length === 0 || curlPos.some((t) => !/^(?:"__LOCAL_URL__"|https?:\/\/(?:127\.0\.0\.1|localhost)(?::\d+)?(?:\/.*)?)$/.test(t))) return false;
-      }
-      if ((first === "uniq" || first === "xxd") && tokens.slice(1).filter((t) => !t.startsWith("-")).length > 1) return false;
-      if (/^env$/.test(core) || SAFE_READONLY_VERBS_RE.test(core) || GIT_READONLY_SUBCMD_RE.test(core) || RUNTIME_VERSION_RE.test(core)) {
-        hasReadVerb = true;
-        return true;
-      }
-      return false;
-    }) && hasReadVerb
-  );
+    } else lines.push(`│ 🔧 待执行操作: ${c.name} (${shortenWorkspaceText(String(args.path ?? ""), workspaceRoot)})`);
+  }
+  return lines.join("\n");
 }
 
 export function formatToolResultLine(result: ToolResultMessage): string {
@@ -165,29 +197,6 @@ export function formatToolResultLine(result: ToolResultMessage): string {
   return `     ↳ 完成 (${result.name} · 共 ${lineCount} 行)`;
 }
 
-export interface TurnMetricsSummary {
-  activeModel: string; turnCostCny: number; sessionCostCny: number; totalCostCny: number; cacheHitRatePct: number;
-}
-
-export function computeTurnMetrics(wireLogFile: string, stepsUsed: number, isReplay = false): TurnMetricsSummary | null {
-  try {
-    if (!fs.existsSync(wireLogFile)) return null;
-    const entries = JSON.parse(fs.readFileSync(wireLogFile, "utf-8")) as HttpWireLogEntry[];
-    const s = Array.isArray(entries) && entries.length > 0 ? summarizeWireCost(entries, { isReplay }) : null;
-    if (!s || s.rounds.length === 0) return null;
-    let startIdx = 0;
-    for (let i = entries.length - 1; i >= 0; i--) {
-      const msgs = (entries[i]?.requestBody as { messages?: { role?: string }[] } | undefined)?.messages;
-      if (Array.isArray(msgs) && !msgs.some((m) => m.role === "assistant")) { startIdx = i; break; }
-    }
-    const sSession = startIdx > 0 ? summarizeWireCost(entries.slice(startIdx), { isReplay }) : s;
-    const sessionRounds = sSession.rounds.length > 0 ? sSession.rounds : s.rounds;
-    const turnRounds = sessionRounds.slice(-Math.max(1, (stepsUsed ?? 0) + 1));
-    const turnIn = turnRounds.reduce((acc, r) => acc + r.promptTokens, 0), turnHit = turnRounds.reduce((acc, r) => acc + r.cacheHitTokens, 0);
-    return { activeModel: turnRounds[turnRounds.length - 1]?.model || "unknown", turnCostCny: turnRounds.reduce((a, r) => a + r.costCny, 0), sessionCostCny: sessionRounds.reduce((a, r) => a + r.costCny, 0), totalCostCny: s.totalCostCny, cacheHitRatePct: turnIn > 0 ? (turnHit / turnIn) * 100 : s.overallCacheRatePct };
-  } catch { return null; }
-}
-
 export function formatDurationMs(ms?: number): string {
   if (ms === undefined || ms < 0) return "";
   if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
@@ -195,16 +204,39 @@ export function formatDurationMs(ms?: number): string {
   return `${Math.floor(totalSec / 60)}m${totalSec % 60}s`;
 }
 
-export function formatCompactTurnFooter(wireLogFile: string, stepsUsed: number, isReplay = false, turnSnapshots: readonly { path: string; beforeContent: string | null; afterContent: string; hunkCount?: number }[] = [], workspaceRoot?: string, elapsedMs?: number): string {
+export function formatCompactTurnFooter(
+  wireLogFile: string,
+  stepsUsed: number,
+  isReplay = false,
+  turnSnapshots: readonly { path: string; beforeContent: string | null; afterContent: string; hunkCount?: number }[] = [],
+  workspaceRoot?: string,
+  elapsedMs?: number,
+): string {
   const diffs = summarizeSnapshotsDiff(turnSnapshots, workspaceRoot);
-  const totalAdd = diffs.reduce((a, d) => a + d.addedLines, 0), totalRem = diffs.reduce((a, d) => a + d.removedLines, 0);
-  const modLines = diffs.length > 0 ? [`\n📋 [本轮共修改 ${diffs.length} 个文件 (\x1b[32m+${totalAdd}\x1b[0m / \x1b[31m-${totalRem}\x1b[0m 行) · 输入 /diff 查看代码对比 | 输入 /undo 撤回修改]:`, ...diffs.map((d) => {
-    const previewLink = workspaceRoot && /\.(?:html?|svg)$/i.test(d.file) ? ` · 🌐 ${pathToFileURL(path.resolve(workspaceRoot, d.file)).href}` : "";
-    return `  ✏️  ${d.file} (${d.isNew ? `新建 \x1b[32m+${d.newLines}\x1b[0m 行` : `\x1b[32m+${d.addedLines}\x1b[0m / \x1b[31m-${d.removedLines}\x1b[0m 行 · ${d.edits} 处修改 (${d.oldLines} -> ${d.newLines} 行)`})${previewLink}`;
-  })] : [];
+  const totalAdd = diffs.reduce((a, d) => a + d.addedLines, 0);
+  const totalRem = diffs.reduce((a, d) => a + d.removedLines, 0);
+  const modLines =
+    diffs.length > 0
+      ? [
+          `\n📋 [本轮共修改 ${diffs.length} 个文件 (\x1b[32m+${totalAdd}\x1b[0m / \x1b[31m-${totalRem}\x1b[0m 行) · 输入 /diff 查看代码对比 | 输入 /open 打开文件 | 输入 /undo 撤回修改]:`,
+          ...diffs.map((d) => {
+            const fullClickable = workspaceRoot ? formatClickablePath(d.file, workspaceRoot) : d.file;
+            const summary = d.isNew
+              ? `新建 \x1b[32m+${d.newLines}\x1b[0m 行`
+              : `\x1b[32m+${d.addedLines}\x1b[0m / \x1b[31m-${d.removedLines}\x1b[0m 行 · ${d.edits} 处修改 (${d.oldLines} -> ${d.newLines} 行)`;
+            return `  ✏️  ${fullClickable} (${summary})`;
+          }),
+        ]
+      : [];
   const modPrefix = modLines.length > 0 ? `${modLines.join("\n")}\n` : "\n";
   const durTag = elapsedMs !== undefined ? ` · ⏱️ ${formatDurationMs(elapsedMs)}` : "";
   const m = computeTurnMetrics(wireLogFile, stepsUsed, isReplay);
-  const costStr = m ? (m.totalCostCny > m.sessionCostCny + 0.00005 ? `本轮 ¥${m.turnCostCny.toFixed(4)} / 当前对话 ¥${m.sessionCostCny.toFixed(4)} (项目总计 ¥${m.totalCostCny.toFixed(4)})` : `本轮 ¥${m.turnCostCny.toFixed(4)} / 当前对话 ¥${m.sessionCostCny.toFixed(4)}`) : "";
-  return m ? `${modPrefix}✅ 本轮完成 (🤖 ${m.activeModel}${durTag} · 共 ${stepsUsed} 步 · 💰 ${costStr} · 缓存命中 ${m.cacheHitRatePct.toFixed(0)}% · 输入 /xray 查账单)` : `${modPrefix}✅ 本轮完成 (${durTag ? `⏱️ ${formatDurationMs(elapsedMs)} · ` : ""}共 ${stepsUsed} 步)`;
+  if (!m) return `${modPrefix}✅ 本轮完成 (${durTag ? `⏱️ ${formatDurationMs(elapsedMs)} · ` : ""}共 ${stepsUsed} 步)`;
+  const costStr =
+    m.totalCostCny > m.sessionCostCny + 0.00005
+      ? `本轮 ¥${m.turnCostCny.toFixed(4)} / 当前对话 ¥${m.sessionCostCny.toFixed(4)} (项目总计 ¥${m.totalCostCny.toFixed(4)})`
+      : `本轮 ¥${m.turnCostCny.toFixed(4)} / 当前对话 ¥${m.sessionCostCny.toFixed(4)}`;
+  const ctxTag = m.contextTokens > 0 ? `🧠 ${(m.contextTokens / 1000).toFixed(1)}k词 · ` : "";
+  const trajTag = stepsUsed > 0 && m.stepCacheTrajectory ? ` [${m.stepCacheTrajectory}]` : "";
+  return `${modPrefix}✅ 本轮完成 (🤖 ${m.activeModel}${durTag} · 共 ${stepsUsed} 步 · 💰 ${costStr} · ${ctxTag}⚡缓存命中 ${m.cacheHitRatePct.toFixed(0)}%${trajTag} · 输入 /xray 查账单)`;
 }

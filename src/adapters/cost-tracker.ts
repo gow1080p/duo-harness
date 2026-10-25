@@ -1,42 +1,31 @@
 import * as fs from "node:fs";
-import type { HttpWireLogEntry } from "./sse-stream.js";
+import type { AssistantMessage } from "../core/contracts.js";
+import { padCols, truncateCols } from "./platform.js";
+
+export { padCols, truncateCols };
+
+export interface HttpWireLogEntry {
+  roundTimestamp: string;
+  apiUrl: string;
+  requestBody: Record<string, unknown>;
+  rawSseLines: string[];
+  assembledMessage: AssistantMessage;
+}
 
 export interface RoundCostMetric {
-  round: number;
-  model: string;
-  messageCount: number;
-  promptTokens: number;
-  cacheHitTokens: number;
-  cacheMissTokens: number;
-  completionTokens: number;
-  reasoningTokens: number;
-  expectedPrefixTokens: number;
-  billCacheRatePct: number;
-  prefixRetentionPct: number | null;
-  diagnosis: string;
-  costCny: number;
-  savedCny: number;
+  round: number; model: string; messageCount: number; promptTokens: number; cacheHitTokens: number;
+  cacheMissTokens: number; completionTokens: number; reasoningTokens: number; expectedPrefixTokens: number;
+  billCacheRatePct: number; prefixRetentionPct: number | null; diagnosis: string; costCny: number; savedCny: number;
 }
 
 export interface SessionCostSummary {
-  isReplay: boolean;
-  periodLabel: string;
-  rounds: RoundCostMetric[];
-  totalPromptTokens: number;
-  totalCacheHitTokens: number;
-  totalCompletionTokens: number;
-  totalReasoningTokens: number;
-  overallCacheRatePct: number;
-  totalCostCny: number;
-  totalSavedCny: number;
+  isReplay: boolean; periodLabel: string; rounds: RoundCostMetric[]; totalPromptTokens: number;
+  totalCacheHitTokens: number; totalCompletionTokens: number; totalReasoningTokens: number;
+  overallCacheRatePct: number; totalCostCny: number; totalSavedCny: number;
 }
 
 interface UnitRates {
-  inMissPerM: number;
-  cacheHitPerM: number;
-  outPerM: number;
-  minCacheTokens: number;
-  periodLabel: string;
+  inMissPerM: number; cacheHitPerM: number; outPerM: number; minCacheTokens: number; periodLabel: string;
 }
 
 export function extractUsageFromSseLines(
@@ -186,23 +175,39 @@ export function summarizeWireCost(
   };
 }
 
-export function truncateCols(str: string, maxCols: number): string {
-  let width = 0;
-  let out = "";
-  for (const ch of str) {
-    const w = (ch.codePointAt(0) ?? 0) > 0xff ? 2 : 1;
-    if (width + w > maxCols) return `${out}..`;
-    out += ch;
-    width += w;
-  }
-  return out;
+export interface TurnMetricsSummary {
+  activeModel: string; turnCostCny: number; sessionCostCny: number; totalCostCny: number;
+  cacheHitRatePct: number; contextTokens: number; stepCacheTrajectory: string;
 }
 
-export function padCols(str: string, targetCols: number, align: "left" | "right" = "left"): string {
-  let width = 0;
-  for (const ch of str) width += (ch.codePointAt(0) ?? 0) > 0xff ? 2 : 1;
-  const pad = Math.max(0, targetCols - width);
-  return align === "right" ? " ".repeat(pad) + str : str + " ".repeat(pad);
+export function computeTurnMetrics(wireLogFile: string, stepsUsed: number, isReplay = false): TurnMetricsSummary | null {
+  try {
+    if (!fs.existsSync(wireLogFile)) return null;
+    const entries = JSON.parse(fs.readFileSync(wireLogFile, "utf-8")) as HttpWireLogEntry[];
+    const s = Array.isArray(entries) && entries.length > 0 ? summarizeWireCost(entries, { isReplay }) : null;
+    if (!s || s.rounds.length === 0) return null;
+    let startIdx = 0;
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const msgs = (entries[i]?.requestBody as { messages?: { role?: string }[] } | undefined)?.messages;
+      if (Array.isArray(msgs) && !msgs.some((m) => m.role === "assistant")) { startIdx = i; break; }
+    }
+    const sSession = startIdx > 0 ? summarizeWireCost(entries.slice(startIdx), { isReplay }) : s;
+    const sessionRounds = sSession.rounds.length > 0 ? sSession.rounds : s.rounds;
+    const turnRounds = sessionRounds.slice(-Math.max(1, (stepsUsed ?? 0) + 1));
+    const turnIn = turnRounds.reduce((acc, r) => acc + r.promptTokens, 0);
+    const turnHit = turnRounds.reduce((acc, r) => acc + r.cacheHitTokens, 0);
+    const lastRound = turnRounds[turnRounds.length - 1];
+    const stepCacheTrajectory = turnRounds.map((r) => `#${r.round}(${r.billCacheRatePct.toFixed(0)}%)`).join("→");
+    return {
+      activeModel: lastRound?.model || "unknown",
+      turnCostCny: turnRounds.reduce((a, r) => a + r.costCny, 0),
+      sessionCostCny: sessionRounds.reduce((a, r) => a + r.costCny, 0),
+      totalCostCny: s.totalCostCny,
+      cacheHitRatePct: turnIn > 0 ? (turnHit / turnIn) * 100 : s.overallCacheRatePct,
+      contextTokens: lastRound?.promptTokens ?? 0,
+      stepCacheTrajectory,
+    };
+  } catch { return null; }
 }
 
 export function formatCostReport(summary: SessionCostSummary): string {
@@ -229,15 +234,10 @@ export function formatCostReport(summary: SessionCostSummary): string {
   return lines.join("\n");
 }
 
-export function loadAndFormatWireCost(
-  wireLogFile = ".sessions/http-wire.json",
-  options: { isReplay?: boolean } = {},
-): string {
+export function loadAndFormatWireCost(wireLogFile = ".sessions/http-wire.json", options: { isReplay?: boolean } = {}): string {
   try {
     if (!fs.existsSync(wireLogFile)) return "";
     const entries = JSON.parse(fs.readFileSync(wireLogFile, "utf-8")) as HttpWireLogEntry[];
     return Array.isArray(entries) && entries.length > 0 ? formatCostReport(summarizeWireCost(entries, options)) : "";
-  } catch {
-    return "";
-  }
+  } catch { return ""; }
 }

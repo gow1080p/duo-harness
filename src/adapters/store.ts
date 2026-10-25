@@ -1,3 +1,4 @@
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
@@ -8,6 +9,7 @@ import {
   type SessionEntry,
 } from "../core/contracts.js";
 import { assertSessionInvariant, projectToMessages } from "../core/session-tree.js";
+import type { HttpWireLogEntry } from "./cost-tracker.js";
 
 export function writeFileAtomicSync(filePath: string, content: string): void {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -95,5 +97,72 @@ export function createReplayProvider(
       cursor += 1;
       return reply;
     },
+  };
+}
+
+function digestWireText(raw: unknown, maxLen = 160): unknown {
+  if (typeof raw !== "string" || raw.length <= maxLen || /\.\.\.\[len=\d+,sha1=[0-9a-f]{10}\]$/.test(raw)) return raw;
+  const sha1 = crypto.createHash("sha1").update(raw).digest("hex").slice(0, 10);
+  const head = raw.includes("[已折叠历史") && !raw.slice(0, 60).includes("[已折叠历史") ? `${raw.slice(0, 42)}[已折叠历史...]` : raw.slice(0, 60);
+  return `${head}...[len=${raw.length},sha1=${sha1}]`;
+}
+
+function compactWireMessage(msg: Record<string, any>): Record<string, any> {
+  if (!msg || typeof msg !== "object") return msg;
+  const out: Record<string, any> = { ...msg };
+  if (typeof out.content === "string") out.content = digestWireText(out.content, 160);
+  else if (Array.isArray(out.content)) {
+    out.content = out.content.map((p: any) =>
+      p?.type === "text"
+        ? { ...p, text: digestWireText(p.text, 160) }
+        : p?.type === "image_url" && p?.image_url?.url
+          ? { ...p, image_url: { ...p.image_url, url: digestWireText(p.image_url.url, 80) } }
+          : p,
+    );
+  }
+  if (typeof out.reasoning_content === "string") out.reasoning_content = digestWireText(out.reasoning_content, 120);
+  if (typeof out.reasoningContent === "string") out.reasoningContent = digestWireText(out.reasoningContent, 120);
+  if (Array.isArray(out.tool_calls)) {
+    out.tool_calls = out.tool_calls.map((tc: any) =>
+      tc?.function ? { ...tc, function: { ...tc.function, arguments: digestWireText(tc.function.arguments, 160) } } : tc,
+    );
+  }
+  if (Array.isArray(out.toolCalls)) {
+    out.toolCalls = out.toolCalls.map((tc: any) => {
+      if (!tc || typeof tc.arguments !== "object" || !tc.arguments) return tc;
+      const args: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(tc.arguments)) {
+        args[k] =
+          k === "pattern" || k === "path" || k === "command"
+            ? digestWireText(v, 160)
+            : typeof v === "string"
+              ? digestWireText(v, 120)
+              : digestWireText(JSON.stringify(v), 120);
+      }
+      return { ...tc, arguments: args };
+    });
+  }
+  return out;
+}
+
+export function compactWireLogEntry(entry: HttpWireLogEntry): HttpWireLogEntry {
+  const { tools: _tools, ...restBody } = (entry.requestBody ?? {}) as Record<string, any>;
+  const messages = Array.isArray(restBody.messages) ? restBody.messages.map(compactWireMessage) : restBody.messages;
+  const rawLines = entry.rawSseLines ?? [];
+  const usageLines = rawLines
+    .filter((l) => l.includes('"prompt_tokens"'))
+    .map((l) => {
+      if (!l.startsWith("[非流式 JSON 响应]")) return l;
+      try {
+        const parsed = JSON.parse(l.replace("[非流式 JSON 响应]", "").trim());
+        return `[非流式 JSON 响应] ${JSON.stringify({ model: parsed.model, usage: parsed.usage })}`;
+      } catch { return l; }
+    });
+  const fallbackLines = rawLines.filter((l) => l.trim() && !l.includes("[DONE]")).slice(-1);
+  return {
+    ...entry,
+    requestBody: { ...restBody, ...(messages !== undefined ? { messages } : {}) },
+    rawSseLines: usageLines.length > 0 ? usageLines.slice(-2) : fallbackLines,
+    assembledMessage: compactWireMessage(entry.assembledMessage as Record<string, any>) as AssistantMessage,
   };
 }

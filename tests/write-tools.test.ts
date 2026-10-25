@@ -554,13 +554,15 @@ describe("Stage 3: 写工具 (edit_file/run_bash/rollback_version)、暂停审�
     expect(boxText).toContain("@@ 修改点 #2");
 
     // 验证只读 tsc --noEmit 自动放行，而会写 .tsbuildinfo 的 tsc -b 必须走写审批；cleanDisplayBash 自动过滤末尾 echo exit
-    const { cleanDisplayBash, formatCompactTurnFooter, formatDurationMs, formatToolResultLine } = await import("../src/adapters/ui-logger.js");
+    const { cleanDisplayBash, formatCompactTurnFooter, formatDurationMs, formatToolResultLine, getVisualCols } = await import("../src/adapters/ui-logger.js");
     expect(formatDurationMs(12_400)).toBe("12.4s");
     expect(formatDurationMs(278_000)).toBe("4m38s");
     const htmlFooter = formatCompactTurnFooter(".sessions/non-existent.json", 4, false, [{ path: "van-gogh-pelican.html", beforeContent: null, afterContent: "<html></html>" }], process.cwd(), 278_000);
     expect(htmlFooter).toContain("⏱️ 4m38s");
-    expect(htmlFooter).toContain("🌐 file:///");
-    expect(htmlFooter).toContain("van-gogh-pelican.html");
+    expect(htmlFooter).toContain("输入 /open 打开文件");
+    expect(htmlFooter).not.toContain("\x1b]8;;");
+    expect(htmlFooter).toContain(`${toPosixPath(process.cwd())}/van-gogh-pelican.html`);
+    expect(getVisualCols("\x1b[32mb.html\x1b[0m")).toBe(6);
     if (process.platform === "win32") {
       const cmdRes = await runCommandInSandbox('cmd.exe /c echo msys_ok', process.cwd(), 5_000, undefined, true);
       expect(cmdRes.output.trim()).toBe("msys_ok");
@@ -626,6 +628,15 @@ describe("Stage 3: 写工具 (edit_file/run_bash/rollback_version)、暂停审�
     const undoOk = await ctrl.undo("turn");
     expect(undoOk.rolledBackCount).toBe(1);
     expect(fs.readFileSync(path.join(tmpWs, "index.html"), "utf-8")).toContain("<title>旧标题</title>");
+    const redoInvalid = await ctrl.redo("invalid_arg");
+    expect(redoInvalid.redoneCount).toBe(0);
+    const redoOk = await ctrl.redo("turn");
+    expect(redoOk.redoneCount).toBe(1);
+    expect(redoOk.totalVersions).toBe(1);
+    expect(redoOk.remainingRedoBatches).toBe(0);
+    expect(fs.readFileSync(path.join(tmpWs, "index.html"), "utf-8")).toContain("<title>新标题</title>");
+    await ctrl.undo("turn");
+    expect(fs.readFileSync(path.join(tmpWs, "index.html"), "utf-8")).toContain("<title>旧标题</title>");
 
     // 验证半途断电/进程强退时：第 1 步刚改完文件（第 2 步还没开始）磁盘 snapshots.json 已实时原子落盘，重启新 Controller 后可立即 /diff 与 /undo
     let snapshotsFlushedMidTurn = 0;
@@ -688,5 +699,133 @@ describe("Stage 3: 写工具 (edit_file/run_bash/rollback_version)、暂停审�
 
     fs.rmSync(tmpWs, { recursive: true, force: true });
     fs.rmSync(tmpHome, { recursive: true, force: true });
+  });
+
+  it("6. 三级沙箱与提权闭环：子进程环境变量脱敏、主目录隐私/printenv 硬拦截、跨目录显式提权与会话重置", async () => {
+    const { isReadonlyBashCommand } = await import("../src/adapters/ui-logger.js");
+    const { analyzeBashSandbox, createSandboxGrants, sanitizeSubprocessEnv } = await import("../src/adapters/sandbox-policy.js");
+
+    // 1. 子进程敏感环境变量脱敏
+    const scrubbed = sanitizeSubprocessEnv({
+      PATH: "/usr/bin",
+      HOME: "/Users/test",
+      MIMO_API_KEY: "sk-mimo-secret",
+      DEEPSEEK_API_KEY: "sk-ds-secret",
+      OPENAI_API_KEY: "sk-oa-secret",
+      ANTIGRAVITY_CSRF_TOKEN: "csrf-123",
+      CUSTOM_SECRET_TOKEN: "tok-999",
+    });
+    expect(scrubbed.PATH).toBe("/usr/bin");
+    expect(scrubbed.MIMO_API_KEY).toBeUndefined();
+    expect(scrubbed.DEEPSEEK_API_KEY).toBeUndefined();
+    expect(scrubbed.OPENAI_API_KEY).toBeUndefined();
+    expect(scrubbed.ANTIGRAVITY_CSRF_TOKEN).toBeUndefined();
+    expect(scrubbed.CUSTOM_SECRET_TOKEN).toBeUndefined();
+
+    // 2. 只读判定与 Hard Deny 拦截
+    expect(isReadonlyBashCommand("printenv", true)).toBe(false);
+    expect(isReadonlyBashCommand("env", true)).toBe(false);
+    expect(isReadonlyBashCommand("printenv PATH", true)).toBe(true);
+    expect(isReadonlyBashCommand("ls -a ~", true)).toBe(false);
+    expect(isReadonlyBashCommand("cat ~/.claude.json", true)).toBe(false);
+    expect(isReadonlyBashCommand("cat ~/.codex/config.toml", true)).toBe(false);
+    expect(isReadonlyBashCommand("cat ./../../.claude.json", true)).toBe(false);
+    expect(isReadonlyBashCommand("cd ~ && ls -la", true)).toBe(false);
+
+    const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "duo-sandbox-tier-"));
+    const wsA = path.join(tmpBase, "project-a");
+    const wsSibling = path.join(tmpBase, "shared-lib");
+    fs.mkdirSync(wsA, { recursive: true });
+    fs.mkdirSync(wsSibling, { recursive: true });
+    fs.writeFileSync(path.join(wsSibling, "config.json"), '{"port":8080}\n', "utf-8");
+
+    expect(analyzeBashSandbox("printenv ; ls -a ~", wsA).tier).toBe("deny");
+    expect(analyzeBashSandbox("cat ~/.claude.json", wsA).tier).toBe("deny");
+    expect(analyzeBashSandbox("cat ./../../other-dir/secret.txt", wsA).tier).toBe("ask_escalated");
+    expect(analyzeBashSandbox(`cat "${path.join(wsSibling, "config.json")}"`, wsA).tier).toBe("ask_escalated");
+
+    // 验证即使用户信任了 $HOME 父级，checkHardDeniedPath 依然锁死 ~/.claude.json
+    const { toGrantDir } = await import("../src/adapters/sandbox-policy.js");
+    expect(toGrantDir(path.join(os.homedir(), "notes.txt"))).toBe(path.join(os.homedir(), "notes.txt"));
+    const testGrants = createSandboxGrants();
+    testGrants.trustedReadDirs.add(os.homedir());
+    expect(() => resolveSafePath(wsA, "~/.claude.json", "read", testGrants)).toThrow(/禁止访问/);
+
+    // 验证跨目录单次授权 (onceAllowedPaths) 编辑外部文件并在结束后清空单次授权时，/undo 与 /redo 仍可正常回滚恢复该外部快照
+    const { rollbackFileSnapshots, redoFileSnapshots } = await import("../src/adapters/write-tools.js");
+    const extSnaps: any[] = [];
+    const extRedoBatches: any[][] = [];
+    const onceGrants = createSandboxGrants();
+    const extTarget = path.join(wsSibling, "config.json");
+    onceGrants.onceAllowedPaths.add(fs.realpathSync(extTarget));
+    const [editExtTool] = createWriteTools(wsA, extSnaps, undefined, undefined, onceGrants);
+    await editExtTool!.execute({ path: "../shared-lib/config.json", oldText: "8080", newText: "9090" });
+    onceGrants.onceAllowedPaths.clear(); // 模拟单轮结束清空单次授权
+    expect(fs.readFileSync(extTarget, "utf-8")).toContain("9090");
+    await rollbackFileSnapshots(wsA, extSnaps, 1, undefined, extRedoBatches);
+    expect(fs.readFileSync(extTarget, "utf-8")).toContain("8080");
+    redoFileSnapshots(wsA, extSnaps, extRedoBatches, 1);
+    expect(fs.readFileSync(extTarget, "utf-8")).toContain("9090");
+    await rollbackFileSnapshots(wsA, extSnaps, 1);
+
+    // 3. Agent 会话中：Hard Deny 0 弹窗拦截 + 跨目录 read_file 触发 ask_escalated 提权并支持 trustDirectory 会话级信任
+    const grants = createSandboxGrants();
+    let approvalCalls = 0;
+    let lastEscalated = false;
+    const replies: AssistantMessage[] = [
+      {
+        role: "assistant",
+        content: "先尝试偷看环境变量和主目录",
+        toolCalls: [{ id: "c_deny_1", name: "run_bash", arguments: { command: "printenv ; ls -a ~" } }],
+      },
+      {
+        role: "assistant",
+        content: "申请读取兄弟项目的 config.json",
+        toolCalls: [{ id: "c_esc_1", name: "read_file", arguments: { path: "../shared-lib/config.json" } }],
+      },
+      {
+        role: "assistant",
+        content: "再次读取已信任目录的 config.json（本次应免弹窗）",
+        toolCalls: [{ id: "c_esc_2", name: "read_file", arguments: { path: "../shared-lib/config.json" } }],
+      },
+      { role: "assistant", content: "已完成跨目录安全读取！" },
+    ];
+    let stepIdx = 0;
+    const seenMessages: any[][] = [];
+    const res = await runAgentSession("帮我连一下外部配置", {
+      workspaceRoot: wsA,
+      sandboxGrants: grants,
+      enableWriteTools: true,
+      suppressFinalEcho: true,
+      provider: {
+        async chat(msgs) {
+          seenMessages.push(msgs);
+          return replies[stepIdx++]!;
+        },
+      },
+      onApprovalRequest: (_calls, meta) => {
+        approvalCalls += 1;
+        lastEscalated = Boolean(meta?.hasEscalated);
+        return { approved: true, trustDirectory: true };
+      },
+    });
+
+    expect(res.finalAnswer).toBe("已完成跨目录安全读取！");
+    // 第 1 步 Hard Deny 直接静默拦截回传错误，未触发 onApprovalRequest；第 2 步触发 1 次提权；第 3 步因已信任目录免批通过
+    expect(approvalCalls).toBe(1);
+    expect(lastEscalated).toBe(true);
+    const denyToolMsg = seenMessages[1]?.find((m) => m.role === "tool" && m.toolCallId === "c_deny_1");
+    expect(denyToolMsg?.isError).toBe(true);
+    expect(denyToolMsg?.content).toContain("[沙箱安全拦截]");
+    const allowedToolMsg = seenMessages[3]?.find((m) => m.role === "tool" && m.toolCallId === "c_esc_2");
+    expect(allowedToolMsg?.isError).toBe(false);
+    expect(allowedToolMsg?.content).toContain('{"port":8080}');
+
+    // 4. 重置授权（如 /cd 或 /new）后，外部目录权限立即清空
+    grants.reset();
+    expect(grants.trustedReadDirs.size).toBe(0);
+    expect(() => resolveSafePath(wsA, "../shared-lib/config.json", "read", grants)).toThrow(/禁止访问/);
+
+    fs.rmSync(tmpBase, { recursive: true, force: true });
   });
 });

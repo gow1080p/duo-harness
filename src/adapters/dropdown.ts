@@ -1,8 +1,10 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { padCols, truncateCols } from "./cost-tracker.js";
+import { buildAtMentionDropdown } from "./context-mention.js";
 import { summarizeSnapshotsDiff } from "./diff-presenter.js";
+import { getVisualCols, padCols, truncateCols } from "./platform.js";
 import { extractConversationTurns, listManagedProjects, loadProjectSnapshots, resolveProjectSessionPaths, SLASH_COMMANDS } from "./project-store.js";
+import { buildSkillDropdownItems } from "./skill-loader.js";
 import { loadJsonlEntries } from "./store.js";
 
 export interface DropdownItem {
@@ -10,15 +12,48 @@ export interface DropdownItem {
   desc: string;
   fillText: string;
   expandOnly?: boolean;
+  cursorAfter?: number;
 }
 
 export function getPromptVisualCols(promptStr: string): number {
   const lastLine = promptStr.split("\n").pop() ?? "";
-  let cols = 0;
-  for (const ch of lastLine) {
-    cols += (ch.codePointAt(0) ?? 0) > 0xff ? 2 : 1;
+  return getVisualCols(lastLine);
+}
+
+function buildDiffOrOpenDropdown(line: string, currentWorkspaceRoot: string, homeBaseDir?: string): DropdownItem[] {
+  const isDiff = line.startsWith("/diff ");
+  const cmdPrefix = line.startsWith("/shot ") ? "/shot" : "/open";
+  const filter = line.slice(6).trim().toLowerCase();
+  const snaps = loadProjectSnapshots(resolveProjectSessionPaths(currentWorkspaceRoot, homeBaseDir).snapshotsFile);
+  const top = snaps[snaps.length - 1];
+  const files = summarizeSnapshotsDiff(top?.turnId ? snaps.filter((s) => s.turnId === top.turnId) : snaps, currentWorkspaceRoot, false);
+  if (isDiff) {
+    const items: DropdownItem[] = files.map((d, i) => ({
+      label: `/diff ${d.file}`,
+      desc: `[#${i + 1}] ${d.isNew ? `新建 +${d.newLines} 行` : `+${d.addedLines} / -${d.removedLines} 行 (${d.edits}处修改)`}`,
+      fillText: `/diff ${d.file}`,
+    }));
+    items.push(
+      { label: "/diff full", desc: "🔍 展开本轮全部修改代码行（不折叠长片段）", fillText: "/diff full" },
+      { label: "/diff all", desc: `📚 查看从第 1 版以来的累计对比 (共 ${snaps.length} 版)`, fillText: "/diff all" },
+    );
+    return items.filter((m) => !filter || m.label.toLowerCase().includes(filter) || m.desc.toLowerCase().includes(filter));
   }
-  return cols;
+  const seen = new Set<string>();
+  const items: DropdownItem[] = [];
+  for (const d of files) {
+    seen.add(d.file);
+    items.push({ label: `${cmdPrefix} ${d.file}`, desc: `🌐 ${cmdPrefix === "/shot" ? "无头截图预览" : "打开本轮修改文件"} (${d.file})`, fillText: `${cmdPrefix} ${d.file}` });
+  }
+  try {
+    for (const e of fs.readdirSync(currentWorkspaceRoot, { withFileTypes: true })) {
+      if (e.isFile() && !e.name.startsWith(".") && !seen.has(e.name)) {
+        items.push({ label: `${cmdPrefix} ${e.name}`, desc: `📄 ${cmdPrefix === "/shot" ? "截取网页/文件预览图" : "用系统默认应用打开"} ${e.name}`, fillText: `${cmdPrefix} ${e.name}` });
+      }
+    }
+  } catch {}
+  if (cmdPrefix === "/open") items.push({ label: "/open .", desc: `📂 在系统文件管理器中打开当前工作区 (${currentWorkspaceRoot})`, fillText: "/open ." });
+  return items.filter((m) => !filter || m.label.toLowerCase().includes(filter) || m.desc.toLowerCase().includes(filter)).slice(0, 8);
 }
 
 export function buildDropdownItems(
@@ -26,6 +61,7 @@ export function buildDropdownItems(
   currentWorkspaceRoot: string,
   homeBaseDir?: string,
   activeLeafId?: string | null,
+  cursor: number = line.length,
 ): DropdownItem[] {
   if (line.startsWith("/model ")) {
     const filter = line.slice(7).trim().toLowerCase();
@@ -51,30 +87,11 @@ export function buildDropdownItems(
         fillText: `/resume #${t.turnIndex}`,
         expandOnly: false,
       }));
-    items.push({
-      label: "/new",
-      desc: "✨ 开启全新空白对话 (保留旧对话记录，随时可 /resume 切回)",
-      fillText: "/new",
-      expandOnly: false,
-    });
+    items.push({ label: "/new", desc: "✨ 开启全新空白对话 (保留旧对话记录，随时可 /resume 切回)", fillText: "/new", expandOnly: false });
     return items;
   }
-  if (line.startsWith("/diff ")) {
-    const filter = line.slice(6).trim().toLowerCase();
-    const snaps = loadProjectSnapshots(resolveProjectSessionPaths(currentWorkspaceRoot, homeBaseDir).snapshotsFile);
-    const top = snaps[snaps.length - 1];
-    const files = summarizeSnapshotsDiff(top?.turnId ? snaps.filter((s) => s.turnId === top.turnId) : snaps, currentWorkspaceRoot, false);
-    const items: DropdownItem[] = files.map((d, i) => ({
-      label: `/diff ${d.file}`,
-      desc: `[#${i + 1}] ${d.isNew ? `新建 +${d.newLines} 行` : `+${d.addedLines} / -${d.removedLines} 行 (${d.edits}处修改)`}`,
-      fillText: `/diff ${d.file}`,
-    }));
-    items.push(
-      { label: "/diff full", desc: "🔍 展开本轮全部修改代码行（不折叠长片段）", fillText: "/diff full" },
-      { label: "/diff all", desc: `📚 查看从第 1 版以来的累计对比 (共 ${snaps.length} 版)`, fillText: "/diff all" },
-    );
-    return items.filter((m) => !filter || m.label.toLowerCase().includes(filter) || m.desc.toLowerCase().includes(filter));
-  }
+  if (line.startsWith("/diff ") || line.startsWith("/open ") || line.startsWith("/shot ")) return buildDiffOrOpenDropdown(line, currentWorkspaceRoot, homeBaseDir);
+  if (line.startsWith("/skill ") || line === "/skills") return buildSkillDropdownItems(line, currentWorkspaceRoot);
   if (line.startsWith("/cd ")) {
     const filter = line.slice(4).trim().toLowerCase();
     const sorted = [...listManagedProjects(homeBaseDir)].sort((a, b) => (a.workspaceRoot === currentWorkspaceRoot ? 1 : 0) - (b.workspaceRoot === currentWorkspaceRoot ? 1 : 0) || a.projectKey.localeCompare(b.projectKey));
@@ -94,7 +111,7 @@ export function buildDropdownItems(
       expandOnly: c.cmd.endsWith(" ") || c.cmd === "/projects",
     }));
   }
-  return [];
+  return buildAtMentionDropdown(line, cursor, currentWorkspaceRoot);
 }
 
 export function findMethodKey(rl: any, name: string): string | symbol | null {
@@ -111,7 +128,8 @@ export function findMethodKey(rl: any, name: string): string | symbol | null {
 
 function formatDropdownRows(items: DropdownItem[], selectedIdx: number, line: string): string {
   const maxCols = Math.max(60, (process.stdout.columns || 100) - 4);
-  const labelWidth = line.startsWith("/cd ") || line.startsWith("/diff ") ? 24 : line.startsWith("/resume ") ? 13 : 16;
+  const isWide = items[0]?.label.startsWith("@") || line.startsWith("/cd ") || line.startsWith("/diff ") || line.startsWith("/open ") || line.startsWith("/shot ") || line.startsWith("/skill");
+  const labelWidth = isWide ? 26 : line.startsWith("/resume ") ? 13 : 16;
   return items
     .map((item, idx) => {
       const active = idx === selectedIdx;
@@ -137,7 +155,9 @@ export function attachLiveSlashDropdown(
   const refreshLine = () => {
     if (refreshKey && typeof rl[refreshKey] === "function") rl[refreshKey]();
   };
-  let menuShown = false, selectedIdx = 0, lastLine = "";
+  let menuShown = false;
+  let selectedIdx = 0;
+  let lastLine = "";
 
   const clearMenu = (cursorCols: number) => {
     if (!menuShown) return;
@@ -150,8 +170,11 @@ export function attachLiveSlashDropdown(
     const line: string = typeof rl.line === "string" ? rl.line : "";
     const cursor: number = typeof rl.cursor === "number" ? rl.cursor : line.length;
     const cursorCols = getPromptCols() + getPromptVisualCols(line.slice(0, cursor));
-    if (line !== lastLine) { selectedIdx = 0; lastLine = line; }
-    const items = buildDropdownItems(line, getWorkspaceRoot(), homeBaseDir, getActiveLeafId?.());
+    if (line !== lastLine) {
+      selectedIdx = 0;
+      lastLine = line;
+    }
+    const items = buildDropdownItems(line, getWorkspaceRoot(), homeBaseDir, getActiveLeafId?.(), cursor);
     if (items.length === 0) return clearMenu(cursorCols);
     selectedIdx = Math.max(0, Math.min(selectedIdx, items.length - 1));
     const down = formatDropdownRows(items, selectedIdx, line);
@@ -162,7 +185,8 @@ export function attachLiveSlashDropdown(
   rl[ttyKey] = function (s: string, key?: { name?: string; ctrl?: boolean; meta?: boolean }) {
     if (!isActivePrompt()) return origTtyWrite(s, key);
     const line: string = typeof rl.line === "string" ? rl.line : "";
-    const items = menuShown ? buildDropdownItems(line, getWorkspaceRoot(), homeBaseDir, getActiveLeafId?.()) : [];
+    const cursor: number = typeof rl.cursor === "number" ? rl.cursor : line.length;
+    const items = menuShown ? buildDropdownItems(line, getWorkspaceRoot(), homeBaseDir, getActiveLeafId?.(), cursor) : [];
     if (items.length > 0 && (key?.name === "up" || key?.name === "down")) {
       selectedIdx = key.name === "down" ? (selectedIdx + 1) % items.length : (selectedIdx - 1 + items.length) % items.length;
       return renderMenu();
@@ -171,7 +195,7 @@ export function attachLiveSlashDropdown(
       const chosen = items[selectedIdx] ?? items[0]!;
       if (key.name === "tab" || key.name === "right" || chosen.expandOnly) {
         rl.line = chosen.fillText;
-        rl.cursor = rl.line.length;
+        rl.cursor = chosen.cursorAfter ?? rl.line.length;
         refreshLine();
         return renderMenu();
       }
@@ -189,5 +213,7 @@ export function attachLiveSlashDropdown(
     setImmediate(renderMenu);
   };
 
-  return () => { rl[ttyKey] = origTtyWrite; };
+  return () => {
+    rl[ttyKey] = origTtyWrite;
+  };
 }

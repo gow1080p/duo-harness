@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { buildBridgePrompt, evaluateAgyQuotaSurplus, parseBridgeReply, stripAgyFooter } from "../src/adapters/agy-bridge.js";
+import { checkFileSyntax } from "../src/adapters/bash-policy.js";
+import { buildAtMentionDropdown, expandAtMentions, runLocalBangCommand, stripAttachedFiles } from "../src/adapters/context-mention.js";
 import { summarizeWireCost } from "../src/adapters/cost-tracker.js";
+import { buildDropdownItems } from "../src/adapters/dropdown.js";
+import { extractConversationTurns } from "../src/adapters/project-store.js";
 import {
   parseOpenAiAssistantMessage,
   resolveActiveModelTarget,
@@ -9,6 +13,8 @@ import {
   zodObjectToJsonSchema,
 } from "../src/adapters/router.js";
 import { assembleSsePayloads, createStreamRenderer, formatMarkdownLine, readOpenAiSseStream } from "../src/adapters/sse-stream.js";
+import { compactWireLogEntry } from "../src/adapters/store.js";
+import { formatApprovalBox } from "../src/adapters/ui-logger.js";
 import { z } from "zod";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -138,6 +144,13 @@ describe("Step 1.4: src/adapters/router.ts 协议转换与分时路由测试", (
     expect(out).toContain("\x1b[36mmain.py\x1b[0m");
     expect(out).toContain("────────────────────────────────────────");
     expect(formatMarkdownLine("### 1. `.gitignore` 问题", false).text).toContain("▸ 1.");
+    const absPkg = path.resolve(process.cwd(), "package.json");
+    const mdInline = formatMarkdownLine(`页面是根目录下的 package.json（完整路径 ${absPkg}），或点 \`package.json\``, false).text;
+    expect(mdInline).not.toContain("\x1b]8;;");
+    expect(mdInline).toContain(absPkg);
+    const mdCode = formatMarkdownLine(absPkg, true).text;
+    expect(mdCode).not.toContain("\x1b]8;;");
+    expect(mdCode).toContain(absPkg);
 
     // 验证长思考 (>5行) 原地 5 行滚动预览 + 结束时自动收拢为 [已思考 N 字] 摘要
     const longReasonChunks: string[] = [];
@@ -252,5 +265,121 @@ describe("Step 1.4: src/adapters/router.ts 协议转换与分时路由测试", (
     });
     const stalledRes = new Response(stalledStream, { headers: { "content-type": "text/event-stream" } });
     await expect(readOpenAiSseStream(stalledRes, undefined, undefined, undefined, 35)).rejects.toThrow("SSE 流空闲超时");
+  });
+
+  it("10. @文件 句中实时补全、行区间内联注入、历史摘要剥离与 !命令 直跑测试", async () => {
+    const tmpWs = fs.mkdtempSync(path.join(os.tmpdir(), "duo-at-mention-"));
+    fs.mkdirSync(path.join(tmpWs, "src", "adapters"), { recursive: true });
+    fs.mkdirSync(path.join(tmpWs, "node_modules", "pkg"), { recursive: true });
+    fs.writeFileSync(path.join(tmpWs, "src", "adapters", "cli.ts"), "line1\nline2\nline3\nline4\nline5\n", "utf-8");
+    fs.writeFileSync(path.join(tmpWs, "node_modules", "pkg", "cli.ts"), "ignored\n", "utf-8");
+
+    // 1) 句中光标位置 (cursor=8) 触发 @cli 补全，自动忽略 node_modules，补尾随空格并返回精准 cursorAfter 防回车死锁
+    const midLine = "请对比 @cli 的实现";
+    const items = buildDropdownItems(midLine, tmpWs, undefined, null, 8);
+    expect(items.length).toBeGreaterThan(0);
+    expect(items[0]?.label).toBe("@src/adapters/cli.ts");
+    expect(items[0]?.fillText).toBe("请对比 @src/adapters/cli.ts 的实现");
+    expect(items[0]?.cursorAfter).toBe("请对比 @src/adapters/cli.ts ".length);
+    expect(items[0]?.expandOnly).toBe(true);
+    // 补全后光标位于尾随空格之后，再次渲染菜单不会重复匹配导致回车死锁
+    expect(buildAtMentionDropdown(items[0]!.fillText, items[0]!.cursorAfter!, tmpWs)).toHaveLength(0);
+
+    // 2) expandAtMentions 支持 @path:2-4 行区间切片且忽略邮箱 dev@example.com
+    const { expandedPrompt, attachedPaths } = expandAtMentions("发邮件给 dev@example.com 并检查 @src/adapters/cli.ts:2-4", tmpWs);
+    expect(attachedPaths).toEqual(["src/adapters/cli.ts"]);
+    expect(expandedPrompt).toContain('<attached_file path="src/adapters/cli.ts" lines="2-4">');
+    expect(expandedPrompt).toContain("2: line2\n3: line3\n4: line4");
+    expect(expandedPrompt).not.toContain("1: line1");
+
+    // 3) stripAttachedFiles 与 extractConversationTurns 剥除 <attached_file> 防历史摘要污染，且纯 @引用 有非空兜底
+    expect(stripAttachedFiles(expandedPrompt)).toBe("发邮件给 dev@example.com 并检查 @src/adapters/cli.ts:2-4");
+    expect(stripAttachedFiles('<attached_file path="src/adapters/cli.ts" lines="1-2">\n1: a\n</attached_file>')).toBe("[引用文件: @src/adapters/cli.ts]");
+    const turns = extractConversationTurns([
+      { id: "u1", parentId: null, timestamp: 1, message: { role: "user", content: expandedPrompt } },
+      { id: "a1", parentId: "u1", timestamp: 2, message: { role: "assistant", content: "已检查完毕" } },
+    ]);
+    expect(turns[0]?.userText).toBe("发邮件给 dev@example.com 并检查 @src/adapters/cli.ts:2-4");
+
+    // 4) !命令 空输入守卫与正常命令直跑
+    await runLocalBangCommand("!", tmpWs);
+    await runLocalBangCommand("!node -v", tmpWs);
+
+    fs.rmSync(tmpWs, { recursive: true, force: true });
+  });
+
+  it("11. Aider 式写后 0ms 语法自检 (checkFileSyntax) 与 Claude Code 式审批框按 d 展开测试", () => {
+    // 1) HTML 内联 <script> 精准抓出第 5 行多余 ); 语法错误，且行号完全对齐
+    const brokenHtml = ["<!doctype html>", "<html>", "<body>", "<script>", "  halo.addColorStop(1, 'rgba(255,170,90,0)'););", "</script>", "</body></html>"].join("\n");
+    const htmlErr = checkFileSyntax("van-gogh-pelican.html", brokenHtml);
+    expect(htmlErr).toContain("van-gogh-pelican.html:5");
+    expect(htmlErr).toContain("Unexpected token ')'");
+
+    // 2) 合法 ES Module (<script type="module">)、WebGL Shader 与带注释 tsconfig.json 零假阳性误报
+    const validEsmAndShader = [
+      '<script type="x-shader/x-vertex">attribute vec3 aPos; void main() { gl_Position = vec4(aPos, 1.0); }</script>',
+      '<script type="module">',
+      'import * as THREE from "three";',
+      "export const scene = new THREE.Scene();",
+      "</script>",
+    ].join("\n");
+    expect(checkFileSyntax("index.html", validEsmAndShader)).toBeNull();
+    expect(checkFileSyntax("tsconfig.json", '{\n  // 允许 JSONC 注释\n  "compilerOptions": {}\n}')).toBeNull();
+    expect(checkFileSyntax("dyn.mjs", 'import os from "node:os";\nexport function run() {\n  import("./heavy.js").then((m) => m.go());\n}')).toBeNull();
+    expect(checkFileSyntax("App.js", 'import React from "react";\nexport default function App() { return <h1>Hi</h1>; }')).toBeNull();
+
+    // 3) ES Module 内部若存在真实语法错误，掩码二次校验依然能精准捕获行号
+    const brokenEsm = ['import fs from "node:fs";', "export function test() {", "  const a = (1 + 2));", "}"].join("\n");
+    const esmErr = checkFileSyntax("app.mjs", brokenEsm);
+    expect(esmErr).toContain("app.mjs:3");
+
+    // 4) formatApprovalBox 汇总文件数/修改处数，且 expandAll=true 解开 4 处与 66 列折叠限制
+    const edits = Array.from({ length: 6 }, (_, i) => ({
+      oldText: `const line${i + 1} = "old_value_${i + 1}";`,
+      newText: `const line${i + 1} = "new_value_${i + 1}_with_a_very_long_tail_exceeding_66_columns_for_sure_1234567890";`,
+    }));
+    const calls = [{ id: "c1", name: "edit_file", arguments: { path: "demo.js", edits } }];
+    const foldedBox = formatApprovalBox(calls, process.cwd(), false);
+    expect(foldedBox).toContain("[待确认：本次申请修改文件 1 个 (共 6 处)]");
+    expect(foldedBox).toContain("其余 2 处修改已折叠，输入 d 展开全部 6 处详情");
+    expect(foldedBox).not.toContain("@@ 修改点 #6");
+
+    const expandedBox = formatApprovalBox(calls, process.cwd(), true);
+    expect(expandedBox).toContain("已展开全部明细");
+    expect(expandedBox).toContain("@@ 修改点 #6");
+    expect(expandedBox).toContain("exceeding_66_columns_for_sure_1234567890");
+
+    // 5) compactWireLogEntry 严格幂等且只保留含 prompt_tokens 的 usage 行，大幅压缩超长消息与 tool_calls 参数
+    const hugeCode = "x".repeat(5000);
+    const rawWire = {
+      roundTimestamp: "2026-10-25T02:00:00.000Z",
+      apiUrl: "https://api.deepseek.com/chat/completions",
+      requestBody: {
+        model: "deepseek-reasoner",
+        tools: [{ type: "function", function: { name: "edit_file" } }],
+        messages: [
+          { role: "user", content: hugeCode },
+          { role: "assistant", content: "ok", tool_calls: [{ id: "tc1", function: { name: "edit_file", arguments: hugeCode } }] },
+        ],
+      },
+      rawSseLines: [
+        'data: {"choices":[{"delta":{"content":"this line mentions usage word"}}]}',
+        'data: {"model":"deepseek-reasoner","usage":{"prompt_tokens":1200,"prompt_cache_hit_tokens":1000,"completion_tokens":80}}',
+        "data: [DONE]",
+      ],
+      assembledMessage: {
+        role: "assistant" as const,
+        content: hugeCode,
+        reasoningContent: hugeCode,
+        toolCalls: [{ id: "tc1", name: "edit_file", arguments: { path: "index.html", edits: hugeCode } }],
+      },
+    };
+    const once = compactWireLogEntry(rawWire);
+    const twice = compactWireLogEntry(once);
+    expect(JSON.stringify(twice)).toBe(JSON.stringify(once));
+    expect(once.rawSseLines).toHaveLength(1);
+    expect(once.requestBody.tools).toBeUndefined();
+    expect(JSON.stringify(once).length).toBeLessThan(1200);
+    expect(summarizeWireCost([once]).totalPromptTokens).toBe(1200);
   });
 });

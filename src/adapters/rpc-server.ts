@@ -17,7 +17,7 @@ const RpcRequestSchema = z.object({
 });
 
 const RpcCommandSchema = z.object({
-  action: z.enum(["status", "turns", "new", "resume", "model", "diff", "undo", "cd", "clear", "projects", "xray"]),
+  action: z.enum(["status", "turns", "new", "resume", "model", "diff", "undo", "redo", "cd", "clear", "compact", "projects", "xray"]),
   arg: z.string().optional(),
 });
 
@@ -119,11 +119,13 @@ async function handleCommandPost(req: http.IncomingMessage, res: http.ServerResp
     }
     if (action === "diff") return sendJson(res, 200, { ok: true, ...ctrl.getDiff(arg.trim() || "turn") });
     if (action === "undo") return sendJson(res, 200, { ok: true, ...(await ctrl.undo(arg.trim() || "turn")) });
+    if (action === "redo") return sendJson(res, 200, { ok: true, ...(await ctrl.redo(arg.trim() || "turn")) });
     if (action === "cd") {
       const sw = ctrl.switchWorkspace(arg.trim());
       return sendJson(res, sw.ok ? 200 : 400, sw);
     }
     if (action === "clear") return sendJson(res, 200, { ok: true, status: ctrl.clearHistory() });
+    if (action === "compact") return sendJson(res, 200, { ok: true, ...ctrl.compact() });
     if (action === "projects") return sendJson(res, 200, { ok: true, projects: listManagedProjects(options.homeBaseDir) });
     if (action === "xray") return sendJson(res, 200, { ok: true, ...ctrl.getXrayReport() });
   } catch (err) {

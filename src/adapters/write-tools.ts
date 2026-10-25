@@ -1,18 +1,21 @@
 import { spawn } from "node:child_process";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { z } from "zod";
 import type { ToolContract } from "../core/contracts.js";
+import { checkFileSyntax } from "./bash-policy.js";
 import { extractChangedHunk } from "./diff-presenter.js";
-import { killProcessGroup, resolvePosixShell, toPosixRelative } from "./platform.js";
+import { expandHomePath, killProcessGroup, resolvePosixShell, toPosixRelative } from "./platform.js";
 import { writeFileAtomicSync } from "./store.js";
-import { resolveSafePath } from "./tools.js";
+import { resolveSafePath, type SandboxGrants } from "./tools.js";
+import { analyzeBashSandbox, checkHardDeniedPath, resolveExistingRealPath } from "./sandbox-policy.js";
 import { isReadonlyBashCommand } from "./ui-logger.js";
 
 export { killProcessGroup };
 
 const SEATBELT_READONLY_PROFILE =
-  '(version 1)(allow default)(deny file-write*)(allow file-write* (literal "/dev/null") (literal "/private/dev/null") (subpath "/dev/fd"))(allow process-exec (literal "/bin/ps") (with no-sandbox))';
+  '(version 1)(allow default)(deny file-write*)(deny file-read* (regex #"^/Users/[^/]+/\\.(ssh|aws|gnupg|claude|codex|config|kube|docker|netrc|git-credentials|npmrc)"))(allow file-write* (literal "/dev/null") (literal "/private/dev/null") (subpath "/dev/fd"))(allow process-exec (literal "/bin/ps") (with no-sandbox))';
 
 const SingleEditItemSchema = z.object({ oldText: z.string(), newText: z.string() });
 const EditFileArgsSchema = z.object({
@@ -34,34 +37,47 @@ const RunBashArgsSchema = z.object({
 const RollbackVersionArgsSchema = z.object({ stepsBack: z.number().int().positive().max(100).default(1) });
 
 export interface FileVersionSnapshot {
-  version: number;
-  path: string;
-  beforeContent: string | null;
-  afterContent: string;
-  timestamp: number;
-  turnId?: string;
-  hunkCount?: number;
+  version: number; path: string; beforeContent: string | null; afterContent: string; timestamp: number; turnId?: string; hunkCount?: number;
 }
 
-/** 按逆序回滚最近 stepsBack 个文件版本快照（beforeContent 为 null 表示原本不存在，回滚时直接删除） */
-export async function rollbackFileSnapshots(
-  workspaceRoot: string,
-  snapshots: FileVersionSnapshot[],
-  stepsBack = 1,
-  onSnapshotChange?: () => void,
-): Promise<{ rolledBackCount: number; currentVersion: number; touchedPaths: string[] }> {
-  const count = Math.min(Math.max(0, stepsBack), snapshots.length);
-  const touchedPaths: string[] = [];
+export async function rollbackFileSnapshots(workspaceRoot: string, snapshots: FileVersionSnapshot[], stepsBack = 1, onSnapshotChange?: () => void, redoBatches?: FileVersionSnapshot[][]): Promise<{ rolledBackCount: number; currentVersion: number; touchedPaths: string[] }> {
+  const count = Math.min(Math.max(0, stepsBack), snapshots.length), touchedPaths: string[] = [], batch: FileVersionSnapshot[] = [];
+  if (count > 0 && redoBatches) redoBatches.push(batch);
+  const realRoot = resolveExistingRealPath(workspaceRoot);
   for (let i = 0; i < count; i++) {
     const snap = snapshots[snapshots.length - 1]!;
-    const fullPath = resolveSafePath(workspaceRoot, snap.path, "write");
+    const fullPath = resolveExistingRealPath(path.resolve(workspaceRoot, expandHomePath(snap.path)));
+    if (checkHardDeniedPath(fullPath, realRoot, "write")) throw new Error(`禁止回滚敏感路径: ${snap.path}`);
     if (snap.beforeContent === null) await fs.rm(fullPath, { force: true });
     else writeFileAtomicSync(fullPath, snap.beforeContent);
     snapshots.pop();
+    batch.unshift(snap);
     onSnapshotChange?.();
     touchedPaths.push(snap.path);
   }
   return { rolledBackCount: count, currentVersion: snapshots.length, touchedPaths };
+}
+
+export function redoFileSnapshots(workspaceRoot: string, snapshots: FileVersionSnapshot[], redoBatches: FileVersionSnapshot[][], batchesToRedo = 1, onSnapshotChange?: () => void) {
+  const count = Math.min(Math.max(0, batchesToRedo), redoBatches.length), touchedPaths: string[] = [];
+  let redoneCount = 0;
+  const realRoot = resolveExistingRealPath(workspaceRoot);
+  for (let i = 0; i < count; i++) {
+    const batch = redoBatches[redoBatches.length - 1]!;
+    while (batch.length > 0) {
+      const snap = batch[0]!;
+      const fullPath = resolveExistingRealPath(path.resolve(workspaceRoot, expandHomePath(snap.path)));
+      if (checkHardDeniedPath(fullPath, realRoot, "write")) throw new Error(`禁止重做敏感路径: ${snap.path}`);
+      writeFileAtomicSync(fullPath, snap.afterContent);
+      batch.shift();
+      snapshots.push({ ...snap, version: snapshots.length + 1 });
+      redoneCount++;
+      touchedPaths.push(snap.path);
+    }
+    redoBatches.pop();
+    onSnapshotChange?.();
+  }
+  return { redoneCount, totalVersions: snapshots.length, remainingRedoBatches: redoBatches.length, touchedPaths: [...new Set(touchedPaths)] };
 }
 
 export function runCommandInSandbox(
@@ -159,60 +175,39 @@ function replaceSingleItem(workingContent: string, oldText: string, newText: str
   throw new Error(`在 ${filePath} 中未找到匹配的 oldText，请先用 read_file 确认原文件内容`);
 }
 
-async function applyFileEdit(
-  workspaceRoot: string,
-  snapshots: FileVersionSnapshot[],
-  args: z.infer<typeof EditFileArgsSchema>,
-  onSnapshotChange?: () => void,
-): Promise<string> {
-  const fullPath = resolveSafePath(workspaceRoot, args.path, "write");
-  const existed = fsSync.existsSync(fullPath);
-  const beforeContent = existed ? await fs.readFile(fullPath, "utf-8") : null;
-
+async function applyFileEdit(workspaceRoot: string, snapshots: FileVersionSnapshot[], args: z.infer<typeof EditFileArgsSchema>, onSnapshotChange?: () => void, grants?: SandboxGrants): Promise<string> {
+  const fullPath = resolveSafePath(workspaceRoot, args.path, "write", grants);
+  const beforeContent = fsSync.existsSync(fullPath) ? await fs.readFile(fullPath, "utf-8") : null;
   const hasBatch = Array.isArray(args.edits) && args.edits.length > 0;
-  if (!hasBatch && (args.oldText === undefined || args.newText === undefined)) {
-    throw new Error(`edit_file 参数缺失：必须提供 oldText/newText 或非空 edits 数组`);
-  }
+  if (!hasBatch && (args.oldText === undefined || args.newText === undefined)) throw new Error(`edit_file 参数缺失：必须提供 oldText/newText 或非空 edits 数组`);
   const editList = hasBatch ? args.edits! : [{ oldText: args.oldText!, newText: args.newText! }];
-  if (editList.length > 1 && editList.some((item) => item.oldText === "")) {
-    throw new Error(`批量 edits 中禁止混入 oldText 为空串的全量覆盖项: ${args.path}`);
-  }
+  if (editList.length > 1 && editList.some((item) => item.oldText === "")) throw new Error(`批量 edits 中禁止混入 oldText 为空串的全量覆盖项: ${args.path}`);
 
   let workingContent = beforeContent ?? "";
   for (const item of editList) {
-    if (item.oldText === "") {
-      workingContent = item.newText;
-    } else {
-      workingContent = replaceSingleItem(workingContent, item.oldText, item.newText, args.path, beforeContent === null);
-    }
+    workingContent = item.oldText === "" ? item.newText : replaceSingleItem(workingContent, item.oldText, item.newText, args.path, beforeContent === null);
   }
 
   writeFileAtomicSync(fullPath, workingContent);
-  const relPath = toPosixRelative(resolveSafePath(workspaceRoot, ".", "read"), fullPath) || args.path;
+  const relPath = toPosixRelative(resolveSafePath(workspaceRoot, ".", "read", grants), fullPath) || args.path;
   const version = snapshots.length + 1;
   snapshots.push({ version, path: relPath, beforeContent, afterContent: workingContent, timestamp: Date.now(), hunkCount: editList.length });
   onSnapshotChange?.();
   const hunks = editList.map((e) => extractChangedHunk(e.oldText, e.newText));
   const added = beforeContent === null ? workingContent.split(/\r?\n/).length : hunks.reduce((a, h) => a + h.added.length, 0);
   const removed = beforeContent === null ? 0 : hunks.reduce((a, h) => a + h.removed.length, 0);
-  return `已写入文件: ${relPath} (共应用 ${editList.length} 处修改 · +${added} / -${removed} 行，当前版本 v${version})`;
+  const baseMsg = `已写入文件: ${relPath} (共应用 ${editList.length} 处修改 · +${added} / -${removed} 行，当前版本 v${version}，语法自检已通过)`;
+  const syntaxErr = checkFileSyntax(relPath, workingContent);
+  return syntaxErr ? `已写入文件: ${relPath} (v${version})\n⚠️ [语法自检未通过] 检测到语法错误:\n${syntaxErr}\n请立即调用 edit_file 修复上述语法错误后再结束本轮回答。` : baseMsg;
 }
 
-/**
- * 创建 Stage 3 写工具集（edit_file、run_bash 与 rollback_version，支持按版本步数倒退还原文件）
- */
-export function createWriteTools(
-  workspaceRoot: string = process.cwd(),
-  snapshots: FileVersionSnapshot[] = [],
-  signal?: AbortSignal,
-  onSnapshotChange?: () => void,
-): ToolContract<any>[] {
+export function createWriteTools(workspaceRoot: string = process.cwd(), snapshots: FileVersionSnapshot[] = [], signal?: AbortSignal, onSnapshotChange?: () => void, grants?: SandboxGrants): ToolContract<any>[] {
   const editFileTool: ToolContract<z.infer<typeof EditFileArgsSchema>> = {
     name: "edit_file",
     description: "修改或新建工作区内的文件（oldText 为空表示新建/覆盖文件，非空则唯一替换 oldText 为 newText）",
     parameters: EditFileArgsSchema,
     readonly: false,
-    execute: (args) => applyFileEdit(workspaceRoot, snapshots, EditFileArgsSchema.parse(args), onSnapshotChange),
+    execute: (args) => applyFileEdit(workspaceRoot, snapshots, EditFileArgsSchema.parse(args), onSnapshotChange, grants),
   };
 
   const rollbackVersionTool: ToolContract<z.infer<typeof RollbackVersionArgsSchema>> = {
@@ -233,7 +228,11 @@ export function createWriteTools(
     parameters: RunBashArgsSchema,
     readonly: false,
     async execute(args) {
-      const isRo = isReadonlyBashCommand(args.command, args.readonly);
+      const check = analyzeBashSandbox(args.command, workspaceRoot, grants);
+      if (check.tier === "deny") {
+        throw new Error(`[沙箱安全拦截] ${check.reason ?? "命令触碰安全红线"}。若缺少配置或 API Key，请立即停止探测并直接向用户询问。`);
+      }
+      const isRo = check.tier === "allow" && isReadonlyBashCommand(args.command, args.readonly, workspaceRoot);
       const timeoutMs = Math.min(Math.max(args.timeoutMs ?? 15_000, 100), 120_000);
       const res = await runCommandInSandbox(args.command, workspaceRoot, timeoutMs, signal, isRo);
       if (res.exitCode !== 0) throw new Error(`命令退出码 ${res.exitCode}:\n${res.output}`);

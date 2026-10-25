@@ -9,16 +9,10 @@ export const ToolCallSchema = z.object({
 export type ToolCall = z.infer<typeof ToolCallSchema>;
 
 /** 2. 四种标准消息角色 (system / user / assistant / tool) */
-export const SystemMessageSchema = z.object({
-  role: z.literal("system"),
-  content: z.string(),
-});
-
-export const UserMessageSchema = z.object({
-  role: z.literal("user"),
-  content: z.string(),
-});
-
+export const SystemMessageSchema = z.object({ role: z.literal("system"), content: z.string() });
+export const ImageAttachmentSchema = z.object({ path: z.string().min(1), mimeType: z.string().min(1), byteSize: z.number().int().nonnegative() });
+export type ImageAttachment = z.infer<typeof ImageAttachmentSchema>;
+export const UserMessageSchema = z.object({ role: z.literal("user"), content: z.string(), images: z.array(ImageAttachmentSchema).optional() });
 export const AssistantMessageSchema = z.object({
   role: z.literal("assistant"),
   content: z.string().nullable().optional().transform((val) => val ?? ""),
@@ -52,14 +46,7 @@ export type Message = z.infer<typeof MessageSchema>;
 /**
  * 3. 纯函数状态机的 State 与输入/输出契约 (类比 React 19 useReducer)
  */
-export const AgentPhaseSchema = z.enum([
-  "idle",
-  "thinking",
-  "executing",
-  "awaiting_approval",
-  "done",
-  "error",
-]);
+export const AgentPhaseSchema = z.enum(["idle", "thinking", "executing", "awaiting_approval", "done", "error"]);
 export type AgentPhase = z.infer<typeof AgentPhaseSchema>;
 
 export const AgentStateSchema = z.object({
@@ -73,7 +60,7 @@ export type AgentState = z.infer<typeof AgentStateSchema>;
 
 /** 喂给纯函数大脑的输入事件 (Action) */
 export type LoopEvent =
-  | { type: "START"; userPrompt: string }
+  | { type: "START"; userPrompt: string; images?: ImageAttachment[] }
   | { type: "LLM_REPLIED"; message: AssistantMessage; requiresApproval?: boolean }
   | { type: "APPROVAL_RESOLVED"; approved: boolean; reason?: string }
   | { type: "TOOLS_FINISHED"; results: ToolResultMessage[] }
@@ -111,7 +98,7 @@ export interface LlmProvider {
   chat(
     messages: Message[],
     tools?: ToolContract[],
-    options?: { signal?: AbortSignal; onStreamEvent?: (event: LlmStreamEvent) => void },
+    options?: { signal?: AbortSignal; onStreamEvent?: (event: LlmStreamEvent) => void; workspaceRoot?: string },
   ): Promise<AssistantMessage>;
 }
 
