@@ -3,7 +3,7 @@ import * as path from "node:path";
 import { AssistantMessageSchema, type AssistantMessage, type LlmStreamEvent, type ToolCall } from "../core/contracts.js";
 import type { HttpWireLogEntry } from "./cost-tracker.js";
 import { compactWireLogEntry, writeFileAtomicSync } from "./store.js";
-import { formatMarkdownLine, getVisualCols, wrapReasoningLines } from "./ui-logger.js";
+import { formatMarkdownLine, getCharVisualWidth, getVisualCols, wrapReasoningLines } from "./ui-logger.js";
 import { syncXrayCacheSnapshot } from "./xray.js";
 
 export { formatMarkdownLine, getVisualCols, type HttpWireLogEntry, wrapReasoningLines };
@@ -139,7 +139,7 @@ function slicePreviewText(text: string, startCols: number, maxCols: number): { o
   if (startCols >= maxCols) return { out: "", nextCols: startCols };
   let out = "", cols = startCols;
   for (const ch of text) {
-    const w = (ch.codePointAt(0) ?? 0) > 0xff ? 2 : 1;
+    const w = getCharVisualWidth(ch.codePointAt(0) ?? 0);
     if (cols + w > maxCols) break;
     out += ch; cols += w;
   }

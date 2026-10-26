@@ -10,13 +10,14 @@ import {
   summarizeSnapshotsDiff,
   truncateVisualCols,
 } from "./diff-presenter.js";
-import { formatClickablePath, getVisualCols, shortenWorkspaceText } from "./platform.js";
+import { formatClickablePath, getCharVisualWidth, getVisualCols, shortenWorkspaceText } from "./platform.js";
 
 export {
   buildDefaultSystemPrompt,
   cleanDisplayBash,
   computeTurnMetrics,
   type FileDiffSummaryItem,
+  getCharVisualWidth,
   getVisualCols,
   isReadonlyBashCommand,
   normalizeEditsArray,
@@ -70,7 +71,7 @@ export function wrapReasoningLines(raw: string, maxCols: number): string[] {
     let line = "";
     let cols = 0;
     for (const ch of para) {
-      const w = (ch.codePointAt(0) ?? 0) > 0xff ? 2 : 1;
+      const w = getCharVisualWidth(ch.codePointAt(0) ?? 0);
       if (cols + w > maxCols) {
         out.push(line);
         line = ch;
@@ -237,6 +238,5 @@ export function formatCompactTurnFooter(
       ? `本轮 ¥${m.turnCostCny.toFixed(4)} / 当前对话 ¥${m.sessionCostCny.toFixed(4)} (项目总计 ¥${m.totalCostCny.toFixed(4)})`
       : `本轮 ¥${m.turnCostCny.toFixed(4)} / 当前对话 ¥${m.sessionCostCny.toFixed(4)}`;
   const ctxTag = m.contextTokens > 0 ? `🧠 ${(m.contextTokens / 1000).toFixed(1)}k词 · ` : "";
-  const trajTag = stepsUsed > 0 && m.stepCacheTrajectory ? ` [${m.stepCacheTrajectory}]` : "";
-  return `${modPrefix}✅ 本轮完成 (🤖 ${m.activeModel}${durTag} · 共 ${stepsUsed} 步 · 💰 ${costStr} · ${ctxTag}⚡缓存命中 ${m.cacheHitRatePct.toFixed(0)}%${trajTag} · 输入 /xray 查账单)`;
+  return `${modPrefix}✅ 本轮完成 (🤖 ${m.activeModel}${durTag} · 共 ${stepsUsed} 步 · 💰 ${costStr} · ${ctxTag}⚡缓存命中 ${m.cacheHitRatePct.toFixed(0)}% · 输入 /xray 查账单)`;
 }

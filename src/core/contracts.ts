@@ -26,6 +26,7 @@ export const ToolResultMessageSchema = z.object({
   toolCallId: z.string().min(1, "toolCallId 不能为空"),
   name: z.string().min(1),
   content: z.string(),
+  images: z.array(ImageAttachmentSchema).optional(),
   /** 本地函数执行报错时设为 true，把错误信息作为消息回传给模型重试 */
   isError: z.boolean().default(false),
 });
@@ -79,6 +80,8 @@ export interface LoopStepResult {
   effect: LoopEffect;
 }
 
+export type ToolExecuteOutput = string | { content: string; images?: ImageAttachment[] };
+
 /** 4. 原子工具契约 (ToolContract) 与厂商无关大模型契约 (LlmProvider) */
 export interface ToolContract<TArgs = unknown> {
   name: string;
@@ -86,7 +89,7 @@ export interface ToolContract<TArgs = unknown> {
   parameters: z.ZodType<TArgs, z.ZodTypeDef, any>;
   inputSchema?: Record<string, unknown>;
   readonly: boolean;
-  execute: (args: TArgs) => Promise<string> | string;
+  execute: (args: TArgs) => Promise<ToolExecuteOutput> | ToolExecuteOutput;
 }
 
 export type LlmStreamEvent =

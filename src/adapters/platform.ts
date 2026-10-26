@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import { createRequire } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
+import { stripVTControlCharacters } from "node:util";
 
 export function toPosixPath(rawPath: string): string { return rawPath.replace(/\\/g, "/"); }
 export function toPosixRelative(fromDir: string, toTarget: string): string { return toPosixPath(path.relative(fromDir, toTarget)); }
@@ -32,9 +33,15 @@ export function shortenWorkspaceText(raw: string, workspaceRoot?: string): strin
   return res.replace(/^\s*cd\s+(?:"\."|'\.'|\.)\s*(?:&&|;)\s*/, "");
 }
 
+export function getCharVisualWidth(cp: number): number {
+  if (cp <= 0x1f || (cp >= 0x7f && cp <= 0x9f) || (cp >= 0x0300 && cp <= 0x036f) || (cp >= 0x200b && cp <= 0x200f) || (cp >= 0xfe00 && cp <= 0xfe0f)) return 0;
+  if ((cp >= 0x1100 && cp <= 0x115f) || (cp >= 0x2e80 && cp <= 0x303e) || (cp >= 0x3040 && cp <= 0xa4cf) || (cp >= 0xac00 && cp <= 0xd7a3) || (cp >= 0xf900 && cp <= 0xfaff) || (cp >= 0xfe10 && cp <= 0xfe6f) || (cp >= 0xff01 && cp <= 0xff60) || (cp >= 0xffe0 && cp <= 0xffe6) || cp >= 0x1f300) return 2;
+  return 1;
+}
+
 export function getVisualCols(s: string): number {
   let w = 0;
-  for (const ch of s.replace(/\x1b\[[0-9;]*m|\x1b\]8;;[^\x07\x1b]*(?:\x07|\x1b\\)/g, "")) w += (ch.codePointAt(0) ?? 0) > 0xff ? 2 : 1;
+  for (const ch of stripVTControlCharacters(s)) w += getCharVisualWidth(ch.codePointAt(0) ?? 0);
   return w;
 }
 
@@ -44,7 +51,7 @@ export function truncateCols(str: string, maxCols: number, suffix = ".."): strin
   const budget = suffix === "..." ? Math.max(1, maxCols - 3) : maxCols;
   let width = 0, out = "";
   for (const ch of clean) {
-    const w = (ch.codePointAt(0) ?? 0) > 0xff ? 2 : 1;
+    const w = getCharVisualWidth(ch.codePointAt(0) ?? 0);
     if (width + w > budget) return `${out}${suffix}`;
     out += ch; width += w;
   }

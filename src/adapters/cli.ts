@@ -15,13 +15,11 @@ import { syncXrayCacheSnapshot } from "./xray.js";
 
 export { buildDefaultSystemPrompt, isReadonlyBashCommand };
 
-export interface ApprovalRequestMeta {
-  hasEscalated: boolean; escalatedReasons: string[]; externalDirs: string[];
-}
+export interface ApprovalRequestMeta { hasEscalated: boolean; escalatedReasons: string[]; externalDirs: string[]; }
 
 export interface RunSessionOptions {
   provider?: LlmProvider; tools?: ToolContract<any>[]; enableWriteTools?: boolean; signal?: AbortSignal;
-  workspaceRoot?: string; snapshots?: FileVersionSnapshot[]; sandboxGrants?: SandboxGrants; compactor?: CompactorOptions;
+  workspaceRoot?: string; snapshots?: FileVersionSnapshot[]; redoBatches?: FileVersionSnapshot[][]; sandboxGrants?: SandboxGrants; compactor?: CompactorOptions;
   maxSteps?: number; systemPrompt?: string; sessionFile?: string; replayFromFile?: string; wireLogFile?: string;
   showCostReport?: boolean; suppressFinalEcho?: boolean; leafId?: string; userImages?: ImageAttachment[];
   onApprovalRequest?: (toolCalls: ToolCall[], meta?: ApprovalRequestMeta) => Promise<{ approved: boolean; reason?: string; trustDirectory?: boolean }> | { approved: boolean; reason?: string; trustDirectory?: boolean };
@@ -29,11 +27,10 @@ export interface RunSessionOptions {
   onStepEvent?: (event: { phase: string; step: number; detail?: string; toolCalls?: ToolCall[]; toolResults?: { toolCallId: string; name: string; content: string; isError?: boolean }[] }) => void;
   onStreamEvent?: (event: LlmStreamEvent) => void;
   onSnapshotChange?: () => void;
+  drainSteerMessages?: () => string[];
 }
 
-interface SessionCursor {
-  persistedCount: number; leafId: string | null;
-}
+interface SessionCursor { persistedCount: number; leafId: string | null; lastErrSig?: string; errStreak?: number; }
 
 function syncNewMessagesToDisk(sessionFile: string | undefined, recordedEntries: SessionEntry[], allMessages: readonly any[], cursor: SessionCursor, isFirstWrite: boolean, wireLogFile?: string): void {
   const unsavedMessages = allMessages.slice(cursor.persistedCount);
@@ -91,12 +88,8 @@ async function runSingleEffectStep(
     const decision = options.onApprovalRequest
       ? await options.onApprovalRequest(targetCalls, { hasEscalated: risk.hasEscalated, escalatedReasons: risk.escalatedReasons, externalDirs: risk.externalDirs })
       : { approved: false, reason: "未配置审批回调，默认拒绝写或跨界操作" };
-    if (decision.approved) {
-      const trustedDirs = grantApprovedCalls(effect.toolCalls, wsRoot, readonlyMap, grants, Boolean(decision.trustDirectory));
-      console.log(trustedDirs.length > 0 ? `  🟢 已授权并信任外部目录: ${trustedDirs.join(", ")}` : `  🟢 已确认允许执行`);
-    } else {
-      console.log(`  🔴 已拒绝执行: ${decision.reason}`);
-    }
+    const trustedDirs = decision.approved ? grantApprovedCalls(effect.toolCalls, wsRoot, readonlyMap, grants, Boolean(decision.trustDirectory)) : [];
+    console.log(decision.approved ? (trustedDirs.length > 0 ? `  🟢 已授权并信任外部目录: ${trustedDirs.join(", ")}` : `  🟢 已确认允许执行`) : `  🔴 已拒绝执行: ${decision.reason}`);
     const resolved = stepAgentLoop(state, { type: "APPROVAL_RESOLVED", approved: decision.approved, reason: decision.reason });
     if (options.signal?.aborted) {
       const abortReason = decision.reason ?? "用户按 Ctrl+C 中断了本轮操作";
@@ -109,14 +102,24 @@ async function runSingleEffectStep(
     try {
       const results = await executeToolCalls(effect.toolCalls, tools);
       for (const r of results) {
-        if (r.isError && r.content.includes("[沙箱安全拦截]")) console.log(`  🛡️ ${r.content.replace(/^执行异常：/, "")}`);
+        if (r.isError) {
+          const sig = `${r.name}:${r.content.slice(0, 48)}`;
+          cursor.errStreak = cursor.lastErrSig === sig ? (cursor.errStreak ?? 1) + 1 : 1;
+          cursor.lastErrSig = sig;
+          if (r.content.includes("[沙箱安全拦截]")) console.log(`  🛡️ ${r.content.replace(/^执行异常：/, "")}`);
+          if (cursor.errStreak >= 2) r.content += `\n[系统防卡死提示：该操作已连续 ${cursor.errStreak} 次出现相同报错，严禁使用相同参数重复尝试，请先核实状态或直接向用户询问]`;
+        } else { cursor.lastErrSig = undefined; cursor.errStreak = 0; }
         console.log(formatToolResultLine(r));
       }
       options.onStepEvent?.({ phase: "executing", step: state.step, detail: "tool_results", toolResults: results });
-      return stepAgentLoop(state, { type: "TOOLS_FINISHED", results });
-    } finally {
-      grants.onceAllowedPaths.clear();
-    }
+      const next = stepAgentLoop(state, { type: "TOOLS_FINISHED", results });
+      const steers = options.drainSteerMessages?.() ?? [];
+      if (steers.length > 0 && next.effect.type === "REQUEST_LLM") {
+        console.log(`  💬 [实时插话已生效] 已向模型注入 ${steers.length} 条补充指令`);
+        return { state: { ...next.state, messages: [...next.state.messages, ...steers.map((s) => ({ role: "user" as const, content: `[用户运行中补充指令] ${s}` }))] }, effect: next.effect };
+      }
+      return next;
+    } finally { grants.onceAllowedPaths.clear(); }
   }
 
   return current;
@@ -160,50 +163,47 @@ function initSessionContext(userPrompt: string, workspaceRoot: string, options: 
 }
 
 export async function runAgentSession(
-  userPrompt: string,
-  options: RunSessionOptions = {},
+  userPrompt: string, options: RunSessionOptions = {},
 ): Promise<{ finalAnswer: string; stepsUsed: number; entries: SessionEntry[]; leafId: string | null }> {
-  const isReplay = Boolean(options.replayFromFile), turnStartMs = Date.now();
-  const workspaceRoot = options.workspaceRoot ?? process.cwd();
-  const snapshots = options.snapshots ?? [];
-  const grants = options.sandboxGrants ?? createSandboxGrants();
-  const snapStartIdx = snapshots.length;
+  const isReplay = Boolean(options.replayFromFile), turnStartMs = Date.now(), workspaceRoot = options.workspaceRoot ?? process.cwd();
+  const snapshots = options.snapshots ?? [], grants = options.sandboxGrants ?? createSandboxGrants(), snapStartIdx = snapshots.length;
   const wireLogFile = options.wireLogFile ?? ".sessions/http-wire.json";
   const provider = isReplay ? createReplayProvider(loadJsonlEntries(options.replayFromFile!)) : (options.provider ?? createRouterProvider(wireLogFile));
-  const defaultTools = [
-    ...createBuiltinTools(workspaceRoot, grants),
-    ...(options.enableWriteTools ? createWriteTools(workspaceRoot, snapshots, options.signal, options.onSnapshotChange, grants) : []),
-  ];
-  const tools = options.tools ?? defaultTools;
-  const readonlyMap = new Map(tools.map((t) => [t.name, t.readonly]));
+  const defaultTools = [...createBuiltinTools(workspaceRoot, grants), ...(options.enableWriteTools ? createWriteTools(workspaceRoot, snapshots, options.signal, options.onSnapshotChange, grants) : [])];
+  const tools = options.tools ?? defaultTools, readonlyMap = new Map(tools.map((t) => [t.name, t.readonly]));
   if (!options.suppressFinalEcho) {
-    console.log(`\n⚡ [路由决策] ${resolveRouteTier(Date.now(), { isReplay }).reason}`);
-    console.log(`👤 [用户提问] ${stripAttachedFiles(userPrompt)}\n`);
+    console.log(`\n⚡ [路由决策] ${resolveRouteTier(Date.now(), { isReplay }).reason}\n👤 [用户提问] ${stripAttachedFiles(userPrompt)}\n`);
   }
 
   let { stepRes, recordedEntries, cursor } = initSessionContext(userPrompt, workspaceRoot, options);
 
   while (true) {
     if (options.signal?.aborted && stepRes.effect.type !== "ABORT") {
-      stepRes = {
-        state: { ...stepRes.state, phase: "error", error: "收到外部取消信号 (AbortSignal)" },
-        effect: { type: "ABORT", reason: "收到外部取消信号 (AbortSignal)" },
-      };
+      stepRes = { state: { ...stepRes.state, phase: "error", error: "收到外部取消信号 (AbortSignal)" }, effect: { type: "ABORT", reason: "收到外部取消信号 (AbortSignal)" } };
     }
     if (stepRes.effect.type === "ABORT") {
       syncNewMessagesToDisk(options.sessionFile, recordedEntries, repairDanglingToolCalls(stepRes.state.messages), cursor, false, wireLogFile);
       const turnSnapCount = snapshots.length - snapStartIdx;
       if (turnSnapCount > 0 && !options.signal?.aborted) {
-        const rb = await rollbackFileSnapshots(workspaceRoot, snapshots, turnSnapCount, options.onSnapshotChange);
-        console.warn(`🔄 [任务熔断自动回滚] 已自动还原 ${rb.rolledBackCount} 个版本修改 (${rb.touchedPaths.join(", ")})`);
-      } else if (turnSnapCount > 0 && options.suppressFinalEcho) {
-        console.log(formatCompactTurnFooter(wireLogFile, stepRes.state.step, isReplay, snapshots.slice(snapStartIdx), workspaceRoot, Date.now() - turnStartMs));
+        const rb = await rollbackFileSnapshots(workspaceRoot, snapshots, turnSnapCount, options.onSnapshotChange, options.redoBatches);
+        console.warn(`🔄 [任务熔断自动回滚] 已自动还原 ${rb.rolledBackCount} 个版本修改 (${rb.touchedPaths.join(", ")}) · 可输入 /redo 恢复`);
+      } else if (turnSnapCount > 0) {
+        console.warn(`⚠️ [已中断] 本轮中断前已修改 ${turnSnapCount} 处文件（输入 /diff 查看，或输入 /undo 一键撤回）`);
+        if (options.suppressFinalEcho) console.log(formatCompactTurnFooter(wireLogFile, stepRes.state.step, isReplay, snapshots.slice(snapStartIdx), workspaceRoot, Date.now() - turnStartMs));
       }
       printCostIfEnabled(options, wireLogFile, isReplay);
       console.error(`\n❌ [循环熔断终止] ${stepRes.effect.reason}`);
       return { finalAnswer: `[ABORT] ${stepRes.effect.reason}`, stepsUsed: stepRes.state.step, entries: recordedEntries, leafId: cursor.leafId };
     }
     if (stepRes.effect.type === "COMPLETE") {
+      const steers = stepRes.state.step < stepRes.state.maxSteps ? (options.drainSteerMessages?.() ?? []) : [];
+      if (steers.length > 0) {
+        console.log(`  💬 [实时插话已生效] 已向模型注入 ${steers.length} 条补充指令`);
+        const nextMsgs = [...stepRes.state.messages, ...steers.map((s) => ({ role: "user" as const, content: `[用户运行中补充指令] ${s}` }))];
+        stepRes = { state: { ...stepRes.state, phase: "thinking", step: stepRes.state.step + 1, messages: nextMsgs }, effect: { type: "REQUEST_LLM", messages: nextMsgs } };
+        syncNewMessagesToDisk(options.sessionFile, recordedEntries, stepRes.state.messages, cursor, false, wireLogFile);
+        continue;
+      }
       if (options.verifyCompletion) {
         const check = await options.verifyCompletion(stepRes.effect.finalAnswer);
         if (!check.ok) {
@@ -212,7 +212,7 @@ export async function runAgentSession(
           syncNewMessagesToDisk(options.sessionFile, recordedEntries, stepRes.state.messages, cursor, false, wireLogFile);
           continue;
         }
-        console.log(`✅ [完成前自动验证通过]`);
+        if (!(check as { skipped?: boolean }).skipped) console.log(`✅ [完成前自动验证通过]`);
       }
       options.onStepEvent?.({ phase: "done", step: stepRes.state.step, detail: stepRes.effect.finalAnswer });
       break;

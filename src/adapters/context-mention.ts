@@ -1,13 +1,13 @@
-import { spawn } from "node:child_process";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
-import { pathToFileURL } from "node:url";
 import type { ImageAttachment } from "../core/contracts.js";
-import { expandHomePath, killProcessGroup, openInDefaultApp, resolveDefaultOpenTarget, toPosixRelative } from "./platform.js";
-import { checkHardDeniedPath, resolveExistingRealPath, toGrantDir } from "./sandbox-policy.js";
+import { expandHomePath, toPosixRelative } from "./platform.js";
+import { checkHardDeniedPath, resolveExistingRealPath } from "./sandbox-policy.js";
 import { BINARY_EXT_RE, IGNORED_DIRS, resolveSafePath, type SandboxGrants } from "./tools.js";
+import { captureClipboardImage, captureHeadlessScreenshot, findHeadlessBrowserBinary, hasPngMagicBytes, parseShotCommandArgs, persistHashedDebugPng } from "./vision-capture.js";
 import { runCommandInSandbox } from "./write-tools.js";
+
+export { captureClipboardImage, captureHeadlessScreenshot, findHeadlessBrowserBinary, hasPngMagicBytes, parseShotCommandArgs, persistHashedDebugPng };
 
 export const IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp)$/i;
 
@@ -29,7 +29,9 @@ export function listWorkspaceFiles(workspaceRoot: string, maxFiles = 1200): stri
   try {
     const entries = fs.readdirSync(realRoot, { recursive: true, withFileTypes: true });
     const files: string[] = [];
-    if (fs.existsSync(path.join(realRoot, ".debug", "shot.png"))) files.push(".debug/shot.png");
+    for (const debugImg of ["shot.png", "clipboard.png"]) {
+      if (fs.existsSync(path.join(realRoot, ".debug", debugImg))) files.push(`.debug/${debugImg}`);
+    }
     for (const e of entries) {
       if (!e.isFile() || e.name.startsWith(".") || (BINARY_EXT_RE.test(e.name) && !IMAGE_EXT_RE.test(e.name))) continue;
       const relDir = path.relative(realRoot, e.parentPath);
@@ -51,44 +53,81 @@ export function buildAtMentionDropdown(
   workspaceRoot: string,
 ): { label: string; desc: string; fillText: string; expandOnly: boolean; cursorAfter: number }[] {
   const safeCursor = Math.max(0, Math.min(cursor, line.length));
-  const before = line.slice(0, safeCursor);
-  const after = line.slice(safeCursor);
+  const before = line.slice(0, safeCursor), after = line.slice(safeCursor);
+  const pastedImg = before.match(/(?:^|[\s(])@(\.debug\/(?:clipboard|shot)-[0-9a-f]{6}\.png)\s$/);
+  if (pastedImg?.[1] && !after.trim()) {
+    const rel = pastedImg[1], full = path.join(workspaceRoot, rel);
+    const kb = fs.existsSync(full) ? Math.max(1, Math.round(fs.statSync(full).size / 1024)) : 0;
+    return [{ label: `@${rel}`, desc: `📋 已粘贴剪贴板截图 (${kb} KB · 直接继续输入问题或按回车即可发送)`, fillText: line, expandOnly: false, cursorAfter: safeCursor }];
+  }
   const m = before.match(/(?:^|[\s(])@([^\s]*)$/);
   if (!m) return [];
-  const rawQuery = m[1]!;
-  const query = rawQuery.toLowerCase();
-  const atIndex = before.length - rawQuery.length - 1;
+  const rawQuery = m[1]!, query = rawQuery.toLowerCase(), atIndex = before.length - rawQuery.length - 1;
+  const trimmedAfter = after.startsWith(" ") ? after.slice(1) : after;
   const allFiles = listWorkspaceFiles(workspaceRoot);
-  const exactBase: string[] = [];
-  const fuzzyPath: string[] = [];
+  const exactBase: string[] = [], fuzzyPath: string[] = [];
   for (const f of allFiles) {
-    const lower = f.toLowerCase();
-    const base = path.posix.basename(lower);
+    const lower = f.toLowerCase(), base = path.posix.basename(lower);
     if (!query || base.startsWith(query)) exactBase.push(f);
     else if (lower.includes(query)) fuzzyPath.push(f);
   }
-  return [...exactBase, ...fuzzyPath].slice(0, 8).map((relPath) => {
-    const replacedPrefix = `${before.slice(0, atIndex)}@${relPath} `;
-    const trimmedAfter = after.startsWith(" ") ? after.slice(1) : after;
-    return {
-      label: `@${relPath}`,
-      desc: `📎 引用工作区文件 (${relPath})`,
-      fillText: `${replacedPrefix}${trimmedAfter}`,
-      expandOnly: true,
-      cursorAfter: replacedPrefix.length,
-    };
+  const items = [...exactBase, ...fuzzyPath].slice(0, 7).map((relPath) => {
+    const formattedRef = relPath.includes(" ") ? `@"${relPath}"` : `@${relPath}`;
+    const replacedPrefix = `${before.slice(0, atIndex)}${formattedRef} `;
+    return { label: formattedRef, desc: `📎 引用工作区文件 (${relPath})`, fillText: `${replacedPrefix}${trimmedAfter}`, expandOnly: true, cursorAfter: replacedPrefix.length };
   });
+  if (!query || "clipboard".startsWith(query) || "paste".startsWith(query)) {
+    const replacedPrefix = `${before.slice(0, atIndex)}@clipboard `;
+    items.push({ label: "@clipboard", desc: "📋 粘贴系统剪贴板最新截图 (.debug/clipboard.png)", fillText: `${replacedPrefix}${trimmedAfter}`, expandOnly: true, cursorAfter: replacedPrefix.length });
+  }
+  return items.slice(0, 8);
 }
 
 export function stripAttachedFiles(raw: string): string {
-  if (!raw || (!raw.includes("<attached_file") && !raw.includes("[已折叠历史引用文件 @"))) return raw;
+  if (!raw || (!raw.includes("<attached_file") && !raw.includes("[已折叠历史引用文件 @") && !raw.includes("[已折叠历史图片 @"))) return raw;
   const stripped = raw
     .replace(/\s*<attached_file\b[^>]*>[\s\S]*?<\/attached_file>/g, "")
-    .replace(/\s*\[已折叠历史引用文件 @[^\]]+\]/g, "")
+    .replace(/\s*\[已折叠历史(?:引用文件|图片) @[^\]]+\]/g, "")
     .trim();
   if (stripped) return stripped;
-  const paths = [...raw.matchAll(/(?:<attached_file\s+path="([^"]+)"|\[已折叠历史引用文件 @([^\s\]]+))/g)].map((m) => `@${m[1] ?? m[2]}`);
+  const paths = [...raw.matchAll(/(?:<attached_file\s+path="([^"]+)"|\[已折叠历史(?:引用文件|图片) @([^\]]+?)(?:\s*\((?:原长|\d+\s*KB)[^\]]*\))?\])/g)].map((m) => `@${(m[1] ?? m[2] ?? "").trim()}`);
   return paths.length > 0 ? `[引用文件: ${paths.join(", ")}]` : raw.slice(0, 80).trim();
+}
+
+export interface ParsedAttachmentToken {
+  target: string;
+  startLine?: number;
+  endLine?: number;
+  isClipboard?: boolean;
+}
+
+export function extractAttachmentTokens(prompt: string): ParsedAttachmentToken[] {
+  const tokens: ParsedAttachmentToken[] = [];
+  const pushFileToken = (rawToken: string, explicitRange?: { start?: string; end?: string }, isExplicitAt = true) => {
+    const unescaped = rawToken.replace(/\\ /g, " ").replace(/[.:;!?]+$/, "").trim();
+    if (!unescaped) return;
+    if (isExplicitAt && (unescaped.toLowerCase() === "clipboard" || unescaped.toLowerCase() === "paste")) {
+      tokens.push({ target: "@clipboard", isClipboard: true });
+      return;
+    }
+    const rangeMatch = !explicitRange?.start ? unescaped.match(/^(.+?):(\d+)(?:-(\d+))?$/) : null;
+    const target = rangeMatch ? rangeMatch[1]! : unescaped;
+    const sStr = explicitRange?.start ?? rangeMatch?.[2], eStr = explicitRange?.end ?? rangeMatch?.[3];
+    tokens.push({ target, ...(sStr ? { startLine: Math.max(1, Number(sStr)) } : {}), ...(eStr ? { endLine: Number(eStr) } : {}) });
+  };
+  const pattern =
+    /(?:^|[\s(])@"([^"]+)"(?::(\d+)(?:-(\d+))?)?|(?:^|[\s(])@'([^']+)'(?::(\d+)(?:-(\d+))?)?|(?:^|[\s(])@((?:\\ |[^\s,;'"`<>()])+)|(?:'((?:\/|~\/|[A-Za-z]:[\\/])[^'\r\n]+)'|"((?:\/|~\/|[A-Za-z]:[\\/])[^"\r\n]+)")|(?:^|[\s(])((?:\/|~\/|[A-Za-z]:[\\/])(?:\\ |[^\s,;'"`<>()])+)/g;
+  for (const m of prompt.matchAll(pattern)) {
+    if (m[1] !== undefined) pushFileToken(m[1], { start: m[2], end: m[3] }, true);
+    else if (m[4] !== undefined) pushFileToken(m[4], { start: m[5], end: m[6] }, true);
+    else if (m[7] !== undefined) pushFileToken(m[7], undefined, true);
+    else if (m[8] !== undefined || m[9] !== undefined) pushFileToken((m[8] ?? m[9])!, undefined, false);
+    else if (m[10] !== undefined) {
+      const unescapedBare = m[10].replace(/\\ /g, " ").replace(/[.:;!?]+$/, "");
+      if (m[10].includes("\\ ") || IMAGE_EXT_RE.test(unescapedBare)) pushFileToken(m[10], undefined, false);
+    }
+  }
+  return tokens;
 }
 
 export function expandAtMentions(
@@ -97,30 +136,41 @@ export function expandAtMentions(
   maxLinesPerFile = 300,
   grants?: SandboxGrants,
 ): { expandedPrompt: string; attachedPaths: string[]; attachedImages: ImageAttachment[] } {
-  const matches = [...prompt.matchAll(/(?:^|[\s(])@([^\s,;'"`<>()]+)/g)];
-  if (matches.length === 0) return { expandedPrompt: prompt, attachedPaths: [], attachedImages: [] };
+  const tokens = extractAttachmentTokens(prompt);
+  if (tokens.length === 0) return { expandedPrompt: prompt, attachedPaths: [], attachedImages: [] };
   const realRoot = fs.existsSync(workspaceRoot) ? fs.realpathSync(workspaceRoot) : path.resolve(workspaceRoot);
-  const seen = new Set<string>();
-  const blocks: string[] = [];
-  const attachedPaths: string[] = [];
-  const attachedImages: ImageAttachment[] = [];
+  const seen = new Set<string>(), blocks: string[] = [], attachedPaths: string[] = [], attachedImages: ImageAttachment[] = [];
 
-  for (const m of matches) {
-    if (attachedPaths.length >= 6) break;
-    const token = m[1]!.replace(/[.:;!?]+$/, "");
-    const rangeMatch = token.match(/^(.+?):(\d+)(?:-(\d+))?$/);
-    const rawTarget = rangeMatch ? rangeMatch[1]! : token;
-    try {
-      const candidate = resolveExistingRealPath(path.resolve(realRoot, expandHomePath(rawTarget)));
-      if (grants && fs.existsSync(candidate) && !checkHardDeniedPath(candidate, realRoot, "read")) {
-        grants.trustedReadDirs.add(toGrantDir(candidate));
+  for (const tok of tokens) {
+    if (attachedPaths.length >= 6) {
+      blocks.push(`[系统提示：单次提问最多附加 6 个文件/图片，其余 @引用已省略]`);
+      break;
+    }
+    if (tok.isClipboard) {
+      if (seen.has("img:clipboard")) continue;
+      const clip = captureClipboardImage(realRoot);
+      if (clip.ok) {
+        seen.add("img:clipboard");
+        attachedPaths.push(clip.relPath);
+        attachedImages.push({ path: clip.immutableRelPath, mimeType: "image/png", byteSize: clip.byteSize });
       }
-      const fullPath = resolveSafePath(realRoot, rawTarget, "read", grants);
+      continue;
+    }
+    try {
+      const candidate = resolveExistingRealPath(path.resolve(realRoot, expandHomePath(tok.target)));
+      if (grants && fs.existsSync(candidate) && !checkHardDeniedPath(candidate, realRoot, "read")) {
+        if (fs.statSync(candidate).isFile()) grants.onceAllowedPaths.add(candidate);
+      }
+      const fullPath = resolveSafePath(realRoot, tok.target, "read", grants);
       const stat = fs.existsSync(fullPath) ? fs.statSync(fullPath) : null;
       if (!stat || !stat.isFile()) continue;
       const relPath = toPosixRelative(realRoot, fullPath) || path.basename(fullPath);
       if (IMAGE_EXT_RE.test(fullPath)) {
-        if (stat.size <= 5 * 1024 * 1024 && !seen.has(`img:${relPath}`)) {
+        if (stat.size > 5 * 1024 * 1024) {
+          const mb = (stat.size / (1024 * 1024)).toFixed(1);
+          console.warn(`⚠️ [图片超限已跳过] ${relPath} (${mb}MB > 5MB 上限)`);
+          blocks.push(`[图片附件已跳过: ${relPath} 体积 ${mb}MB 超出 5MB 上限]`);
+        } else if (!seen.has(`img:${relPath}`)) {
           seen.add(`img:${relPath}`);
           attachedPaths.push(relPath);
           attachedImages.push({ path: relPath.startsWith("..") ? fullPath : relPath, mimeType: getImageMimeType(fullPath), byteSize: stat.size });
@@ -128,75 +178,23 @@ export function expandAtMentions(
         continue;
       }
       if (BINARY_EXT_RE.test(fullPath)) continue;
-      const cacheKey = `${relPath}:${rangeMatch?.[2] ?? ""}-${rangeMatch?.[3] ?? ""}`;
+      const cacheKey = `${relPath}:${tok.startLine ?? ""}-${tok.endLine ?? ""}`;
       if (seen.has(cacheKey)) continue;
       const content = fs.readFileSync(fullPath, "utf-8");
       if (content.includes("\u0000")) continue;
-      const allLines = content.split("\n");
-      const startLine = rangeMatch ? Math.max(1, Number(rangeMatch[2])) : 1;
-      const requestedEnd = rangeMatch?.[3] ? Number(rangeMatch[3]) : rangeMatch ? startLine + maxLinesPerFile - 1 : maxLinesPerFile;
+      const allLines = content.split("\n"), startLine = tok.startLine ?? 1;
+      const requestedEnd = tok.endLine ?? (tok.startLine ? startLine + maxLinesPerFile - 1 : maxLinesPerFile);
       const endLine = Math.min(allLines.length, Math.max(startLine, requestedEnd));
       const numbered = allLines.slice(startLine - 1, endLine).map((l, idx) => `${startLine + idx}: ${l}`);
-      if (endLine < allLines.length && !rangeMatch?.[3]) {
-        numbered.push(`... (其余 ${allLines.length - endLine} 行已省略，如需查看后续内容请调用 read_file)`);
-      }
+      if (endLine < allLines.length && !tok.endLine) numbered.push(`... (其余 ${allLines.length - endLine} 行已省略，如需查看后续内容请调用 read_file)`);
       seen.add(cacheKey);
       attachedPaths.push(relPath);
       blocks.push(`<attached_file path="${relPath}" lines="${startLine}-${endLine}">\n${numbered.join("\n")}\n</attached_file>`);
     } catch {}
   }
-  return { expandedPrompt: blocks.length > 0 ? `${prompt}\n\n${blocks.join("\n\n")}` : prompt, attachedPaths, attachedImages };
-}
-
-export function findHeadlessBrowserBinary(): string | null {
-  if (process.env.DUO_BROWSER_BIN && fs.existsSync(process.env.DUO_BROWSER_BIN)) return process.env.DUO_BROWSER_BIN;
-  const candidates =
-    process.platform === "win32"
-      ? [
-          path.join(process.env["ProgramFiles(x86)"] ?? "C:\\Program Files (x86)", "Microsoft\\Edge\\Application\\msedge.exe"),
-          path.join(process.env.ProgramFiles ?? "C:\\Program Files", "Microsoft\\Edge\\Application\\msedge.exe"),
-          path.join(process.env.ProgramFiles ?? "C:\\Program Files", "Google\\Chrome\\Application\\chrome.exe"),
-          path.join(process.env.LOCALAPPDATA ?? "", "Google\\Chrome\\Application\\chrome.exe"),
-          path.join(process.env.LOCALAPPDATA ?? "", "Microsoft\\Edge\\Application\\msedge.exe"),
-        ]
-      : process.platform === "darwin"
-        ? ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"]
-        : ["/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/microsoft-edge"];
-  return candidates.find((p) => p && fs.existsSync(p)) ?? null;
-}
-
-export async function captureHeadlessScreenshot(
-  targetPathOrUrl: string,
-  workspaceRoot: string,
-  recentFiles: readonly string[] = [],
-): Promise<{ ok: boolean; shotPath: string; targetUrl: string; error?: string }> {
-  const raw = targetPathOrUrl.trim() || resolveDefaultOpenTarget(workspaceRoot, recentFiles);
-  const isHttp = /^https?:\/\//i.test(raw);
-  const resolvedLocal = isHttp ? raw : path.resolve(workspaceRoot, expandHomePath(raw));
-  const shotPath = path.join(workspaceRoot, ".debug", "shot.png");
-  if (!isHttp && (!fs.existsSync(resolvedLocal) || !fs.statSync(resolvedLocal).isFile())) {
-    return { ok: false, shotPath, targetUrl: resolvedLocal, error: `未找到可截图的目标文件: ${resolvedLocal}` };
-  }
-  const browserBin = findHeadlessBrowserBinary();
-  if (!browserBin) return { ok: false, shotPath, targetUrl: resolvedLocal, error: "未检测到本机 Edge 或 Chrome 浏览器可执行文件" };
-  const targetUrl = isHttp ? raw : pathToFileURL(resolvedLocal).href;
-  fs.mkdirSync(path.dirname(shotPath), { recursive: true });
-  if (fs.existsSync(shotPath)) try { fs.unlinkSync(shotPath); } catch {}
-  const tmpProfile = fs.mkdtempSync(path.join(os.tmpdir(), "duo-shot-"));
-  try {
-    await new Promise<void>((resolve) => {
-      const args = [`--headless=new`, `--disable-gpu`, `--no-first-run`, `--no-default-browser-check`, `--user-data-dir=${tmpProfile}`, `--window-size=1280,800`, `--screenshot=${shotPath}`, targetUrl];
-      const child = spawn(browserBin, args, { detached: process.platform !== "win32", stdio: "ignore", windowsHide: true });
-      const timer = setTimeout(() => { killProcessGroup(child.pid); resolve(); }, 12_000);
-      child.on("close", () => { clearTimeout(timer); resolve(); });
-      child.on("error", () => { clearTimeout(timer); resolve(); });
-    });
-    if (!fs.existsSync(shotPath)) return { ok: false, shotPath, targetUrl, error: "浏览器未生成截图文件 (.debug/shot.png)" };
-    openInDefaultApp(shotPath, workspaceRoot);
-    return { ok: true, shotPath, targetUrl };
-  } finally {
-    try { fs.rmSync(tmpProfile, { recursive: true, force: true }); } catch {}
-  }
+  const hasBareImageOnly = attachedImages.length > 0 && blocks.length === 0 && !prompt.replace(/@(?:"[^"]+"|'[^']+'|\S+)/g, "").trim();
+  const basePrompt = hasBareImageOnly ? `${prompt}\n\n请查看并分析这张截图。` : prompt;
+  return { expandedPrompt: blocks.length > 0 ? `${basePrompt}\n\n${blocks.join("\n\n")}` : basePrompt, attachedPaths, attachedImages };
 }
 
 export async function runLocalBangCommand(
@@ -209,8 +207,7 @@ export async function runLocalBangCommand(
     console.log("💡 用法: !<本地命令> (例如: !git status 或 !pnpm test，直接在终端秒跑且 0 Token 消耗)");
     return;
   }
-  const abortCtrl = new AbortController();
-  const onSigint = () => abortCtrl.abort();
+  const abortCtrl = new AbortController(), onSigint = () => abortCtrl.abort();
   rl?.on("SIGINT", onSigint);
   try {
     console.log(`⚡ [本地直跑] $ ${cmd}`);

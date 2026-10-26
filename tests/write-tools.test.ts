@@ -208,10 +208,12 @@ describe("Stage 3: 写工具 (edit_file/run_bash/rollback_version)、暂停审�
     const priorSnapshots = [
       { version: 1, path: "prev.ts", beforeContent: "old", afterContent: "kept", timestamp: 1 },
     ];
+    const redoBatches: any[][] = [];
     const res = await runAgentSession("尝试修改", {
       provider: mockProvider,
       workspaceRoot: tmpRoot,
       snapshots: priorSnapshots,
+      redoBatches,
       enableWriteTools: true,
       maxSteps: 1, // 第 1 轮工具改完文件后 step=1，交卷验证失败时触发 maxSteps 熔断 ABORT
       verifyCompletion: () => ({ ok: false, errorOutput: "编译依然报错" }),
@@ -223,6 +225,9 @@ describe("Stage 3: 写工具 (edit_file/run_bash/rollback_version)、暂停审�
     expect(fs.existsSync(path.join(tmpRoot, "temp-junk.ts"))).toBe(false);
     expect(priorSnapshots).toHaveLength(1);
     expect(priorSnapshots[0]!.path).toBe("prev.ts");
+    // 验证自动回滚的修改已压入 redoBatches，随时可通过 /redo 恢复
+    expect(redoBatches).toHaveLength(1);
+    expect(redoBatches[0]).toHaveLength(2);
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   });
 
@@ -825,6 +830,64 @@ describe("Stage 3: 写工具 (edit_file/run_bash/rollback_version)、暂停审�
     grants.reset();
     expect(grants.trustedReadDirs.size).toBe(0);
     expect(() => resolveSafePath(wsA, "../shared-lib/config.json", "read", grants)).toThrow(/禁止访问/);
+
+    // 5. 复合命令 printenv 敏感变量绕过拦截 + edit_file 相对缩进偏移容错与多重匹配行号定位 + 运行期 Steer 插话队列
+    expect(analyzeBashSandbox("true && printenv DEEPSEEK_API_KEY", wsA).tier).toBe("deny");
+    expect(analyzeBashSandbox("ls; printenv 'MIMO_API_KEY'", wsA).tier).toBe("deny");
+
+    const indentFile = path.join(wsA, "indent.ts");
+    fs.writeFileSync(indentFile, "function demo() {\n    if (ok) {\n      return 1;\n    }\n}\n", "utf-8");
+    const [editTool] = createWriteTools(wsA);
+    await editTool!.execute({
+      path: "indent.ts",
+      oldText: "if (ok) {\n  return 1;\n}",
+      newText: "if (ok) {\n  return 2;\n}",
+    });
+    expect(fs.readFileSync(indentFile, "utf-8")).toBe("function demo() {\n    if (ok) {\n      return 2;\n    }\n}\n");
+
+    fs.writeFileSync(indentFile, "const a = 1;\nconst x = 0;\nconst a = 1;\n", "utf-8");
+    await expect(editTool!.execute({ path: "indent.ts", oldText: "const a = 1;", newText: "const a = 2;" })).rejects.toThrow(/位于第 1, 3 行/);
+
+    let steerPulled = false;
+    const steerSeen: any[][] = [];
+    let sStep = 0;
+    const steerReplies: any[] = [
+      { role: "assistant", content: "", toolCalls: [{ id: "s1", name: "list_dir", arguments: { path: "." } }] },
+      { role: "assistant", content: "已收到插话并完成" },
+    ];
+    await runAgentSession("初始问题", {
+      workspaceRoot: wsA,
+      suppressFinalEcho: true,
+      drainSteerMessages: () => {
+        if (!steerPulled) { steerPulled = true; return ["请顺便检查端口 8080"]; }
+        return [];
+      },
+      provider: { async chat(msgs) { steerSeen.push(msgs); return steerReplies[sStep++]!; } },
+    });
+    expect(steerSeen[1]?.some((m) => m.role === "user" && m.content.includes("请顺便检查端口 8080"))).toBe(true);
+
+    // 6. COMPLETE 阶段消费末尾插话 + 连续重复工具错误防死磕提示
+    let completeSteerPulled = false, cStep = 0;
+    const cSeen: any[][] = [];
+    const cReplies: any[] = [
+      { role: "assistant", content: "", toolCalls: [{ id: "e1", name: "read_file", arguments: { path: "no-such-file.ts" } }] },
+      { role: "assistant", content: "", toolCalls: [{ id: "e2", name: "read_file", arguments: { path: "no-such-file.ts" } }] },
+      { role: "assistant", content: "准备结束回答" },
+      { role: "assistant", content: "已处理末尾插话并最终完成" },
+    ];
+    const cRes = await runAgentSession("测试连续报错与末尾插话", {
+      workspaceRoot: wsA,
+      suppressFinalEcho: true,
+      drainSteerMessages: () => {
+        if (cStep === 3 && !completeSteerPulled) { completeSteerPulled = true; return ["再补充一句总结"]; }
+        return [];
+      },
+      provider: { async chat(msgs) { cSeen.push(msgs); return cReplies[cStep++]!; } },
+    });
+    expect(cRes.finalAnswer).toBe("已处理末尾插话并最终完成");
+    const secondErrMsg = cSeen[2]?.find((m) => m.role === "tool" && m.toolCallId === "e2");
+    expect(secondErrMsg?.content).toContain("[系统防卡死提示：该操作已连续 2 次出现相同报错");
+    expect(cSeen[3]?.some((m) => m.role === "user" && m.content.includes("再补充一句总结"))).toBe(true);
 
     fs.rmSync(tmpBase, { recursive: true, force: true });
   });

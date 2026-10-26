@@ -54,14 +54,12 @@ export function resolveExistingRealPath(targetPath: string): string {
 }
 
 export function getBuiltinReadonlySkillRoots(home = os.homedir()): string[] {
-  return [
-    path.join(home, ".duo-harness", "skills"),
-    path.join(home, ".codex", "skills"),
-    path.join(home, ".agents", "skills"),
-    path.join(home, ".claude", "skills"),
-    path.join(home, ".gemini", "config", "plugins"),
-    path.join(home, ".gemini", "antigravity", "builtin", "skills"),
-  ].map(resolveExistingRealPath);
+  const bases = [".duo-harness/skills", ".codex/skills", ".agents/skills", ".claude/skills", ".gemini/config/plugins", ".gemini/antigravity/builtin/skills"].map((p) => path.join(home, p));
+  const out = new Set(bases.map(resolveExistingRealPath));
+  for (const b of bases) {
+    try { for (const d of fsSync.readdirSync(b)) out.add(resolveExistingRealPath(path.join(b, d))); } catch {}
+  }
+  return [...out];
 }
 
 function isGrantedBySession(realCandidate: string, mode: "read" | "write", grants?: SandboxGrants): boolean {
@@ -156,8 +154,8 @@ export function analyzeBashSandbox(cmd: string, workspaceRoot: string, grants?: 
   if (HARD_DENY_CMD_RE.test(raw) || /\$(?:MIMO_|DEEPSEEK_|OPENAI_|ANTHROPIC_|GEMINI_)[A-Z0-9_]*/i.test(raw)) {
     return { tier: "deny", reason: "禁止导出全量系统环境变量或探测宿主敏感密钥", externalDirs: [] };
   }
-  if (/^printenv\s+(\S+)/i.test(raw)) {
-    const arg = raw.match(/^printenv\s+(\S+)/i)?.[1] ?? "";
+  for (const m of raw.matchAll(/(?:^|[;&|]\s*)printenv\s+([^\s;&|>]+)/gi)) {
+    const arg = m[1]?.replace(/^['"]|['"]$/g, "") ?? "";
     if (SENSITIVE_SUBPROCESS_ENV_RE.test(arg)) return { tier: "deny", reason: `禁止读取敏感环境变量 (${arg})`, externalDirs: [] };
   }
   const home = os.homedir(), realRoot = resolveExistingRealPath(workspaceRoot);

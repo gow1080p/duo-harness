@@ -11,17 +11,8 @@ export { parseOpenAiAssistantMessage };
 
 export type RouteTier = "tier0_replay" | "tier1_mimo_peak" | "tier2_deepseek_offpeak" | "tier3_gemini_cli";
 
-export interface RouteOptions {
-  isReplay?: boolean;
-  forceGeminiCli?: boolean;
-}
-
-export interface RouteDecision {
-  tier: RouteTier;
-  beijingHour: number;
-  isWorkday: boolean;
-  reason: string;
-}
+export interface RouteOptions { isReplay?: boolean; forceGeminiCli?: boolean; }
+export interface RouteDecision { tier: RouteTier; beijingHour: number; isWorkday: boolean; reason: string; }
 
 export function resolveRouteTier(utcTimestampMs: number, options: RouteOptions = {}): RouteDecision {
   const beijingDate = new Date(utcTimestampMs + 8 * 3600_000);
@@ -36,16 +27,19 @@ export function resolveRouteTier(utcTimestampMs: number, options: RouteOptions =
 }
 
 function zodTypeToJsonSchema(fieldSchema: z.ZodTypeAny): { schema: Record<string, unknown>; isOptional: boolean } {
-  let current: z.ZodTypeAny = fieldSchema;
-  let isOptional = false;
+  let current: z.ZodTypeAny = fieldSchema, isOptional = false, desc = fieldSchema.description;
   while (current instanceof z.ZodOptional || current instanceof z.ZodDefault || current instanceof z.ZodEffects) {
     if (current instanceof z.ZodOptional || current instanceof z.ZodDefault) isOptional = true;
     current = current instanceof z.ZodEffects ? current._def.schema : current._def.innerType;
+    desc ??= current.description;
   }
-  if (current instanceof z.ZodArray) return { schema: { type: "array", items: zodTypeToJsonSchema(current._def.type).schema }, isOptional };
-  if (current instanceof z.ZodObject) return { schema: zodObjectToJsonSchema(current), isOptional };
+  const withDesc = (base: Record<string, unknown>) => (desc ? { ...base, description: desc } : base);
+  if (current instanceof z.ZodArray) return { schema: withDesc({ type: "array", items: zodTypeToJsonSchema(current._def.type).schema }), isOptional };
+  if (current instanceof z.ZodObject) return { schema: withDesc(zodObjectToJsonSchema(current)), isOptional };
+  if (current instanceof z.ZodEnum) return { schema: withDesc({ type: "string", enum: current._def.values }), isOptional };
+  if (current instanceof z.ZodLiteral) return { schema: withDesc({ type: typeof current._def.value, enum: [current._def.value] }), isOptional };
   const typeName = current instanceof z.ZodNumber ? "number" : current instanceof z.ZodBoolean ? "boolean" : "string";
-  return { schema: { type: typeName }, isOptional };
+  return { schema: withDesc({ type: typeName }), isOptional };
 }
 
 export function zodObjectToJsonSchema(schema: z.ZodTypeAny): Record<string, unknown> {
@@ -61,43 +55,61 @@ export function zodObjectToJsonSchema(schema: z.ZodTypeAny): Record<string, unkn
   return { type: "object", properties, ...(required.length > 0 ? { required } : {}) };
 }
 
-export function toOpenAiMessages(messages: Message[], workspaceRoot = process.cwd()): Record<string, unknown>[] {
+export function toOpenAiMessages(messages: Message[], workspaceRoot = process.cwd(), allowImages = true): Record<string, unknown>[] {
   const lastUserIdx = messages.map((m) => m.role).lastIndexOf("user");
-  return messages.map((msg, idx) => {
+  const outParams: Record<string, unknown>[] = [];
+  const seenTurnImages = new Set<string>();
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i]!;
     if (msg.role === "assistant") {
       const hasTools = Boolean(msg.toolCalls && msg.toolCalls.length > 0);
-      const out: Record<string, unknown> = {
-        role: "assistant",
-        content: msg.content || (hasTools ? null : ""),
-      };
-      if (idx > lastUserIdx && msg.reasoningContent !== undefined) {
-        out.reasoning_content = msg.reasoningContent;
-      }
+      const out: Record<string, unknown> = { role: "assistant", content: msg.content || (hasTools ? null : "") };
+      if (i > lastUserIdx && msg.reasoningContent !== undefined) out.reasoning_content = msg.reasoningContent;
       if (msg.toolCalls && msg.toolCalls.length > 0) {
-        out.tool_calls = msg.toolCalls.map((tc) => ({
-          id: tc.id,
-          type: "function",
-          function: { name: tc.name, arguments: JSON.stringify(tc.arguments) },
-        }));
+        out.tool_calls = msg.toolCalls.map((tc) => ({ id: tc.id, type: "function", function: { name: tc.name, arguments: JSON.stringify(tc.arguments) } }));
       }
-      return out;
+      outParams.push(out);
+      continue;
     }
     if (msg.role === "tool") {
-      return { role: "tool", tool_call_id: msg.toolCallId, name: msg.name, content: msg.content };
-    }
-    if (msg.role === "user" && msg.images && msg.images.length > 0) {
-      const parts: Record<string, unknown>[] = [{ type: "text", text: msg.content }];
-      for (const img of msg.images) {
-        const abs = path.isAbsolute(img.path) ? img.path : path.resolve(workspaceRoot, img.path);
-        if (fs.existsSync(abs)) {
-          const b64 = fs.readFileSync(abs).toString("base64");
-          parts.push({ type: "image_url", image_url: { url: `data:${img.mimeType};base64,${b64}` } });
+      const imageBlocks: Record<string, unknown>[] = [];
+      let j = i;
+      for (; j < messages.length && messages[j]!.role === "tool"; j++) {
+        const tm = messages[j] as Extract<Message, { role: "tool" }>;
+        outParams.push({ role: "tool", tool_call_id: tm.toolCallId, name: tm.name, content: tm.content });
+        for (const img of allowImages ? (tm.images ?? []) : []) {
+          const abs = path.isAbsolute(img.path) ? img.path : path.resolve(workspaceRoot, img.path);
+          if (!seenTurnImages.has(abs) && fs.existsSync(abs)) {
+            seenTurnImages.add(abs);
+            imageBlocks.push({ type: "image_url", image_url: { url: `data:${img.mimeType};base64,${fs.readFileSync(abs).toString("base64")}` } });
+          }
         }
       }
-      if (parts.length > 1) return { role: "user", content: parts };
+      i = j - 1;
+      if (imageBlocks.length > 0) {
+        outParams.push({ role: "user", content: [{ type: "text", text: "Attached image(s) from tool result:" }, ...imageBlocks] });
+      }
+      continue;
     }
-    return { role: msg.role, content: msg.content };
-  });
+    if (msg.role === "user") {
+      seenTurnImages.clear();
+      if (msg.images && msg.images.length > 0) {
+        const tags = msg.images.map((img) => `<attached_image path="${img.path}" mime="${img.mimeType}" />`).join("\n");
+        if (!allowImages) { outParams.push({ role: "user", content: `${msg.content}\n${tags}`.trim() }); continue; }
+        const parts: Record<string, unknown>[] = [{ type: "text", text: `${msg.content}\n${tags}`.trim() }];
+        for (const img of msg.images) {
+          const abs = path.isAbsolute(img.path) ? img.path : path.resolve(workspaceRoot, img.path);
+          if (fs.existsSync(abs)) {
+            seenTurnImages.add(abs);
+            parts.push({ type: "image_url", image_url: { url: `data:${img.mimeType};base64,${fs.readFileSync(abs).toString("base64")}` } });
+          }
+        }
+        if (parts.length > 1) { outParams.push({ role: "user", content: parts }); continue; }
+      }
+    }
+    outParams.push({ role: msg.role, content: msg.content });
+  }
+  return outParams;
 }
 
 function readKeyFromFile(filePath: string, envName: string, allowBareFirstLine = true): string {
@@ -170,9 +182,10 @@ export function createRouterProvider(wireLogFile = ".sessions/http-wire.json", a
         roundCount += 1;
         return agyDelegate.chat(messages, tools, options);
       }
-      const hasPrior = messages.some((m) => m.role === "assistant");
-      const hasImages = messages.some((m) => m.role === "user" && Boolean(m.images && m.images.length > 0));
-      const { apiUrl, model, apiKey } = resolveActiveModelTarget(wireLogFile, hasPrior, mode, Date.now(), hasImages);
+      const hasPrior = messages.some((m) => m.role === "assistant"), lastUserIdx = messages.map((m) => m.role).lastIndexOf("user");
+      const turnHasImages = messages.slice(Math.max(0, lastUserIdx)).some((m) => (m.role === "user" || m.role === "tool") && Boolean(m.images && m.images.length > 0));
+      const userTurnHasImages = Boolean(lastUserIdx >= 0 && (messages[lastUserIdx] as Extract<Message, { role: "user" }>)?.images?.length);
+      const { apiUrl, model, apiKey } = resolveActiveModelTarget(wireLogFile, hasPrior, mode, Date.now(), mode === "deepseek" ? userTurnHasImages : turnHasImages);
       if (!apiKey) throw new Error(`未检测到模型密钥，请配置 DEEPSEEK_API_KEY / MIMO_API_KEY 或 ~/.gemini/antigravity/.deepseek_key`);
 
       const openAiTools = tools.map((t) => ({
@@ -181,7 +194,7 @@ export function createRouterProvider(wireLogFile = ".sessions/http-wire.json", a
       }));
       const requestBody: Record<string, unknown> = {
         model,
-        messages: toOpenAiMessages(messages, options.workspaceRoot),
+        messages: toOpenAiMessages(messages, options.workspaceRoot, !model.startsWith("deepseek")),
         ...(openAiTools.length > 0 ? { tools: openAiTools } : {}),
         ...(model.includes("reasoner") ? {} : { temperature: 0 }),
         stream: true,

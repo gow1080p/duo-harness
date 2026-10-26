@@ -2,30 +2,30 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { z } from "zod";
-import type { ToolCall, ToolContract, ToolResultMessage } from "../core/contracts.js";
+import type { ImageAttachment, ToolCall, ToolContract, ToolExecuteOutput, ToolResultMessage } from "../core/contracts.js";
 import { toPosixRelative } from "./platform.js";
 import { resolveSafePath, type SandboxGrants } from "./sandbox-policy.js";
 
 export { resolveSafePath, type SandboxGrants };
 
 const ReadFileArgsSchema = z.object({
-  path: z.string().min(1),
-  startLine: z.number().int().min(0).optional(),
-  endLine: z.number().int().positive().optional(),
-  maxLines: z.number().int().positive().optional(),
+  path: z.string().min(1).describe("要读取的文件路径（支持工作区相对路径或已授权技能路径）"),
+  startLine: z.number().int().min(0).optional().describe("起始行号（1-based，可选）"),
+  endLine: z.number().int().positive().optional().describe("结束行号（含，可选）"),
+  maxLines: z.number().int().positive().optional().describe("最大读取行数（可选）"),
 });
 
 const ListDirArgsSchema = z.object({
-  path: z.string().default("."),
+  path: z.string().default(".").describe("要列出的目录路径（默认当前工作区根目录 .）"),
 });
 
 const GrepArgsSchema = z.object({
-  pattern: z.string().min(1),
-  path: z.string().default("."),
-  contextLines: z.number().int().min(0).optional(),
+  pattern: z.string().min(1).describe("要搜索的正则表达式或关键词"),
+  path: z.string().default(".").describe("搜索的文件或目录路径（默认 .）"),
+  contextLines: z.number().int().min(0).optional().describe("附带的前后上下文行数（0-15）"),
 });
 
-export const IGNORED_DIRS = new Set([".git", "node_modules", ".sessions", "venv", ".venv", "__pycache__", "dist", "build", ".next"]);
+export const IGNORED_DIRS = new Set([".git", "node_modules", ".sessions", ".debug", "venv", ".venv", "__pycache__", "dist", "build", ".next"]);
 export const BINARY_EXT_RE = /\.(png|jpe?g|gif|webp|ico|pdf|zip|tar|gz|woff2?|ttf|eot|mp[34]|mov|pyc|so|dylib|dll|exe|db|sqlite3?|lock)$/i;
 
 async function runGrepSearch(
@@ -74,7 +74,9 @@ async function runGrepSearch(
       }
     });
   }
-  return matches.length > 0 ? matches.slice(0, 50).join("\n") : "未找到匹配内容";
+  if (matches.length === 0) return "未找到匹配内容";
+  const shown = matches.slice(0, 50).join("\n");
+  return matches.length > 50 ? `${shown}\n... [共找到 ${matches.length} 处匹配，仅展示前 50 处，请缩小 path 或 pattern 范围]` : shown;
 }
 
 function formatFileWithLineCount(fullFilePath: string, displayName: string): string {
@@ -90,19 +92,60 @@ function formatFileWithLineCount(fullFilePath: string, displayName: string): str
   }
 }
 
+const BITMAP_IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp|ico)$/i;
+
+function detectBitmapMimeType(filePath: string): string {
+  const ext = path.extname(filePath).toLowerCase();
+  if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
+  if (ext === ".gif") return "image/gif";
+  if (ext === ".webp") return "image/webp";
+  if (ext === ".ico") return "image/x-icon";
+  return "image/png";
+}
+
+async function runReadFile(
+  workspaceRoot: string,
+  args: z.infer<typeof ReadFileArgsSchema>,
+  grants?: SandboxGrants,
+): Promise<ToolExecuteOutput> {
+  const realRoot = resolveSafePath(workspaceRoot, ".", "read", grants);
+  const fullPath = resolveSafePath(workspaceRoot, args.path, "read", grants);
+  const stat = await fs.stat(fullPath);
+  if (BITMAP_IMAGE_EXT_RE.test(fullPath)) {
+    const mimeType = detectBitmapMimeType(fullPath);
+    if (stat.size > 5 * 1024 * 1024) {
+      return `Read image file [${mimeType}] failed: file size (${stat.size} bytes) exceeds 5MB limit.`;
+    }
+    const rel = toPosixRelative(realRoot, fullPath) || path.basename(fullPath);
+    const imgPath = rel.startsWith("..") ? fullPath : rel;
+    const kb = Math.max(1, Math.round(stat.size / 1024));
+    return {
+      content: `Read image file [${mimeType}] (${kb} KB)`,
+      images: [{ path: imgPath, mimeType, byteSize: stat.size }],
+    };
+  }
+  if (BINARY_EXT_RE.test(fullPath) || stat.size > 2_000_000) {
+    return `[二进制或超大文件 (${stat.size} bytes)，无法通过 read_file 作为 UTF-8 文本读取]`;
+  }
+  const raw = await fs.readFile(fullPath, "utf-8");
+  if (raw.includes("\u0000")) {
+    return `[二进制文件 (含 NUL 字节)，无法作为 UTF-8 文本读取]`;
+  }
+  const lines = raw.split("\n");
+  const startIdx = Math.max(0, (args.startLine ?? 1) - 1);
+  const endIdx = Math.min(lines.length, args.endLine ? args.endLine : startIdx + (args.maxLines ?? lines.length));
+  const out = lines.slice(startIdx, endIdx).map((line, i) => `${startIdx + i + 1}: ${line}`).join("\n");
+  const rangeNote = startIdx > 0 || endIdx < lines.length ? `\n... [文件共 ${lines.length} 行，当前显示第 ${startIdx + 1}-${Math.max(startIdx + 1, endIdx)} 行]` : "";
+  return out.length > 80_000 ? `${out.slice(0, 80_000)}\n... [单次读取超出 80,000 字符已截断，请传 startLine/endLine 分片读取]` : `${out}${rangeNote}`;
+}
+
 export function createBuiltinTools(workspaceRoot: string = process.cwd(), grants?: SandboxGrants): ToolContract<any>[] {
   const readFileTool: ToolContract<z.infer<typeof ReadFileArgsSchema>> = {
     name: "read_file",
-    description: "读取指定文件的文本内容（支持 startLine/endLine 行区间切片，附带行号）",
+    description: "读取指定文件的内容（支持文本代码 startLine/endLine 行区间切片，以及读取 png/jpg/gif/webp 图片并作为多模态附件返回）",
     parameters: ReadFileArgsSchema,
     readonly: true,
-    async execute(args) {
-      const fullPath = resolveSafePath(workspaceRoot, args.path, "read", grants);
-      const lines = (await fs.readFile(fullPath, "utf-8")).split("\n");
-      const startIdx = Math.max(0, (args.startLine ?? 1) - 1);
-      const endIdx = args.endLine ? Math.min(lines.length, args.endLine) : startIdx + (args.maxLines ?? lines.length);
-      return lines.slice(startIdx, endIdx).map((line, i) => `${startIdx + i + 1}: ${line}`).join("\n");
-    },
+    execute: (args) => runReadFile(workspaceRoot, args, grants),
   };
 
   const listDirTool: ToolContract<z.infer<typeof ListDirArgsSchema>> = {
@@ -118,7 +161,7 @@ export function createBuiltinTools(workspaceRoot: string = process.cwd(), grants
       const ignoredFound: string[] = [];
       for (const e of entries) {
         if (IGNORED_DIRS.has(e.name)) {
-          if (e.isDirectory() && e.name !== ".git" && e.name !== ".sessions") ignoredFound.push(`${e.name}/`);
+          if (e.isDirectory() && e.name !== ".git" && e.name !== ".sessions" && e.name !== ".debug") ignoredFound.push(`${e.name}/`);
           continue;
         }
         if (e.isDirectory()) {
@@ -129,10 +172,11 @@ export function createBuiltinTools(workspaceRoot: string = process.cwd(), grants
             if (!IGNORED_DIRS.has(sub.name)) {
               const relSub = `${e.name}/${sub.name}`;
               lines.push(`  ${sub.isDirectory() ? `${relSub}/` : formatFileWithLineCount(path.join(subPath, sub.name), relSub)}`);
-            } else if (sub.isDirectory() && sub.name !== ".git" && sub.name !== ".sessions") {
+            } else if (sub.isDirectory() && sub.name !== ".git" && sub.name !== ".sessions" && sub.name !== ".debug") {
               ignoredFound.push(`${e.name}/${sub.name}/`);
             }
           }
+          if (subEntries.length > 25) lines.push(`  ... (其余 ${subEntries.length - 25} 项已省略，可对该子目录单独调用 list_dir)`);
         } else {
           lines.push(formatFileWithLineCount(path.join(fullPath, e.name), e.name));
         }
@@ -163,6 +207,16 @@ async function executeSingleToolCall(
   }
   try {
     const output = await tool.execute(tool.parameters.parse(call.arguments));
+    if (typeof output === "object" && output !== null && "content" in output) {
+      return {
+        role: "tool",
+        toolCallId: call.id,
+        name: call.name,
+        content: String(output.content),
+        ...(output.images && output.images.length > 0 ? { images: output.images } : {}),
+        isError: false,
+      };
+    }
     return { role: "tool", toolCallId: call.id, name: call.name, content: String(output), isError: false };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

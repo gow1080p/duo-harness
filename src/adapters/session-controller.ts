@@ -85,8 +85,8 @@ async function executeControllerAsk(st: ControllerMutableState, prompt: string, 
   saveProjectMeta(st.paths.metaFile, { activeLeafId: null, ...(meta.lastUndoNotice ? { lastUndoNotice: null } : {}) });
   const snapStart = st.snapshots.length, turnId = `turn_${Date.now()}`;
   const persistTurnSnapshots = () => {
-    for (let i = 0; i < st.snapshots.length; i++) {
-      if (!st.snapshots[i]!.turnId) { st.snapshots[i]!.turnId = turnId; st.redoBatches = []; }
+    for (let i = snapStart; i < st.snapshots.length; i++) {
+      if (!st.snapshots[i]!.turnId) { st.snapshots[i]!.turnId = turnId; st.redoBatches.length = 0; }
     }
     saveProjectSnapshots(st.paths.snapshotsFile, st.snapshots, st.redoBatches);
   };
@@ -94,7 +94,7 @@ async function executeControllerAsk(st: ControllerMutableState, prompt: string, 
   try {
     const res = await runAgentSession(effectivePrompt, {
       ...runOpts, workspaceRoot: st.paths.workspaceRoot, sessionFile: st.paths.sessionFile, wireLogFile: st.paths.wireLogFile,
-      leafId: st.leafId ?? undefined, provider: runOpts.provider ?? st.provider, snapshots: st.snapshots, sandboxGrants: st.sandboxGrants,
+      leafId: st.leafId ?? undefined, provider: runOpts.provider ?? st.provider, snapshots: st.snapshots, redoBatches: st.redoBatches, sandboxGrants: st.sandboxGrants,
       userImages: runOpts.userImages ?? attachedImages, onSnapshotChange: persistTurnSnapshots, enableWriteTools: runOpts.enableWriteTools ?? true, showCostReport: runOpts.showCostReport ?? false,
     });
     finalLeafId = res.leafId;
@@ -106,8 +106,9 @@ async function executeControllerAsk(st: ControllerMutableState, prompt: string, 
       modifiedFiles: summarizeSnapshotsDiff(turnSnaps, st.paths.workspaceRoot),
     };
   } catch (err) {
-    const disk = loadDiskEntries(st.paths.sessionFile);
-    if (disk.length > 0) finalLeafId = disk[disk.length - 1]!.id;
+    const disk = loadDiskEntries(st.paths.sessionFile), last = disk[disk.length - 1];
+    if (last && last.message.role !== "user") finalLeafId = last.id;
+    else if (!finalLeafId && disk[0]) finalLeafId = disk[0].id;
     if (st.snapshots.length > snapStart) console.log(`💾 [本轮中途异常前已落盘 ${st.snapshots.length - snapStart} 处文件修改 · 可直接输入“继续”接力收尾，或输入 /diff 查看 | /undo 撤回]`);
     throw err;
   } finally {
@@ -234,7 +235,7 @@ export function createSessionController(options: SessionControllerOptions = {}) 
     },
     clearHistory: (): SessionStatusSummary => {
       for (const f of [st.paths.sessionFile, st.paths.wireLogFile, st.paths.snapshotsFile]) if (fs.existsSync(f)) fs.unlinkSync(f);
-      st.leafId = null; st.snapshots = []; st.redoBatches = []; st.sandboxGrants.reset();
+      st.leafId = null; st.snapshots.length = 0; st.redoBatches.length = 0; st.sandboxGrants.reset();
       saveProjectMeta(st.paths.metaFile, { activeLeafId: null, lastUndoNotice: null });
       return buildStatusSummary(st);
     },

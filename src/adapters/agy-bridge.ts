@@ -81,26 +81,34 @@ export async function probeAgyQuota(): Promise<AgyQuotaSnapshot> {
   return { online: true, userTier: String(statusData?.userStatus?.userTier?.name ?? "Pro"), remaining5hPct: rem5hPct, resetInMinutes, remainingWeeklyPct: remWeeklyPct, shouldPreferAgy, summaryLabel: `5h余 ${rem5hPct}%${resetTag} · 周余 ${remWeeklyPct}% (${shouldPreferAgy ? "🟢 推荐白嫖" : "🟡 保守留存"})` };
 }
 
-export function buildBridgePrompt(messages: Message[], tools: ToolContract<any>[] = []): string {
+export function buildBridgePrompt(messages: Message[], tools: ToolContract<any>[] = [], workspaceRoot = process.cwd()): string {
   const parts = ["【档位：Argon-Med】请保持思考链精炼高效（thinking <= 150 字，使用简明中文），直奔结论。"];
+  let hasImages = false;
   for (const m of messages) {
     if (m.role === "assistant" && m.toolCalls?.length) {
       parts.push(`[ASSISTANT]\n${m.content ? `${m.content}\n` : ""}${JSON.stringify({ toolCalls: m.toolCalls })}`);
     } else if (m.role === "tool") {
-      parts.push(`[TOOL_RESULT (${m.name} · id=${m.toolCallId})]\n${m.content}`);
+      if (m.images?.length) hasImages = true;
+      const absImgs = (m.images ?? []).map((img) => (path.isAbsolute(img.path) ? img.path : path.resolve(workspaceRoot, img.path)));
+      parts.push(`[TOOL_RESULT (${m.name} · id=${m.toolCallId})]\n${m.content}${absImgs.length ? `\n[工具附加视觉图片: ${absImgs.join(", ")}]` : ""}`);
+    } else if (m.role === "user" && m.images?.length) {
+      hasImages = true;
+      const absImgs = m.images.map((img) => (path.isAbsolute(img.path) ? img.path : path.resolve(workspaceRoot, img.path)));
+      parts.push(`[USER]\n${m.content}\n[用户附加视觉图片: ${absImgs.join(", ")}]`);
     } else {
       parts.push(`[${m.role.toUpperCase()}]\n${m.content}`);
     }
   }
+  const visionNote = hasImages ? "（多模态特例：仅允许对 [用户附加视觉图片] 中的图片绝对路径调用内置 view_file/read_file 查看画面；其余一切操作严禁调内置工具）" : "";
   if (tools.length > 0) {
     const toolDesc = tools.map((t) => {
       const shape = (t.parameters as any)?.shape as Record<string, any> | undefined;
       const keys = shape ? Object.keys(shape).map((k) => (typeof shape[k]?.isOptional === "function" && shape[k].isOptional() ? `${k}?` : k)).join(", ") : "";
       return `- ${t.name}(${keys}): ${t.description}`;
     }).join("\n");
-    parts.push(`【Duo-Harness 桥接协议：严禁直接调用 Antigravity IDE 自身内置工具（严禁调 IDE 的 view_file/read_file/run_command/get-metrics.mjs 或拉起子代理）！若需查看目录、读取文件或执行命令，请从以下 Duo-Harness 宿主工具中选择，并直接输出且仅输出一行纯 JSON（不要加 markdown 代码块包裹）：\n{"content":"","toolCalls":[{"name":"工具名","arguments":{"参数名":"..."}}]}\n可用宿主工具列表：\n${toolDesc}\n若当前上下文已足够回答用户问题，请直接输出最终中文 Markdown 回答】`);
+    parts.push(`【Duo-Harness 桥接协议：严禁直接调用 Antigravity IDE 自身内置工具（严禁调 IDE 的 view_file/read_file/run_command/get-metrics.mjs 或拉起子代理）${visionNote}！若需查看目录、读取文件或执行命令，请从以下 Duo-Harness 宿主工具中选择，并直接输出且仅输出一行纯 JSON（不要加 markdown 代码块包裹）：\n{"content":"","toolCalls":[{"name":"工具名","arguments":{"参数名":"..."}}]}\n可用宿主工具列表：\n${toolDesc}\n若当前上下文已足够回答用户问题，请直接输出最终中文 Markdown 回答】`);
   } else {
-    parts.push("【纯文本/JSON 桥接守卫：以上已包含全部所需上下文。严禁调用任何工具(read_file/run_command等)、严禁运行 get-metrics.mjs 或拉起子代理，请直接输出最终回答】");
+    parts.push(`【纯文本/JSON 桥接守卫：以上已包含全部所需上下文。严禁调用任何工具(read_file/run_command等)${visionNote}、严禁运行 get-metrics.mjs 或拉起子代理，请直接输出最终回答】`);
   }
   return parts.join("\n\n");
 }
@@ -162,7 +170,7 @@ async function pollLivePlannerStep(convId: string, port: number, token: string):
 export function createAgyBridgeProvider(wireLogFile = ".sessions/http-wire.json", appendExistingWire = false): LlmProvider {
   let roundCount = 0;
   return {
-    async chat(messages: Message[], tools: ToolContract<any>[] = [], options: { signal?: AbortSignal; onStreamEvent?: (event: LlmStreamEvent) => void } = {}): Promise<AssistantMessage> {
+    async chat(messages: Message[], tools: ToolContract<any>[] = [], options: { signal?: AbortSignal; onStreamEvent?: (event: LlmStreamEvent) => void; workspaceRoot?: string } = {}): Promise<AssistantMessage> {
       const lsBin = resolveAntigravityLsBin();
       const conn = await discoverLocalLs();
       if (!fs.existsSync(lsBin) || !conn) throw new Error("未检测到本机运行中的 Antigravity language_server，无法使用 agy 桥接模式");
@@ -171,7 +179,7 @@ export function createAgyBridgeProvider(wireLogFile = ".sessions/http-wire.json"
       delete cleanEnv.ANTIGRAVITY_SIDECAR_UI_TOKEN;
       delete cleanEnv.ANTIGRAVITY_SIDECAR_WEB_PORT;
 
-      const prompt = buildBridgePrompt(messages, tools);
+      const prompt = buildBridgePrompt(messages, tools, options.workspaceRoot);
       let stdout = "";
       try {
         ({ stdout } = await execFileAsync(lsBin, ["agentapi", "new-conversation", "--model=pro", "--title=🪐 [Duo-Bridge] 临时工单", prompt], { env: cleanEnv, timeout: 25_000 }));

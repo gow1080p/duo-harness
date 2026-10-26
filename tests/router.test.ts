@@ -3,8 +3,11 @@ import { buildBridgePrompt, evaluateAgyQuotaSurplus, parseBridgeReply, stripAgyF
 import { checkFileSyntax } from "../src/adapters/bash-policy.js";
 import { buildAtMentionDropdown, expandAtMentions, runLocalBangCommand, stripAttachedFiles } from "../src/adapters/context-mention.js";
 import { summarizeWireCost } from "../src/adapters/cost-tracker.js";
-import { buildDropdownItems } from "../src/adapters/dropdown.js";
-import { extractConversationTurns } from "../src/adapters/project-store.js";
+import { buildDropdownItems, encodePastedNewlines, restorePastedNewlines } from "../src/adapters/dropdown.js";
+import { getVisualCols } from "../src/adapters/platform.js";
+import { extractConversationTurns, loadProjectMeta, resolveProjectSessionPaths, saveProjectMeta } from "../src/adapters/project-store.js";
+import { handleSlashCommand, runOneShotCli } from "../src/adapters/repl.js";
+import { createSessionController } from "../src/adapters/session-controller.js";
 import {
   parseOpenAiAssistantMessage,
   resolveActiveModelTarget,
@@ -308,7 +311,7 @@ describe("Step 1.4: src/adapters/router.ts 协议转换与分时路由测试", (
     fs.rmSync(tmpWs, { recursive: true, force: true });
   });
 
-  it("11. Aider 式写后 0ms 语法自检 (checkFileSyntax) 与 Claude Code 式审批框按 d 展开测试", () => {
+  it("11. Aider 式写后 0ms 语法自检 (checkFileSyntax) 与 Claude Code 式审批框按 d 展开测试", async () => {
     // 1) HTML 内联 <script> 精准抓出第 5 行多余 ); 语法错误，且行号完全对齐
     const brokenHtml = ["<!doctype html>", "<html>", "<body>", "<script>", "  halo.addColorStop(1, 'rgba(255,170,90,0)'););", "</script>", "</body></html>"].join("\n");
     const htmlErr = checkFileSyntax("van-gogh-pelican.html", brokenHtml);
@@ -381,5 +384,51 @@ describe("Step 1.4: src/adapters/router.ts 协议转换与分时路由测试", (
     expect(once.requestBody.tools).toBeUndefined();
     expect(JSON.stringify(once).length).toBeLessThan(1200);
     expect(summarizeWireCost([once]).totalPromptTokens).toBe(1200);
+
+    // 验证 zodObjectToJsonSchema 保留外层 .optional().describe() 与 z.enum
+    const testSchema = z.object({
+      mode: z.enum(["read", "write"]).default("read").describe("读写模式"),
+      startLine: z.number().int().optional().describe("起始行"),
+    });
+    const jsonSchema = zodObjectToJsonSchema(testSchema) as any;
+    expect(jsonSchema.properties.mode).toEqual({ type: "string", enum: ["read", "write"], description: "读写模式" });
+    expect(jsonSchema.properties.startLine).toEqual({ type: "number", description: "起始行" });
+
+    // 验证单宽制表符/箭头/圆点宽度为 1 列、CJK 为 2 列，且多行粘贴编解码无损
+    expect(getVisualCols("❯ ─│•→")).toBe(6);
+    expect(getVisualCols("中文")).toBe(4);
+    const multi = "line1\r\nline2\nline3";
+    const encoded = encodePastedNewlines(multi);
+    expect(encoded.includes("\n")).toBe(false);
+    expect(restorePastedNewlines(encoded)).toBe("line1\nline2\nline3");
+
+    // 验证 inputHistory 逆序持久化、/commit 展开及 runOneShotCli 管道输入 + -y 写操作落盘
+    const tmpOneShot = fs.mkdtempSync(path.join(os.tmpdir(), "duo-oneshot-"));
+    try {
+      const paths = resolveProjectSessionPaths(tmpOneShot, tmpOneShot);
+      saveProjectMeta(paths.metaFile, { inputHistory: ["最新命令", "上一条命令"] });
+      expect(loadProjectMeta(paths.metaFile).inputHistory).toEqual(["最新命令", "上一条命令"]);
+
+      const ctrl = createSessionController({ workspaceRoot: tmpOneShot, homeBaseDir: tmpOneShot });
+      const commitExpanded = await handleSlashCommand("/commit 修复管道输入", ctrl);
+      expect(typeof commitExpanded).toBe("string");
+      expect(String(commitExpanded)).toContain("git commit");
+
+      let step = 0;
+      const seenOneShotMsgs: any[][] = [];
+      const mockReplies: any[] = [
+        { role: "assistant", content: "", toolCalls: [{ id: "e1", name: "edit_file", arguments: { path: "note.txt", oldText: "", newText: "fixed" } }] },
+        { role: "assistant", content: "已根据管道报错修好 note.txt" },
+      ];
+      await runOneShotCli(["-y", "修一下"], "Error: missing note.txt", {
+        workspaceRoot: tmpOneShot,
+        homeBaseDir: tmpOneShot,
+        provider: { async chat(msgs) { seenOneShotMsgs.push(msgs); return mockReplies[step++]!; } },
+      });
+      expect(seenOneShotMsgs[0]?.some((m) => m.role === "user" && m.content.includes("<piped_stdin>"))).toBe(true);
+      expect(fs.readFileSync(path.join(tmpOneShot, "note.txt"), "utf-8")).toBe("fixed");
+    } finally {
+      fs.rmSync(tmpOneShot, { recursive: true, force: true });
+    }
   });
 });

@@ -3,16 +3,18 @@ import * as path from "node:path";
 import * as readline from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 import type { LlmProvider, ToolCall } from "../core/contracts.js";
-import { padCols } from "./cost-tracker.js";
-import { captureHeadlessScreenshot, runLocalBangCommand } from "./context-mention.js";
-import { attachLiveSlashDropdown, getPromptVisualCols } from "./dropdown.js";
-import { openInDefaultApp, resolveDefaultOpenTarget } from "./platform.js";
-import { createReplCompleter, formatRecentHistoryRecap, listManagedProjects, type ManagedProjectSummary, type ProjectSessionPaths, resolveProjectSessionPaths, SLASH_COMMANDS } from "./project-store.js";
-import { resolveRouteTier } from "./router.js";
 import { probeAgyQuota } from "./agy-bridge.js";
+import { runLocalBangCommand } from "./context-mention.js";
+import { padCols } from "./cost-tracker.js";
+import { attachLiveSlashDropdown, getPromptVisualCols, restorePastedNewlines } from "./dropdown.js";
+import { openInDefaultApp, resolveDefaultOpenTarget } from "./platform.js";
+import { createReplCompleter, formatRecentHistoryRecap, listManagedProjects, loadProjectMeta, type ManagedProjectSummary, type ProjectSessionPaths, resolveProjectSessionPaths, saveProjectMeta, SLASH_COMMANDS } from "./project-store.js";
+import { executeReplReviewCommand } from "./reviewer.js";
+import { resolveRouteTier } from "./router.js";
 import { createSessionController, type SessionController } from "./session-controller.js";
 import { discoverAvailableSkills, expandSkillSlashCommand } from "./skill-loader.js";
 import { formatApprovalBox } from "./ui-logger.js";
+import { executeVisionSlashCommand, getPasteShortcutLabel } from "./vision-capture.js";
 import { runCommandInSandbox } from "./write-tools.js";
 
 export { createReplCompleter, listManagedProjects, type ManagedProjectSummary, type ProjectSessionPaths, resolveProjectSessionPaths };
@@ -21,36 +23,28 @@ export async function verifyGoalCompletion(workspaceRoot: string, finalAnswer: s
   if (isGoal && /(?:接下来我将|下一步我将|现在开始创建|准备开始修改)/.test(finalAnswer) && finalAnswer.length < 240) {
     return { ok: false, errorOutput: "当前处于 /goal 自治模式，请不要只汇报下一步计划，请直接调用工具完成剩余步骤后再总结。" };
   }
-  const hasTsConfig = fs.existsSync(path.join(workspaceRoot, "tsconfig.json"));
-  const hasLocalTsc = fs.existsSync(path.join(workspaceRoot, "node_modules", ".bin", "tsc")) || fs.existsSync(path.join(workspaceRoot, "node_modules", ".bin", "tsc.cmd"));
-  if (hasTsConfig && hasLocalTsc) {
+  if (fs.existsSync(path.join(workspaceRoot, "tsconfig.json")) && (fs.existsSync(path.join(workspaceRoot, "node_modules", ".bin", "tsc")) || fs.existsSync(path.join(workspaceRoot, "node_modules", ".bin", "tsc.cmd")))) {
     const check = await runCommandInSandbox("./node_modules/.bin/tsc --noEmit --incremental false", workspaceRoot, 30_000, signal, false);
-    if (check.exitCode !== 0) {
-      return { ok: false, errorOutput: `npx tsc --noEmit 类型检查未通过 (exit ${check.exitCode}):\n${check.output.slice(0, 1500)}` };
-    }
+    if (check.exitCode !== 0) return { ok: false, errorOutput: `npx tsc --noEmit 类型检查未通过 (exit ${check.exitCode}):\n${check.output.slice(0, 1500)}` };
   }
   return { ok: true };
 }
 
 function formatPrompt(ctrl: SessionController): string {
-  const st = ctrl.getStatus();
-  const short = st.projectName.length > 18 ? `${st.projectName.slice(0, 15)}...` : st.projectName;
-  if (st.isNew) return `📂 ${short} [新对话 · ${st.modelLabel}] > `;
-  return `📂 ${short} [${st.activeTurnIndex ? `续#${st.activeTurnIndex}` : "续聊"} · ${st.modelLabel}] > `;
+  const st = ctrl.getStatus(), short = st.projectName.length > 18 ? `${st.projectName.slice(0, 15)}...` : st.projectName;
+  return st.isNew ? `📂 ${short} [新对话 · ${st.modelLabel}] > ` : `📂 ${short} [${st.activeTurnIndex ? `续#${st.activeTurnIndex}` : "续聊"} · ${st.modelLabel}] > `;
 }
 
 function printReplWelcomeBanner(ctrl: SessionController): void {
-  const st0 = ctrl.getStatus();
+  const st0 = ctrl.getStatus(), recap = formatRecentHistoryRecap(ctrl.loadEntries(), 1, ctrl.getLeafId()), diff0 = ctrl.getDiff();
   console.log(`\n🚀 Duo-Harness | 当前项目: ${st0.projectName} (${st0.workspaceRoot})`);
   console.log(`⚡ 模型路由: ${resolveRouteTier(Date.now()).reason} (同会话自动锁定原模型防缓存失效 · 输入 /model 可手动切换)`);
-  console.log(`💡 输入 / 用 ↑/↓ 方向键选择命令 (/goal 自治任务 | /resume 选轮次 | /new 新对话 | /model 切模型 | /diff 看修改 | /undo 撤回)`);
-  const recap = formatRecentHistoryRecap(ctrl.loadEntries(), 1, ctrl.getLeafId());
+  console.log(`💡 输入 / 用 ↑/↓ 方向键选择命令 | 截图后直接按 ${getPasteShortcutLabel()} (或敲 @clipboard) 粘贴图片 (/goal 自治 | /resume 选轮次 | /diff 看修改 | /undo 撤回)`);
   if (recap) console.log(recap);
-  const diff0 = ctrl.getDiff();
   if (diff0.totalSnapshots > 0) console.log(`📋 [检测到未撤回修改] 当前工作区有 ${diff0.files.length} 个已修改文件 (${diff0.totalSnapshots} 个版本 · 输入 /diff 查看 | /undo 撤回)`);
 }
 
-async function handleSlashCommand(rawCmd: string, ctrl: SessionController): Promise<boolean> {
+export async function handleSlashCommand(rawCmd: string, ctrl: SessionController): Promise<boolean | string> {
   if (rawCmd === "/" || rawCmd === "/help" || rawCmd === "?") {
     console.log("\n💡 [快捷指令 (输入 / 后可直接用 ↑/↓ 方向键选择并回车执行)]:");
     for (const m of SLASH_COMMANDS) console.log(`  ${padCols(m.label, 14)} - ${m.desc}`);
@@ -58,7 +52,6 @@ async function handleSlashCommand(rawCmd: string, ctrl: SessionController): Prom
   }
   const exactOrUnique = !rawCmd.includes(" ") ? SLASH_COMMANDS.filter((c) => c.cmd.trim().startsWith(rawCmd)) : [];
   const cmd = exactOrUnique.length === 1 ? exactOrUnique[0]!.cmd.trim() : rawCmd;
-
   if (cmd.startsWith("/cd ")) {
     const res = ctrl.switchWorkspace(cmd.slice("/cd ".length).trim());
     if (!res.ok) console.log(`⚠️ ${res.error}（输入 / 然后回车即可用 ↑/↓ 方向键选择项目）`);
@@ -68,9 +61,7 @@ async function handleSlashCommand(rawCmd: string, ctrl: SessionController): Prom
   }
   if (cmd === "/model" || cmd.startsWith("/model ")) {
     const arg = cmd.slice("/model".length).trim().toLowerCase();
-    if (arg === "auto" || arg === "deepseek" || arg === "mimo" || arg === "agy" || arg === "openai") {
-      console.log(`🤖 已切换模型策略为 [${arg}] (当前生效: ${ctrl.setModelMode(arg).activeModel})`);
-    } else console.log(`💡 用法: /model auto | /model deepseek | /model mimo | /model agy (当前: ${ctrl.getStatus().modelMode})`);
+    console.log(arg === "auto" || arg === "deepseek" || arg === "mimo" || arg === "agy" || arg === "openai" ? `🤖 已切换模型策略为 [${arg}] (当前生效: ${ctrl.setModelMode(arg).activeModel})` : `💡 用法: /model auto | /model deepseek | /model mimo | /model agy (当前: ${ctrl.getStatus().modelMode})`);
     return true;
   }
   if (cmd === "/xray" || cmd === "/tree") {
@@ -87,16 +78,21 @@ async function handleSlashCommand(rawCmd: string, ctrl: SessionController): Prom
     return true;
   }
   if (cmd === "/diff" || cmd.startsWith("/diff ")) { console.log(ctrl.getDiff(cmd.slice("/diff".length).trim() || "turn").formattedText); return true; }
+  if (cmd === "/review" || cmd.startsWith("/review ")) {
+    await executeReplReviewCommand(cmd.slice("/review".length).trim(), ctrl.getPaths().workspaceRoot, ctrl.getDiff("all").files.map((f) => f.file));
+    return true;
+  }
+  if (cmd === "/commit" || cmd.startsWith("/commit ")) {
+    const note = cmd.slice("/commit".length).trim();
+    return `请先调用 run_bash 查看 git status 与 git diff，结合改动生成规范中文提交信息（格式：<类型>(<模块>): <中文概述>${note ? `，备注：${note}` : ""}），执行 git add、git commit 并 git push 推送。`;
+  }
   if (cmd === "/open" || cmd.startsWith("/open ")) {
     const ws = ctrl.getPaths().workspaceRoot, res = openInDefaultApp(cmd.slice("/open".length).trim() || resolveDefaultOpenTarget(ws, ctrl.getDiff("all").files.map((f) => f.file)), ws);
     console.log(res.ok ? `🌐 已调用系统默认应用打开: ${res.resolved}` : `⚠️ ${res.error}`);
     return true;
   }
-  if (cmd === "/shot" || cmd.startsWith("/shot ")) {
-    const res = await captureHeadlessScreenshot(cmd.slice("/shot".length).trim(), ctrl.getPaths().workspaceRoot, ctrl.getDiff("all").files.map((f) => f.file));
-    console.log(res.ok ? `📸 已生成网页无头截图并打开: ${res.shotPath} (源: ${res.targetUrl} · 提问时输入 @.debug/shot.png 即可将截图发给视觉模型)` : `⚠️ ${res.error}`);
-    return true;
-  }
+  const visionRes = await executeVisionSlashCommand(cmd, ctrl.getPaths().workspaceRoot, ctrl.getDiff("all").files.map((f) => f.file));
+  if (visionRes !== null) return visionRes;
   if (cmd === "/skills" || cmd === "/skill") {
     const skills = discoverAvailableSkills(ctrl.getPaths().workspaceRoot);
     console.log(skills.length > 0 ? `\n🧩 [已发现可用技能 (${skills.length} 个 · 输入 /skill <名称> <任务> 调用)]:\n` + skills.map((s) => `  • ${padCols(s.name, 18)} [${s.scope === "workspace" ? "项目" : "全局"}] ${s.description}`).join("\n") : "ℹ️ 未检测到可用 SKILL.md 技能文件。");
@@ -148,35 +144,58 @@ export function resolveApprovalInput(rawAns: string, isEsc: boolean, hasExternal
 
 async function promptUserApproval(
   rl: readline.Interface, toolCalls: ToolCall[], workspaceRoot: string,
-  st: { autoApprove: boolean; inMainPrompt: boolean; turnAbort: AbortController | null },
+  st: { autoApprove: boolean; inMainPrompt: boolean; inApprovalPrompt: boolean; turnAbort: AbortController | null },
   meta?: { hasEscalated?: boolean; escalatedReasons?: string[]; externalDirs?: string[] },
 ): Promise<{ approved: boolean; reason?: string; trustDirectory?: boolean }> {
   const isEsc = Boolean(meta?.hasEscalated), reasons = meta?.escalatedReasons ?? [], hasExt = (meta?.externalDirs?.length ?? 0) > 0;
   if (!isEsc && st.autoApprove) { console.log(`  ⚡ [本轮免问已自动放行 ${toolCalls.length} 项工作区操作]`); return { approved: true }; }
-  st.inMainPrompt = false;
+  st.inMainPrompt = false; st.inApprovalPrompt = true;
   const initialBox = formatApprovalBox(toolCalls, workspaceRoot, false, reasons), dHint = initialBox.includes("已折叠") ? " | d=展开全部详情" : "";
   console.log(initialBox);
-  while (true) {
-    try {
+  try {
+    while (true) {
       const aLabel = isEsc ? (hasExt ? "a=允许并信任该目录" : "a=允许并本轮免问") : "a=本轮后续免问";
       const promptStr = isEsc ? `└─ 🚨 是否授权提权执行？[y=仅允许本次${dHint} | ${aLabel} | 回车/n=拒绝] > ` : `└─ 是否允许执行？[回车/y=允许本次${dHint} | ${aLabel} | n=拒绝(或直接输入修改意见)] > `;
-      const res = resolveApprovalInput(await rl.question(promptStr, st.turnAbort ? { signal: st.turnAbort.signal } : {}), isEsc, hasExt);
+      const res = resolveApprovalInput(restorePastedNewlines(await rl.question(promptStr, st.turnAbort ? { signal: st.turnAbort.signal } : {})), isEsc, hasExt);
       if (res.kind === "details") { console.log(formatApprovalBox(toolCalls, workspaceRoot, true, reasons)); continue; }
       if (res.kind === "invalid") { console.log(res.message); continue; }
       if (res.kind === "approve") { if (res.autoApprove) st.autoApprove = true; return { approved: true, ...(res.trustDirectory ? { trustDirectory: true } : {}) }; }
       return { approved: false, reason: res.reason };
-    } catch {
-      process.stdout.write("\n"); st.turnAbort?.abort();
-      return { approved: false, reason: "用户按 Ctrl+C 中断了本轮操作" };
     }
-  }
+  } catch {
+    process.stdout.write("\n"); st.turnAbort?.abort();
+    return { approved: false, reason: "用户按 Ctrl+C 中断了本轮操作" };
+  } finally { st.inApprovalPrompt = false; }
+}
+
+export async function runOneShotCli(rawArgs: string[], pipedText = "", options: { workspaceRoot?: string; homeBaseDir?: string; provider?: LlmProvider } = {}): Promise<void> {
+  const autoYes = rawArgs.includes("-y") || rawArgs.includes("--yes"), promptArgs = rawArgs.filter((a) => a !== "-y" && a !== "--yes").join(" ").trim(), clip = pipedText.trim().slice(0, 64_000);
+  const fullPrompt = clip ? `${promptArgs || "请分析以下标准输入内容："}\n\n<piped_stdin>\n${clip}\n</piped_stdin>` : promptArgs;
+  if (!fullPrompt) return;
+  const ctrl = createSessionController(options), ws = ctrl.getPaths().workspaceRoot, isGoal = /^\/g(?:oal)?(?:\s|$)/.test(fullPrompt), ac = new AbortController();
+  const onSigint = () => ac.abort();
+  process.once("SIGINT", onSigint);
+  try {
+    await ctrl.ask(expandSkillSlashCommand(isGoal ? fullPrompt.replace(/^\/g(?:oal)?\b/, "").trim() : fullPrompt, ws), {
+      suppressFinalEcho: true, maxSteps: isGoal ? 50 : undefined, signal: ac.signal,
+      onApprovalRequest: (_calls, meta) => {
+        if ((autoYes || isGoal) && !meta?.hasEscalated) return { approved: true };
+        console.warn(`  ⚠️ [单次模式已拦截写/提权操作] 如需允许工作区修改，请附加 -y 参数运行（例: duo -y "你的指令"）`);
+        return { approved: false, reason: "非交互单次模式未传 -y 参数，默认拒绝写操作（请直接输出分析结论或代码方案）" };
+      },
+      verifyCompletion: (ans) => (isGoal || ctrl.getDiff("turn").files.some((f) => /\.[cm]?tsx?$/i.test(f.file)) ? verifyGoalCompletion(ws, ans, ac.signal, isGoal) : { ok: true, skipped: true } as any),
+    });
+  } finally { process.off("SIGINT", onSigint); }
 }
 
 export async function startInteractiveRepl(options: { workspaceRoot?: string; homeBaseDir?: string; provider?: LlmProvider } = {}): Promise<void> {
-  const ctrl = createSessionController(options), replState = { autoApprove: false, inMainPrompt: false, turnAbort: null as AbortController | null };
+  const ctrl = createSessionController(options), replState = { autoApprove: false, inMainPrompt: false, inApprovalPrompt: false, turnAbort: null as AbortController | null, steerQueue: [] as string[] };
   printReplWelcomeBanner(ctrl);
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout, completer: createReplCompleter(() => ctrl.getPaths().workspaceRoot, () => ctrl.getPaths().sessionFile) });
-  const detachDropdown = attachLiveSlashDropdown(rl, () => replState.inMainPrompt, () => getPromptVisualCols(formatPrompt(ctrl)), () => ctrl.getPaths().workspaceRoot, options.homeBaseDir, () => ctrl.getLeafId());
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout, history: [...(loadProjectMeta(ctrl.getPaths().metaFile).inputHistory ?? [])], historySize: 80, completer: createReplCompleter(() => ctrl.getPaths().workspaceRoot, () => ctrl.getPaths().sessionFile) });
+  const detachDropdown = attachLiveSlashDropdown(rl, () => replState.inMainPrompt, () => getPromptVisualCols(formatPrompt(ctrl)), () => ctrl.getPaths().workspaceRoot, options.homeBaseDir, () => ctrl.getLeafId(), {
+    isApprovalActive: () => replState.inApprovalPrompt, onAbortRun: () => replState.turnAbort?.abort(),
+    onSteerLine: (text) => { replState.steerQueue.push(text); console.log(`\n  💬 [已加入插话队列] 当前工具执行完毕后立即注入：「${text.slice(0, 60)}」`); },
+  });
   const onTerminateSignal = () => replState.turnAbort?.abort();
   process.on("SIGHUP", onTerminateSignal); process.on("SIGTERM", onTerminateSignal);
   try {
@@ -184,7 +203,7 @@ export async function startInteractiveRepl(options: { workspaceRoot?: string; ho
       replState.inMainPrompt = true;
       let line = "";
       try {
-        process.stdout.write("\n"); line = (await rl.question(formatPrompt(ctrl))).trim();
+        process.stdout.write("\n"); line = restorePastedNewlines(await rl.question(formatPrompt(ctrl))).trim();
       } catch (err) {
         if (err instanceof Error && (err.name === "AbortError" || err.message.includes("Ctrl+C"))) { process.stdout.write("\r\n\x1b[J👋 已退出 Duo-Harness。\n"); break; }
         throw err;
@@ -192,39 +211,38 @@ export async function startInteractiveRepl(options: { workspaceRoot?: string; ho
       replState.inMainPrompt = false;
       if (!line) continue;
       if (line === "exit" || line === "quit" || line === "/exit" || line === "/quit" || line === "/e") { process.stdout.write("👋 已退出 Duo-Harness。\n"); break; }
+      saveProjectMeta(ctrl.getPaths().metaFile, { inputHistory: (((rl as any).history as string[]) ?? []).slice(0, 60) });
       if (line.startsWith("!")) { await runLocalBangCommand(line, ctrl.getPaths().workspaceRoot, rl); continue; }
-      if (await handleSlashCommand(line, ctrl)) continue;
-      const isGoal = /^\/g(?:oal)?(?:\s|$)/.test(line);
-      const rawTask = isGoal ? (line.replace(/^\/g(?:oal)?\b/, "").trim() || "请继续推进并完成当前目标，采用分批小步落盘（每步最多写 1~3 个文件），确保所有代码落盘并通过构建/运行验证。") : line;
-      const askPrompt = expandSkillSlashCommand(rawTask, ctrl.getPaths().workspaceRoot);
+      const slashRes = await handleSlashCommand(line, ctrl);
+      if (slashRes === true) continue;
+      if (typeof slashRes === "string") line = slashRes;
+      const isGoal = /^\/g(?:oal)?(?:\s|$)/.test(line), rawTask = isGoal ? (line.replace(/^\/g(?:oal)?\b/, "").trim() || "请继续推进并完成当前目标，采用分批小步落盘（每步最多写 1~3 个文件），确保所有代码落盘并通过构建/运行验证。") : line;
       if (isGoal) console.log("🎯 [已开启 /goal 长程自治模式] 本轮自动放行工作区写与构建操作 · 步数上限 50 步 · 完成前自动校验编译状态");
-      replState.autoApprove = false; replState.turnAbort = new AbortController();
+      replState.autoApprove = false; replState.steerQueue = []; replState.turnAbort = new AbortController();
       const onSigint = () => replState.turnAbort?.abort();
       rl.on("SIGINT", onSigint);
       try {
         const ws = ctrl.getPaths().workspaceRoot;
-        await ctrl.ask(askPrompt, {
+        await ctrl.ask(expandSkillSlashCommand(rawTask, ws), {
           suppressFinalEcho: true, maxSteps: isGoal ? 50 : undefined, signal: replState.turnAbort.signal,
+          drainSteerMessages: () => replState.steerQueue.splice(0, replState.steerQueue.length),
           onApprovalRequest: (calls, meta) => (isGoal && !meta?.hasEscalated ? { approved: true } : promptUserApproval(rl, calls, ws, replState, meta)),
-          verifyCompletion: (ans) => (isGoal || ctrl.getDiff("turn").files.some((f) => /\.[cm]?tsx?$/i.test(f.file)) ? verifyGoalCompletion(ws, ans, replState.turnAbort?.signal, isGoal) : { ok: true }),
+          verifyCompletion: (ans) => (isGoal || ctrl.getDiff("turn").files.some((f) => /\.[cm]?tsx?$/i.test(f.file)) ? verifyGoalCompletion(ws, ans, replState.turnAbort?.signal, isGoal) : { ok: true, skipped: true } as any),
         });
-      } catch (err) {
-        console.error(`\n❌ 本轮运行异常: ${err instanceof Error ? err.message : String(err)}`);
-      } finally {
-        rl.off("SIGINT", onSigint); replState.turnAbort = null;
-      }
+      } catch (err) { console.error(`\n❌ 本轮运行异常: ${err instanceof Error ? err.message : String(err)}`); } finally { rl.off("SIGINT", onSigint); replState.turnAbort = null; replState.steerQueue = []; }
     }
   } finally {
-    process.off("SIGHUP", onTerminateSignal); process.off("SIGTERM", onTerminateSignal);
-    detachDropdown(); rl.close();
+    process.off("SIGHUP", onTerminateSignal); process.off("SIGTERM", onTerminateSignal); detachDropdown(); rl.close();
   }
 }
 
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
 if (isMain) {
-  const argDir = process.argv[2] && !process.argv[2].startsWith("-") ? process.argv[2] : undefined;
-  startInteractiveRepl({ workspaceRoot: argDir }).catch((err) => {
-    console.error("终端运行异常:", err instanceof Error ? err.message : err);
-    process.exit(1);
-  });
+  const args = process.argv.slice(2), isDirArg = args.length === 1 && !args[0]!.startsWith("-") && fs.existsSync(args[0]!) && fs.statSync(args[0]!).isDirectory();
+  (async () => {
+    if (process.stdin.isTTY && (args.length === 0 || isDirArg)) return startInteractiveRepl({ workspaceRoot: isDirArg ? args[0] : undefined });
+    let piped = "";
+    if (!process.stdin.isTTY) { for await (const chunk of process.stdin) piped += chunk.toString("utf-8"); }
+    await runOneShotCli(args, piped);
+  })().catch((err) => { console.error("终端运行异常:", err instanceof Error ? err.message : err); process.exit(1); });
 }

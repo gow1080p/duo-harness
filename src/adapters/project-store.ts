@@ -13,7 +13,7 @@ export { formatSnapshotsDiff };
 
 export interface ProjectMetaState {
   projectKey: string; workspaceRoot: string; updatedAt: string; activeLeafId?: string | null;
-  modelMode?: "auto" | "deepseek" | "mimo" | "agy" | "openai"; lastUndoNotice?: string | null;
+  modelMode?: "auto" | "deepseek" | "mimo" | "agy" | "openai"; lastUndoNotice?: string | null; inputHistory?: string[];
 }
 
 export function loadProjectMeta(metaFile: string): Partial<ProjectMetaState> {
@@ -28,28 +28,23 @@ export function saveProjectMeta(metaFile: string, patch: Partial<ProjectMetaStat
   } catch {}
 }
 
-export interface ProjectSessionPaths {
-  projectKey: string; workspaceRoot: string; projectDir: string; sessionFile: string; wireLogFile: string; snapshotsFile: string; metaFile: string;
-}
-
-export interface ManagedProjectSummary {
-  projectKey: string; workspaceRoot: string; updatedAt: string; entryCount: number; lastLeafId: string | null;
-}
-
-export interface ConversationTurnSummary {
-  turnIndex: number; userEntryId: string; leafEntryId: string; userText: string; replyText: string; toolSteps: number; isCurrentLeaf: boolean;
-}
+export interface ProjectSessionPaths { projectKey: string; workspaceRoot: string; projectDir: string; sessionFile: string; wireLogFile: string; snapshotsFile: string; metaFile: string; }
+export interface ManagedProjectSummary { projectKey: string; workspaceRoot: string; updatedAt: string; entryCount: number; lastLeafId: string | null; }
+export interface ConversationTurnSummary { turnIndex: number; userEntryId: string; leafEntryId: string; userText: string; replyText: string; toolSteps: number; isCurrentLeaf: boolean; }
 
 export const SLASH_COMMANDS = [
   { cmd: "/goal ", label: "/goal <目标>", desc: "长程自治模式 (自动放行写操作 + 50步上限 + 完成前自动验证)" },
   { cmd: "/skill ", label: "/skill <名称>", desc: "按需加载扩展技能规范 (按 ↑/↓ 选择本机或项目 SKILL.md)" },
+  { cmd: "/review", label: "/review [文件]", desc: "对本轮修改或指定文件运行 RepoMap + 架构规范独立审查" },
+  { cmd: "/commit", label: "/commit [说明]", desc: "检查 git status/diff 并按规范生成中文 Commit 提交与推送" },
   { cmd: "/resume ", label: "/resume", desc: "用 ↑/↓ 方向键选择历史轮次或切换会话" },
   { cmd: "/new", label: "/new", desc: "开启全新对话 (保留旧历史，可随时 /resume 切回)" },
   { cmd: "/model ", label: "/model", desc: "用 ↑/↓ 方向键切换模型 (auto/deepseek/mimo/agy)" },
   { cmd: "/history", label: "/history", desc: "查看当前项目所有历史问答列表" },
   { cmd: "/diff", label: "/diff", desc: "查看文件修改对比 (/diff 空格可按 ↑/↓ 选文件)" },
   { cmd: "/open", label: "/open [文件]", desc: "用系统默认浏览器/应用打开最新修改文件或指定路径 (/open 空格可选文件)" },
-  { cmd: "/shot", label: "/shot [文件]", desc: "用本机无头 Edge/Chrome 截取网页或 HTML 预览图 (.debug/shot.png)" },
+  { cmd: "/shot", label: "/shot [目标]", desc: "用无头 Chrome/Edge 截图 (.debug/shot.png · 支持 /shot [URL] [提问] 或 --open)" },
+  { cmd: "/clip", label: "/clip [提问]", desc: "读取系统剪贴板中的最新截图 (.debug/clipboard.png · 亦支持 /paste 或 @clipboard)" },
   { cmd: "/undo", label: "/undo", desc: "撤回修改 (/undo 撤上一轮 | /undo N 撤N步 | /undo all 全部撤回)" },
   { cmd: "/redo", label: "/redo", desc: "重做恢复 (/redo 恢复上次撤回 | /redo all 恢复全部撤回)" },
   { cmd: "/cd ", label: "/cd <项目>", desc: "切换项目工作区 (按回车直接展开项目列表)" },

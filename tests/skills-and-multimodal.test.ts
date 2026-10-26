@@ -4,13 +4,17 @@ import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import { compactMessages, estimateMessagesChars, foldSingleMessage } from "../src/core/compactor.js";
 import type { Message } from "../src/core/contracts.js";
-import { expandAtMentions, listWorkspaceFiles } from "../src/adapters/context-mention.js";
+import { buildBridgePrompt } from "../src/adapters/agy-bridge.js";
+import { expandAtMentions, listWorkspaceFiles, parseShotCommandArgs, stripAttachedFiles } from "../src/adapters/context-mention.js";
 import { buildDropdownItems } from "../src/adapters/dropdown.js";
-import { resolveApprovalInput, verifyGoalCompletion } from "../src/adapters/repl.js";
+import { handleSlashCommand, resolveApprovalInput, verifyGoalCompletion } from "../src/adapters/repl.js";
 import { createRouterProvider, resolveActiveModelTarget, toOpenAiMessages } from "../src/adapters/router.js";
-import { analyzeBashSandbox } from "../src/adapters/sandbox-policy.js";
+import { analyzeBashSandbox, classifyToolCallRisk, createSandboxGrants } from "../src/adapters/sandbox-policy.js";
+import { createSessionController } from "../src/adapters/session-controller.js";
 import { discoverAvailableSkills, expandSkillSlashCommand, formatSkillsSystemIndex } from "../src/adapters/skill-loader.js";
 import { compactWireLogEntry } from "../src/adapters/store.js";
+import { createBuiltinTools, executeToolCalls } from "../src/adapters/tools.js";
+import { tryExpandClipboardInLine } from "../src/adapters/vision-capture.js";
 
 describe("Custom SKILL.md Lazy-Loading & Multimodal Image Input", () => {
   it("1. SKILL.md 扫描、同名优先级覆盖、<skills> 极简索引与 /skill 下拉指令展开", () => {
@@ -61,7 +65,7 @@ describe("Custom SKILL.md Lazy-Loading & Multimodal Image Input", () => {
     }
   });
 
-  it("2. 多模态 @图片 解析、轻量元数据体积估算、历史图片折叠与 OpenAI image_url 序列化", () => {
+  it("2. 多模态 @图片 解析、轻量元数据体积估算、历史图片折叠与 OpenAI image_url 序列化", async () => {
     const tmpWs = fs.mkdtempSync(path.join(os.tmpdir(), "duo-img-test-"));
     try {
       const debugDir = path.join(tmpWs, ".debug");
@@ -92,9 +96,58 @@ describe("Custom SKILL.md Lazy-Loading & Multimodal Image Input", () => {
       const openAiMsgs = toOpenAiMessages([userMsg], tmpWs);
       expect(Array.isArray(openAiMsgs[0]?.content)).toBe(true);
       const contentArr = openAiMsgs[0]!.content as any[];
-      expect(contentArr[0]).toEqual({ type: "text", text: "请看下 @.debug/shot.png 的导航栏" });
+      expect(contentArr[0]?.type).toBe("text");
+      expect(contentArr[0]?.text).toContain("请看下 @.debug/shot.png 的导航栏");
+      expect(contentArr[0]?.text).toContain('<attached_image path=".debug/shot.png" mime="image/png" />');
       expect(contentArr[1]?.type).toBe("image_url");
       expect(String(contentArr[1]?.image_url?.url)).toMatch(/^data:image\/png;base64,/);
+
+      // read_file 原生读取图片（对齐 pi-mono read.ts & openai-completions.ts）
+      const logoPath = path.join(tmpWs, "logo.png");
+      fs.writeFileSync(logoPath, fakePng);
+      const builtinTools = createBuiltinTools(tmpWs);
+      const [toolImgRes] = await executeToolCalls([{ id: "call_img", name: "read_file", arguments: { path: "logo.png" } }], builtinTools);
+      expect(toolImgRes?.content).toBe("Read image file [image/png] (120 KB)");
+      expect(toolImgRes?.images).toEqual([{ path: "logo.png", mimeType: "image/png", byteSize: 120 * 1024 }]);
+
+      // 1) 当模型调 read_file 读取了新图片 logo.png 时，toOpenAiMessages 在 tool 消息后自动追加合成 user image_url 消息
+      const toolVisionMsgs = toOpenAiMessages(
+        [
+          { role: "user", content: "看下项目里的 logo.png" },
+          { role: "assistant", content: "", toolCalls: [{ id: "call_img", name: "read_file", arguments: { path: "logo.png" } }] },
+          toolImgRes!,
+        ],
+        tmpWs,
+      );
+      expect(toolVisionMsgs.map((m) => m.role)).toEqual(["user", "assistant", "tool", "user"]);
+      const syntheticUserContent = toolVisionMsgs[3]!.content as any[];
+      expect(syntheticUserContent[0]).toEqual({ type: "text", text: "Attached image(s) from tool result:" });
+      expect(syntheticUserContent[1]?.type).toBe("image_url");
+
+      // 2) 当模型对本轮 user.images 已附带的图片重复调 read_file 时，seenTurnImages 自动去重，不重复追加合成 user 消息
+      const [dupToolRes] = await executeToolCalls([{ id: "call_dup", name: "read_file", arguments: { path: ".debug/shot.png" } }], builtinTools);
+      const dedupedMsgs = toOpenAiMessages(
+        [
+          userMsg,
+          { role: "assistant", content: "", toolCalls: [{ id: "call_dup", name: "read_file", arguments: { path: ".debug/shot.png" } }] },
+          dupToolRes!,
+        ],
+        tmpWs,
+      );
+      expect(dedupedMsgs.map((m) => m.role)).toEqual(["user", "assistant", "tool"]);
+
+      // 新会话第 1 轮 Step 2 (userMsg 位于 headPrefix[1]) 遇到大工具输出时，严禁把当轮图片折叠掉
+      const newSessionStep2: Message[] = [
+        { role: "system", content: "sys" },
+        userMsg,
+        { role: "assistant", content: "先看下文件", toolCalls: [{ id: "c0", name: "list_dir", arguments: { path: "." } }] },
+        { role: "tool", toolCallId: "c0", name: "list_dir", content: "y".repeat(40_000), isError: false },
+      ];
+      const newSessCompacted = compactMessages(newSessionStep2, { maxTotalChars: 20_000, keepRecentMessages: 2 });
+      expect(newSessCompacted[1]?.role).toBe("user");
+      if (newSessCompacted[1]?.role === "user") {
+        expect(newSessCompacted[1].images?.length).toBe(1);
+      }
 
       const compactedWire = compactWireLogEntry({
         roundTimestamp: new Date().toISOString(),
@@ -106,6 +159,10 @@ describe("Custom SKILL.md Lazy-Loading & Multimodal Image Input", () => {
       const wireImgUrl = (compactedWire.requestBody.messages as any[])[0].content[1].image_url.url;
       expect(wireImgUrl.length).toBeLessThan(120);
       expect(wireImgUrl).toContain("...[len=");
+
+      const noVisionMsgs = toOpenAiMessages([userMsg], tmpWs, false);
+      expect(typeof noVisionMsgs[0]?.content).toBe("string");
+      expect(String(noVisionMsgs[0]?.content)).toContain('<attached_image path=".debug/shot.png"');
 
       const folded = foldSingleMessage(userMsg);
       expect(folded.role).toBe("user");
@@ -154,6 +211,117 @@ describe("Custom SKILL.md Lazy-Loading & Multimodal Image Input", () => {
 
     const goalShort = await verifyGoalCompletion(os.tmpdir(), "接下来我将开始修改文件。", undefined, true);
     expect(goalShort.ok).toBe(false);
+
+    // 验证：Finder 拖拽带空格/引号路径、@clipboard 剪贴板防覆盖哈希、外部单文件授权不污染父目录、/shot 智能参数、agy 桥接与首步失败回退 leafId
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "duo-vision-ux-"));
+    const wsDir = path.join(tmpRoot, "ws");
+    const extDir = path.join(tmpRoot, "Desktop");
+    const homeBase = path.join(tmpRoot, "home");
+    const prevClipMock = process.env.DUO_MOCK_CLIPBOARD_IMAGE;
+    try {
+      fs.mkdirSync(path.join(wsDir, "src"), { recursive: true });
+      fs.mkdirSync(extDir, { recursive: true });
+      fs.writeFileSync(path.join(wsDir, "src", "my view.tsx"), "line1\nline2\nline3\nline4\n");
+
+      const validPngA = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from("IMAGE_A_DATA")]);
+      const validPngB = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from("IMAGE_B_DATA")]);
+      const dragImgPath = path.join(extDir, "截屏 2026-10-26.png");
+      const otherSecretPath = path.join(extDir, "passwords.txt");
+      fs.writeFileSync(dragImgPath, validPngA);
+      fs.writeFileSync(otherSecretPath, "secret");
+
+      // (a) Finder 单引号拖拽路径 + @"带空格代码文件":行号切片 + 最小权限单文件授权（绝不污染 extDir 父目录）
+      const grants = createSandboxGrants();
+      const dragPrompt = `看看 '${dragImgPath}' 和 @"src/my view.tsx":2-3 的区别`;
+      const expandedDrag = expandAtMentions(dragPrompt, wsDir, 300, grants);
+      expect(expandedDrag.attachedImages.length).toBe(1);
+      expect(expandedDrag.attachedImages[0]?.path).toBe(fs.realpathSync(dragImgPath));
+      expect(expandedDrag.expandedPrompt).toContain('<attached_file path="src/my view.tsx" lines="2-3">');
+      expect(expandedDrag.expandedPrompt).toContain("2: line2\n3: line3");
+      expect(grants.trustedReadDirs.size).toBe(0);
+      const siblingRisk = classifyToolCallRisk({ id: "t1", name: "read_file", arguments: { path: otherSecretPath } }, wsDir, new Map(), grants);
+      expect(siblingRisk.tier).toBe("ask_escalated");
+
+      // (b) 普通报错堆栈中的外部非图片路径绝不误判为拖拽文件
+      const stackTracePrompt = `报错在 ${otherSecretPath}:12 请分析`;
+      const expandedStack = expandAtMentions(stackTracePrompt, wsDir, 300, grants);
+      expect(expandedStack.attachedPaths).toEqual([]);
+
+      // (c) @clipboard 与 /paste 多轮防覆盖短哈希快照
+      const mockClipFile = path.join(tmpRoot, "clip-src.png");
+      fs.writeFileSync(mockClipFile, validPngA);
+      process.env.DUO_MOCK_CLIPBOARD_IMAGE = mockClipFile;
+      const clip1 = expandAtMentions("请分析 @clipboard 里的报错", wsDir);
+      expect(clip1.attachedPaths).toEqual([".debug/clipboard.png"]);
+      expect(clip1.attachedImages[0]?.path).toMatch(/^\.debug\/clipboard-[0-9a-f]{6}\.png$/);
+
+      fs.writeFileSync(mockClipFile, validPngB);
+      const clip2 = expandAtMentions("再看下 @clipboard 新图", wsDir);
+      expect(clip2.attachedImages[0]?.path).not.toBe(clip1.attachedImages[0]?.path);
+      expect(fs.existsSync(path.join(wsDir, clip1.attachedImages[0]!.path))).toBe(true);
+      expect(fs.existsSync(path.join(wsDir, clip2.attachedImages[0]!.path))).toBe(true);
+
+      // 验证终端按 Ctrl+V / Cmd+V (@clipboard ) 时直接在输入行展开为 @.debug/clipboard-xxxxxx.png 并展示就绪下拉条
+      const ctrlVPasted = tryExpandClipboardInLine("", 0, wsDir, true);
+      expect(ctrlVPasted?.line).toMatch(/^@\.debug\/clipboard-[0-9a-f]{6}\.png $/);
+      const cmdVPasted = tryExpandClipboardInLine("@clipboard ", 11, wsDir, false);
+      expect(cmdVPasted?.line).toMatch(/^@\.debug\/clipboard-[0-9a-f]{6}\.png $/);
+      const pastedDropdown = buildDropdownItems(cmdVPasted!.line, wsDir, undefined, null, cmdVPasted!.cursor);
+      expect(pastedDropdown[0]?.desc).toContain("已粘贴剪贴板截图");
+      expect(pastedDropdown[0]?.expandOnly).toBe(false);
+      const bareImgExpand = expandAtMentions(cmdVPasted!.line.trim(), wsDir);
+      expect(bareImgExpand.expandedPrompt).toContain("请查看并分析这张截图");
+
+      // (d) /shot 智能参数拆解与 stripAttachedFiles
+      expect(parseShotCommandArgs("", wsDir)).toEqual({ openPreview: false, target: "", question: "" });
+      expect(parseShotCommandArgs("--open localhost:5173 检查顶部间距", wsDir)).toEqual({
+        openPreview: true,
+        target: "http://localhost:5173",
+        question: "检查顶部间距",
+      });
+      expect(parseShotCommandArgs("帮我看看页面留白够不够", wsDir)).toEqual({
+        openPreview: false,
+        target: "",
+        question: "帮我看看页面留白够不够",
+      });
+      expect(stripAttachedFiles("[已折叠历史图片 @.debug/shot.png (120 KB)]")).toBe("[引用文件: @.debug/shot.png]");
+      expect(stripAttachedFiles('[已折叠历史引用文件 @src/my view.tsx (原长 1200 字)]')).toBe("[引用文件: @src/my view.tsx]");
+
+      // (e) /model agy 桥接提示词显式注入视觉图片绝对路径
+      const bridgePrompt = buildBridgePrompt(
+        [{ role: "user", content: "看图", images: [{ path: ".debug/shot.png", mimeType: "image/png", byteSize: 100 }] }],
+        [],
+        wsDir,
+      );
+      expect(bridgePrompt).toContain(`[用户附加视觉图片: ${path.join(wsDir, ".debug/shot.png")}]`);
+      expect(bridgePrompt).toContain("多模态特例");
+
+      // (f) 首步视觉报错或网络失败时自动回退 leafId，严防孤立 user 节点锁死会话后续纯文本轮次
+      let callCount = 0;
+      const ctrl = createSessionController({
+        workspaceRoot: wsDir,
+        homeBaseDir: homeBase,
+        provider: {
+          async chat(msgs) {
+            callCount++;
+            if (msgs.some((m) => m.role === "user" && m.images?.length)) {
+              throw new Error("当前会话包含未折叠的图片附件，但 DeepSeek 官方接口不支持视觉输入");
+            }
+            return { role: "assistant", content: "纯文本正常回复" };
+          },
+        },
+      });
+      const pasteRewrite = await handleSlashCommand("/paste 看看这张剪贴板图", ctrl);
+      expect(typeof pasteRewrite).toBe("string");
+      await expect(ctrl.ask(String(pasteRewrite))).rejects.toThrow(/不支持视觉输入/);
+      const followUp = await ctrl.ask("那先帮我写段普通文字");
+      expect(followUp.finalAnswer).toBe("纯文本正常回复");
+      expect(callCount).toBe(2);
+    } finally {
+      if (prevClipMock === undefined) delete process.env.DUO_MOCK_CLIPBOARD_IMAGE;
+      else process.env.DUO_MOCK_CLIPBOARD_IMAGE = prevClipMock;
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
   });
 
   it("4. reasoningContent 计入水位估算且不改写思考正文（保 KV 缓存）+ 零 Delta 退避重试与半途断流防重发", async () => {
