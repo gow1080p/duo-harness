@@ -10,7 +10,7 @@ import { attachLiveSlashDropdown, getPromptVisualCols, restorePastedNewlines } f
 import { openInDefaultApp, resolveDefaultOpenTarget } from "./platform.js";
 import { createReplCompleter, formatRecentHistoryRecap, listManagedProjects, loadProjectMeta, type ManagedProjectSummary, type ProjectSessionPaths, resolveProjectSessionPaths, saveProjectMeta, SLASH_COMMANDS } from "./project-store.js";
 import { executeReplReviewCommand } from "./reviewer.js";
-import { resolveRouteTier } from "./router.js";
+import { ensureDefaultModelsConfigFile, listAvailableModelModes, resolveRouteTier } from "./router.js";
 import { createSessionController, type SessionController } from "./session-controller.js";
 import { discoverAvailableSkills, expandSkillSlashCommand } from "./skill-loader.js";
 import { formatApprovalBox } from "./ui-logger.js";
@@ -29,17 +29,13 @@ export async function verifyGoalCompletion(workspaceRoot: string, finalAnswer: s
   }
   return { ok: true };
 }
-
 function formatPrompt(ctrl: SessionController): string {
   const st = ctrl.getStatus(), short = st.projectName.length > 18 ? `${st.projectName.slice(0, 15)}...` : st.projectName;
   return st.isNew ? `📂 ${short} [新对话 · ${st.modelLabel}] > ` : `📂 ${short} [${st.activeTurnIndex ? `续#${st.activeTurnIndex}` : "续聊"} · ${st.modelLabel}] > `;
 }
-
 function printReplWelcomeBanner(ctrl: SessionController): void {
   const st0 = ctrl.getStatus(), recap = formatRecentHistoryRecap(ctrl.loadEntries(), 1, ctrl.getLeafId()), diff0 = ctrl.getDiff();
-  console.log(`\n🚀 Duo-Harness | 当前项目: ${st0.projectName} (${st0.workspaceRoot})`);
-  console.log(`⚡ 模型路由: ${resolveRouteTier(Date.now()).reason} (同会话自动锁定原模型防缓存失效 · 输入 /model 可手动切换)`);
-  console.log(`💡 输入 / 用 ↑/↓ 方向键选择命令 | 截图后直接按 ${getPasteShortcutLabel()} (或敲 @clipboard) 粘贴图片 (/goal 自治 | /resume 选轮次 | /diff 看修改 | /undo 撤回)`);
+  console.log(`\n🚀 Duo-Harness | 当前项目: ${st0.projectName} (${st0.workspaceRoot})\n⚡ 模型路由: ${resolveRouteTier(Date.now()).reason} (同会话自动锁定原模型防缓存失效 · 输入 /model 可手动切换)\n💡 输入 / 用 ↑/↓ 方向键选择命令 | 截图后直接按 ${getPasteShortcutLabel()} (或敲 @clipboard) 粘贴图片 (/goal 自治 | /resume 选轮次 | /diff 看修改 | /undo 撤回)`);
   if (recap) console.log(recap);
   if (diff0.totalSnapshots > 0) console.log(`📋 [检测到未撤回修改] 当前工作区有 ${diff0.files.length} 个已修改文件 (${diff0.totalSnapshots} 个版本 · 输入 /diff 查看 | /undo 撤回)`);
 }
@@ -60,8 +56,14 @@ export async function handleSlashCommand(rawCmd: string, ctrl: SessionController
     return true;
   }
   if (cmd === "/model" || cmd.startsWith("/model ")) {
-    const arg = cmd.slice("/model".length).trim().toLowerCase();
-    console.log(arg === "auto" || arg === "deepseek" || arg === "mimo" || arg === "agy" || arg === "openai" ? `🤖 已切换模型策略为 [${arg}] (当前生效: ${ctrl.setModelMode(arg).activeModel})` : `💡 用法: /model auto | /model deepseek | /model mimo | /model agy (当前: ${ctrl.getStatus().modelMode})`);
+    const rawArg = cmd.slice("/model".length).trim(), ws = ctrl.getPaths().workspaceRoot, validModes = listAvailableModelModes(ws);
+    if (rawArg.toLowerCase() === "config") {
+      const cfgFile = ensureDefaultModelsConfigFile(ws), res = openInDefaultApp(cfgFile, ws);
+      console.log(res.ok ? `⚙️ 已打开模型配置文件: ${cfgFile} (修改保存后下一轮立即生效)` : `⚙️ 模型配置文件已就绪: ${cfgFile}`);
+      return true;
+    }
+    const matched = validModes.find((m) => m.toLowerCase() === rawArg.toLowerCase());
+    console.log(matched ? `🤖 已切换模型策略为 [${matched}] (当前生效: ${ctrl.setModelMode(matched).activeModel})` : `💡 用法: ${validModes.map((m) => `/model ${m}`).join(" | ")} | /model config (当前: ${ctrl.getStatus().modelMode})`);
     return true;
   }
   if (cmd === "/xray" || cmd === "/tree") {
@@ -202,9 +204,7 @@ export async function startInteractiveRepl(options: { workspaceRoot?: string; ho
     while (true) {
       replState.inMainPrompt = true;
       let line = "";
-      try {
-        process.stdout.write("\n"); line = restorePastedNewlines(await rl.question(formatPrompt(ctrl))).trim();
-      } catch (err) {
+      try { process.stdout.write("\n"); line = restorePastedNewlines(await rl.question(formatPrompt(ctrl))).trim(); } catch (err) {
         if (err instanceof Error && (err.name === "AbortError" || err.message.includes("Ctrl+C"))) { process.stdout.write("\r\n\x1b[J👋 已退出 Duo-Harness。\n"); break; }
         throw err;
       }
@@ -231,9 +231,7 @@ export async function startInteractiveRepl(options: { workspaceRoot?: string; ho
         });
       } catch (err) { console.error(`\n❌ 本轮运行异常: ${err instanceof Error ? err.message : String(err)}`); } finally { rl.off("SIGINT", onSigint); replState.turnAbort = null; replState.steerQueue = []; }
     }
-  } finally {
-    process.off("SIGHUP", onTerminateSignal); process.off("SIGTERM", onTerminateSignal); detachDropdown(); rl.close();
-  }
+  } finally { process.off("SIGHUP", onTerminateSignal); process.off("SIGTERM", onTerminateSignal); detachDropdown(); rl.close(); }
 }
 
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];

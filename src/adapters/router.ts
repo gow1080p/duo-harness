@@ -1,30 +1,47 @@
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import type { AssistantMessage, LlmProvider, LlmStreamEvent, Message, ToolContract } from "../core/contracts.js";
 import { createAgyBridgeProvider } from "./agy-bridge.js";
+import {
+  ensureDefaultModelsConfigFile,
+  listAvailableModelModes,
+  loadApiKey,
+  loadModelRegistryConfig,
+  type ModelEndpointConfig,
+  type ModelMode,
+  type ModelRegistryConfig,
+  type ResolvedModelTarget,
+  type RouteDecision,
+  type RouteOptions,
+  type RouteTier,
+  resolveActiveModelTarget,
+  resolveModelsConfigPath,
+  resolveRouteTier,
+  saveModelRegistryConfig,
+  type TimeRoutingConfig,
+} from "./model-config.js";
 import { createStreamRenderer, parseOpenAiAssistantMessage, readOpenAiSseStream, recordHttpWireLog } from "./sse-stream.js";
 
-export { parseOpenAiAssistantMessage };
-
-export type RouteTier = "tier0_replay" | "tier1_mimo_peak" | "tier2_deepseek_offpeak" | "tier3_gemini_cli";
-
-export interface RouteOptions { isReplay?: boolean; forceGeminiCli?: boolean; }
-export interface RouteDecision { tier: RouteTier; beijingHour: number; isWorkday: boolean; reason: string; }
-
-export function resolveRouteTier(utcTimestampMs: number, options: RouteOptions = {}): RouteDecision {
-  const beijingDate = new Date(utcTimestampMs + 8 * 3600_000);
-  const day = beijingDate.getUTCDay();
-  const beijingHour = beijingDate.getUTCHours();
-  const isWorkday = day >= 1 && day <= 5;
-  if (options.isReplay) return { tier: "tier0_replay", beijingHour, isWorkday, reason: "离线录像回放模式 (¥0)" };
-  if (options.forceGeminiCli) return { tier: "tier3_gemini_cli", beijingHour, isWorkday, reason: "显式指定 Gemini CLI 桥接兜底 (¥0)" };
-  const isPeakHour = isWorkday && ((beijingHour >= 9 && beijingHour < 12) || (beijingHour >= 14 && beijingHour < 18));
-  if (isPeakHour) return { tier: "tier1_mimo_peak", beijingHour, isWorkday, reason: `工作日高峰时段 (${beijingHour}:00 · 自动路由高速主力模型)` };
-  return { tier: "tier2_deepseek_offpeak", beijingHour, isWorkday, reason: `低谷优惠时段 (${isWorkday ? "工作日午休/夜间" : "周末"} ${beijingHour}:00 · 自动路由 DeepSeek)` };
-}
+export {
+  ensureDefaultModelsConfigFile,
+  listAvailableModelModes,
+  loadApiKey,
+  loadModelRegistryConfig,
+  parseOpenAiAssistantMessage,
+  resolveActiveModelTarget,
+  resolveModelsConfigPath,
+  resolveRouteTier,
+  saveModelRegistryConfig,
+  type ModelEndpointConfig,
+  type ModelMode,
+  type ModelRegistryConfig,
+  type ResolvedModelTarget,
+  type RouteDecision,
+  type RouteOptions,
+  type RouteTier,
+  type TimeRoutingConfig,
+};
 
 function zodTypeToJsonSchema(fieldSchema: z.ZodTypeAny): { schema: Record<string, unknown>; isOptional: boolean } {
   let current: z.ZodTypeAny = fieldSchema, isOptional = false, desc = fieldSchema.description;
@@ -112,81 +129,33 @@ export function toOpenAiMessages(messages: Message[], workspaceRoot = process.cw
   return outParams;
 }
 
-function readKeyFromFile(filePath: string, envName: string, allowBareFirstLine = true): string {
-  if (!fs.existsSync(filePath)) return "";
-  const raw = fs.readFileSync(filePath, "utf-8").trim();
-  const match = raw.match(new RegExp(`^(?:export\\s+)?${envName}\\s*=\\s*(.+)$`, "m"));
-  if (match?.[1]) return match[1].trim().replace(/^['"]|['"]$/g, "");
-  if (!allowBareFirstLine) return "";
-  const firstLine = raw.split("\n").map((l) => l.trim()).find((l) => l && !l.startsWith("#")) ?? "";
-  return firstLine.includes("=") ? "" : firstLine.replace(/^['"]|['"]$/g, "");
-}
-
-function loadApiKey(envName: string, dotFileName: string): string {
-  if (process.env[envName]?.trim()) return process.env[envName]!.trim();
-  const cwdEnv = readKeyFromFile(path.resolve(process.cwd(), ".env.local"), envName, false);
-  if (cwdEnv) return cwdEnv;
-  const harnessRootEnv = readKeyFromFile(path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../.env.local"), envName, false);
-  return harnessRootEnv || readKeyFromFile(path.join(os.homedir(), ".gemini", "antigravity", dotFileName), envName, true);
-}
-
-export type ModelMode = "auto" | "deepseek" | "mimo" | "agy" | "openai";
-
-export function resolveActiveModelTarget(
-  wireLogFile?: string,
-  hasPriorAssistant = false,
-  mode: ModelMode = "auto",
-  nowUtcMs = Date.now(),
-  hasImages = false,
-): { apiUrl: string; model: string; apiKey: string; shortLabel: string } {
-  if (mode === "agy") return { apiUrl: "agy://local-language-server", model: "gemini-4-argon-agy", apiKey: "local-agy", shortLabel: "Argon·反重力" };
-  const openaiKey = loadApiKey("OPENAI_API_KEY", ".openai_key");
-  const mimoKey = loadApiKey("MIMO_API_KEY", ".mimo_key");
-  const deepseekKey = loadApiKey("DEEPSEEK_API_KEY", ".deepseek_key");
-  let stickyProvider: "mimo" | "deepseek" | null = null;
-  if (mode === "auto" && hasPriorAssistant && wireLogFile && fs.existsSync(wireLogFile)) {
-    try {
-      const arr = JSON.parse(fs.readFileSync(wireLogFile, "utf-8"));
-      const lastModel = String(arr[arr.length - 1]?.requestBody?.model ?? arr[arr.length - 1]?.model ?? "");
-      if (lastModel.startsWith("deepseek") && deepseekKey) stickyProvider = "deepseek";
-      else if (lastModel.startsWith("mimo") && mimoKey) stickyProvider = "mimo";
-    } catch {}
-  }
-  const decision = resolveRouteTier(nowUtcMs);
-  const useOpenAi = mode === "openai" || (mode === "auto" && openaiKey.length > 0 && ((!mimoKey && !deepseekKey) || process.env.LLM_PROVIDER === "openai"));
-  const useMimo = !useOpenAi && (mode === "mimo" || (mode === "auto" && ((hasImages && mimoKey.length > 0) || (stickyProvider ? stickyProvider === "mimo" : decision.tier === "tier1_mimo_peak" && mimoKey.length > 0))));
-  if (hasImages && !useOpenAi && !useMimo) {
-    throw new Error("当前会话包含未折叠的图片附件，但 DeepSeek 官方接口不支持视觉输入 (image_url)；请配置 MIMO_API_KEY / 执行 /model mimo 切换到支持视觉的模型，或执行 /compact 折叠历史图片后再试。");
-  }
-  const isTokenPlan = mimoKey.startsWith("tp-") || mimoKey.startsWith("ttp-");
-  const openaiBaseUrl = (process.env.OPENAI_BASE_URL?.trim() || "https://api.openai.com/v1").replace(/\/$/, "");
-  const mimoBaseUrl = process.env.MIMO_BASE_URL?.trim() || (isTokenPlan ? "https://token-plan-cn.xiaomimimo.com/v1" : "https://api.xiaomimimo.com/v1");
-  const apiUrl = useOpenAi ? `${openaiBaseUrl}/chat/completions` : useMimo ? `${mimoBaseUrl.replace(/\/$/, "")}/chat/completions` : "https://api.deepseek.com/chat/completions";
-  const model = useOpenAi ? process.env.OPENAI_MODEL?.trim() || "gpt-5-codex" : useMimo ? process.env.MIMO_MODEL?.trim() || "mimo-v2.6-pro" : process.env.DEEPSEEK_MODEL?.trim() || "deepseek-reasoner";
-  const apiKey = useOpenAi ? openaiKey : useMimo ? mimoKey : deepseekKey;
-  const baseTag = useOpenAi ? "OpenAI" : useMimo ? "MiMo-2.6" : "DeepSeek";
-  const shortLabel = mode !== "auto" ? `${baseTag}·锁` : hasImages && useMimo ? `${baseTag}·视觉` : stickyProvider ? `${baseTag}·保缓存` : baseTag;
-  return { apiUrl, model, apiKey, shortLabel };
-}
-
 const RETRYABLE_ERR_RE = /^LLM HTTP (?:408|429|500|502|503|504)\b|fetch failed|terminated|ECONNRESET|ETIMEDOUT|socket|超时/i;
 
-export function createRouterProvider(wireLogFile = ".sessions/http-wire.json", appendExistingWire = false, getModelMode?: () => ModelMode): LlmProvider {
+export function createRouterProvider(
+  wireLogFile = ".sessions/http-wire.json",
+  appendExistingWire = false,
+  getModelMode?: () => ModelMode,
+  customConfigPath?: string,
+): LlmProvider {
   let roundCount = 0;
   let agyDelegate: LlmProvider | null = null;
   return {
     async chat(messages: Message[], tools: ToolContract<any>[] = [], options: { signal?: AbortSignal; onStreamEvent?: (event: LlmStreamEvent) => void; workspaceRoot?: string } = {}): Promise<AssistantMessage> {
       const mode = getModelMode?.() ?? "auto";
-      if (mode === "agy") {
+      const wsRoot = options.workspaceRoot ?? process.cwd();
+      const cfg = loadModelRegistryConfig(wsRoot, customConfigPath);
+      const isLockedMode = mode !== "auto" || Boolean(cfg.defaultModel && cfg.defaultModel !== "auto");
+      const hasPrior = messages.some((m) => m.role === "assistant"), lastUserIdx = messages.map((m) => m.role).lastIndexOf("user");
+      const turnHasImages = messages.slice(Math.max(0, lastUserIdx)).some((m) => (m.role === "user" || m.role === "tool") && Boolean(m.images && m.images.length > 0));
+      const userTurnHasImages = Boolean(lastUserIdx >= 0 && (messages[lastUserIdx] as Extract<Message, { role: "user" }>)?.images?.length);
+      const target = resolveActiveModelTarget(wireLogFile, hasPrior, mode, Date.now(), isLockedMode ? userTurnHasImages : turnHasImages, wsRoot, cfg);
+      if (target.protocol === "agy") {
         agyDelegate ??= createAgyBridgeProvider(wireLogFile, appendExistingWire || roundCount > 0);
         roundCount += 1;
         return agyDelegate.chat(messages, tools, options);
       }
-      const hasPrior = messages.some((m) => m.role === "assistant"), lastUserIdx = messages.map((m) => m.role).lastIndexOf("user");
-      const turnHasImages = messages.slice(Math.max(0, lastUserIdx)).some((m) => (m.role === "user" || m.role === "tool") && Boolean(m.images && m.images.length > 0));
-      const userTurnHasImages = Boolean(lastUserIdx >= 0 && (messages[lastUserIdx] as Extract<Message, { role: "user" }>)?.images?.length);
-      const { apiUrl, model, apiKey } = resolveActiveModelTarget(wireLogFile, hasPrior, mode, Date.now(), mode === "deepseek" ? userTurnHasImages : turnHasImages);
-      if (!apiKey) throw new Error(`未检测到模型密钥，请配置 DEEPSEEK_API_KEY / MIMO_API_KEY 或 ~/.gemini/antigravity/.deepseek_key`);
+      const { apiUrl, model, apiKey, supportsVision } = target;
+      if (!apiKey) throw new Error(`未检测到模型 [${model}] 密钥，请配置对应环境变量、.duo/models.json 或 ~/.duo-harness/models.json`);
 
       const openAiTools = tools.map((t) => ({
         type: "function",
@@ -194,7 +163,7 @@ export function createRouterProvider(wireLogFile = ".sessions/http-wire.json", a
       }));
       const requestBody: Record<string, unknown> = {
         model,
-        messages: toOpenAiMessages(messages, options.workspaceRoot, !model.startsWith("deepseek")),
+        messages: toOpenAiMessages(messages, wsRoot, supportsVision),
         ...(openAiTools.length > 0 ? { tools: openAiTools } : {}),
         ...(model.includes("reasoner") ? {} : { temperature: 0 }),
         stream: true,

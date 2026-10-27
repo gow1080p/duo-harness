@@ -13,7 +13,7 @@ export { formatSnapshotsDiff };
 
 export interface ProjectMetaState {
   projectKey: string; workspaceRoot: string; updatedAt: string; activeLeafId?: string | null;
-  modelMode?: "auto" | "deepseek" | "mimo" | "agy" | "openai"; lastUndoNotice?: string | null; inputHistory?: string[];
+  modelMode?: string; lastUndoNotice?: string | null; inputHistory?: string[];
 }
 
 export function loadProjectMeta(metaFile: string): Partial<ProjectMetaState> {

@@ -3,6 +3,7 @@ export * from "./core/loop.js";
 export * from "./core/session-tree.js";
 export * from "./core/compactor.js";
 
+export * from "./adapters/model-config.js";
 export * from "./adapters/router.js";
 export * from "./adapters/sse-stream.js";
 export * from "./adapters/cost-tracker.js";

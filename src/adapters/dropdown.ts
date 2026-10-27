@@ -2,23 +2,16 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { buildAtMentionDropdown } from "./context-mention.js";
 import { summarizeSnapshotsDiff } from "./diff-presenter.js";
+import { loadModelRegistryConfig } from "./model-config.js";
 import { getVisualCols, padCols, truncateCols } from "./platform.js";
 import { extractConversationTurns, listManagedProjects, loadProjectSnapshots, resolveProjectSessionPaths, SLASH_COMMANDS } from "./project-store.js";
 import { buildSkillDropdownItems } from "./skill-loader.js";
 import { loadJsonlEntries } from "./store.js";
 import { tryExpandClipboardInLine } from "./vision-capture.js";
 
-export interface DropdownItem {
-  label: string; desc: string; fillText: string; expandOnly?: boolean; cursorAfter?: number;
-}
-
-export interface LiveDropdownRuntimeHooks {
-  isApprovalActive?: () => boolean; onAbortRun?: () => void; onSteerLine?: (text: string) => void;
-}
-
-const MAX_MENU_ROWS = 8;
-const PASTED_NEWLINE_TOKEN = "\u200b↵\u200b";
-
+export interface DropdownItem { label: string; desc: string; fillText: string; expandOnly?: boolean; cursorAfter?: number; }
+export interface LiveDropdownRuntimeHooks { isApprovalActive?: () => boolean; onAbortRun?: () => void; onSteerLine?: (text: string) => void; }
+const MAX_MENU_ROWS = 8, PASTED_NEWLINE_TOKEN = "\u200b↵\u200b";
 export function encodePastedNewlines(raw: string): string { return raw.replace(/\r\n|\r|\n/g, PASTED_NEWLINE_TOKEN); }
 export function restorePastedNewlines(line: string): string { return line.split(PASTED_NEWLINE_TOKEN).join("\n"); }
 export function getPromptVisualCols(promptStr: string): number { return getVisualCols(promptStr.split("\n").pop() ?? ""); }
@@ -59,13 +52,18 @@ function buildDiffOrOpenDropdown(line: string, currentWorkspaceRoot: string, hom
 
 export function buildDropdownItems(line: string, currentWorkspaceRoot: string, homeBaseDir?: string, activeLeafId?: string | null, cursor: number = line.length): DropdownItem[] {
   if (line.startsWith("/model ")) {
-    const filter = line.slice(7).trim().toLowerCase();
-    return [
+    const filter = line.slice(7).trim().toLowerCase(), cfg = loadModelRegistryConfig(currentWorkspaceRoot);
+    const baseItems: DropdownItem[] = [
       { label: "/model auto", desc: "⚡ 智能模式 (新对话按高峰MiMo/低谷DS路由，续聊自动保持原模型防缓存失效)", fillText: "/model auto" },
       { label: "/model deepseek", desc: "🧠 锁定 DeepSeek (deepseek-reasoner · 深度中文推理)", fillText: "/model deepseek" },
       { label: "/model mimo", desc: "🚀 锁定 小米 MiMo (mimo-v2.6-pro · 高速主力模型)", fillText: "/model mimo" },
       { label: "/model agy", desc: "🪐 桥接 Antigravity (本机官方 language_server · 白嫖 5h 刷新额度)", fillText: "/model agy" },
-    ].filter((m) => !filter || m.label.includes(filter));
+    ];
+    for (const [k, v] of Object.entries(cfg.models)) {
+      if (!["deepseek", "mimo", "agy", "openai"].includes(k)) baseItems.push({ label: `/model ${k}`, desc: `🔌 自定义模型 (${v.label ?? k} · ${v.model})`, fillText: `/model ${k}` });
+    }
+    baseItems.push({ label: "/model config", desc: "⚙️ 打开模型配置文件 (~/.duo-harness/models.json · 添加/修改 API 与自定义模型)", fillText: "/model config" });
+    return baseItems.filter((m) => !filter || m.label.toLowerCase().includes(filter) || m.desc.toLowerCase().includes(filter));
   }
   if (line.startsWith("/resume ") || line.startsWith("/branch ")) {
     const filter = line.replace(/^\/(?:resume|branch)\s+/, "").trim().toLowerCase();

@@ -4,6 +4,7 @@ import { z } from "zod";
 import type { LlmProvider, ToolCall } from "../core/contracts.js";
 import { listManagedProjects } from "./project-store.js";
 import { runCodeReview } from "./reviewer.js";
+import { listAvailableModelModes, loadModelRegistryConfig, resolveModelsConfigPath, saveModelRegistryConfig } from "./router.js";
 import { createSessionController, type SessionController } from "./session-controller.js";
 
 const RpcRequestSchema = z.object({
@@ -113,9 +114,10 @@ async function handleCommandPost(req: http.IncomingMessage, res: http.ServerResp
       return sendJson(res, r.ok ? 200 : 400, r);
     }
     if (action === "model") {
-      const m = arg.trim().toLowerCase();
-      if (m !== "auto" && m !== "deepseek" && m !== "mimo" && m !== "agy" && m !== "openai") return sendJson(res, 400, { ok: false, error: `不支持的模型模式: ${arg}` });
-      return sendJson(res, 200, { ok: true, status: ctrl.setModelMode(m) });
+      const raw = arg.trim(), valid = listAvailableModelModes(ctrl.getPaths().workspaceRoot);
+      const matched = valid.find((m) => m.toLowerCase() === raw.toLowerCase());
+      if (!matched) return sendJson(res, 400, { ok: false, error: `不支持的模型模式: ${arg}` });
+      return sendJson(res, 200, { ok: true, status: ctrl.setModelMode(matched) });
     }
     if (action === "diff") return sendJson(res, 200, { ok: true, ...ctrl.getDiff(arg.trim() || "turn") });
     if (action === "undo") return sendJson(res, 200, { ok: true, ...(await ctrl.undo(arg.trim() || "turn")) });
@@ -168,9 +170,22 @@ async function handleSessionPost(req: http.IncomingMessage, res: http.ServerResp
 export function createHarnessRpcServer(options: HarnessRpcServerOptions = {}): http.Server {
   const ctrl = createSessionController({ workspaceRoot: options.workspaceRoot, homeBaseDir: options.homeBaseDir, provider: options.provider });
   return http.createServer((req, res) => {
-    const url = req.url ?? "/";
+    const url = req.url ?? "/", ws = ctrl.getPaths().workspaceRoot;
     if (req.method === "GET" && url === "/health") return sendJson(res, 200, { ok: true, status: "healthy" });
     if (req.method === "GET" && url === "/api/status") return sendJson(res, 200, { ok: true, status: ctrl.getStatus(), turns: ctrl.listTurns(), diff: ctrl.getDiff() });
+    if (req.method === "GET" && url === "/api/models") {
+      return sendJson(res, 200, { ok: true, configPath: resolveModelsConfigPath(ws), config: loadModelRegistryConfig(ws), availableModes: listAvailableModelModes(ws), status: ctrl.getStatus() });
+    }
+    if (req.method === "POST" && url === "/api/models") {
+      void readJsonBody(req, options.maxBodyBytes ?? 65_536)
+        .then((body: any) => {
+          const savedPath = saveModelRegistryConfig(body ?? {}, ws, Boolean(body?.preferWorkspace));
+          if (typeof body?.activeMode === "string" && listAvailableModelModes(ws).includes(body.activeMode)) ctrl.setModelMode(body.activeMode);
+          sendJson(res, 200, { ok: true, configPath: savedPath, config: loadModelRegistryConfig(ws), availableModes: listAvailableModelModes(ws), status: ctrl.getStatus() });
+        })
+        .catch((err) => sendJson(res, 400, { ok: false, error: err instanceof Error ? err.message : String(err) }));
+      return;
+    }
     if (req.method === "POST" && url === "/api/command") { void handleCommandPost(req, res, ctrl, options); return; }
     if (req.method === "POST" && url === "/api/session") { void handleSessionPost(req, res, ctrl, options); return; }
     sendJson(res, 404, { ok: false, error: `未知路由: ${req.method} ${url}` });

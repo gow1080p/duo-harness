@@ -3,9 +3,11 @@ import * as path from "node:path";
 import * as os from "node:os";
 import type { AddressInfo } from "node:net";
 import { describe, expect, it } from "vitest";
+import { z } from "zod";
 import { compactMessages } from "../src/core/compactor.js";
 import type { AssistantMessage, LlmProvider, Message } from "../src/core/contracts.js";
-import { createBuiltinTools, executeToolCalls } from "../src/adapters/tools.js";
+import { runAgentSession } from "../src/adapters/cli.js";
+import { createBuiltinTools, executeToolCalls, type AdapterToolContract } from "../src/adapters/tools.js";
 import {
   buildRepoMap,
   runCodeReview,
@@ -13,7 +15,7 @@ import {
 } from "../src/adapters/reviewer.js";
 import { createHarnessRpcServer } from "../src/adapters/rpc-server.js";
 import { formatCostReport, summarizeWireCost } from "../src/adapters/cost-tracker.js";
-import { toOpenAiMessages } from "../src/adapters/router.js";
+import { ensureDefaultModelsConfigFile, listAvailableModelModes, loadModelRegistryConfig, resolveActiveModelTarget, saveModelRegistryConfig, toOpenAiMessages } from "../src/adapters/router.js";
 import { analyzeSessionXray, formatXrayReport } from "../src/adapters/xray.js";
 import type { HttpWireLogEntry } from "../src/adapters/sse-stream.js";
 
@@ -273,5 +275,141 @@ describe("Stage 5: 自主探路代码审查特工 (reviewer.ts)、RepoMap 与轻
 
     const xray = analyzeSessionXray(".sessions/play.jsonl", ".sessions/http-wire.json");
     expect(formatXrayReport(xray)).toContain("每步消息与工具调用明细");
+  });
+
+  it("5. 外部 models.json 用户配置化与业务系统 SDK 扩展钩子 (includeBuiltinTools:false / quiet / details / terminate:true 秒停)", async () => {
+    const tmpWs = fs.mkdtempSync(path.join(os.tmpdir(), "duo-ext-sdk-"));
+    try {
+      // 1) 验证 .duo/models.json 自定义内网/本地模型加载与路由解析
+      fs.mkdirSync(path.join(tmpWs, ".duo"), { recursive: true });
+      fs.writeFileSync(
+        path.join(tmpWs, ".duo", "models.json"),
+        JSON.stringify({
+          defaultModel: "qwen-intranet",
+          timeRouting: { peakModel: "qwen-intranet", offPeakModel: "deepseek", visionModel: "unconfigured-vlm" },
+          models: {
+            deepseek: {
+              model: "deepseek-chat",
+            },
+            "corp-ds": {
+              protocol: "openai",
+              baseUrl: "https://llm.corp.internal/v1",
+              model: "deepseek-chat",
+              apiKey: "sk-corp",
+            },
+            "qwen-intranet": {
+              protocol: "openai",
+              baseUrl: "http://192.168.50.251:8000/v1",
+              model: "qwen3.8-27b",
+              label: "Qwen内网",
+              supportsVision: false,
+            },
+          },
+        }),
+        "utf-8",
+      );
+
+      const cfg = loadModelRegistryConfig(tmpWs);
+      expect(cfg.defaultModel).toBe("qwen-intranet");
+      // 验证单字段增量覆写生效（无需重复填 baseUrl）
+      expect(cfg.models.deepseek?.model).toBe("deepseek-chat");
+      expect(cfg.models.deepseek?.baseUrl).toBe("https://api.deepseek.com");
+      expect(listAvailableModelModes(tmpWs)).toContain("qwen-intranet");
+
+      const targetAuto = resolveActiveModelTarget(undefined, false, "auto", Date.now(), false, tmpWs);
+      expect(targetAuto.apiUrl).toBe("http://192.168.50.251:8000/v1/chat/completions");
+      expect(targetAuto.model).toBe("qwen3.8-27b");
+      expect(targetAuto.apiKey).toBe("EMPTY");
+      expect(targetAuto.shortLabel).toContain("Qwen内网");
+
+      // 验证多轮粘性路由按 apiUrl + model 精确匹配，防止同 model 名称的企业代理被内置 deepseek 劫持
+      const wireFile = path.join(tmpWs, ".duo", "wire.json");
+      fs.writeFileSync(wireFile, JSON.stringify([{ apiUrl: "https://llm.corp.internal/v1/chat/completions", requestBody: { model: "deepseek-chat" } }]), "utf-8");
+      const stickyCorp = resolveActiveModelTarget(wireFile, true, "auto", Date.now(), false, tmpWs, { ...cfg, defaultModel: "auto" });
+      expect(stickyCorp.apiUrl).toBe("https://llm.corp.internal/v1/chat/completions");
+      expect(stickyCorp.shortLabel).toContain("保缓存");
+
+      // 按模型实际名称 "qwen3.8-27b" 也能反查命中配置
+      const targetByModelName = resolveActiveModelTarget(undefined, false, "qwen3.8-27b", Date.now(), false, tmpWs);
+      expect(targetByModelName.apiUrl).toBe("http://192.168.50.251:8000/v1/chat/completions");
+
+      // 验证 ensureDefaultModelsConfigFile 与 saveModelRegistryConfig 持久化保存
+      const ensuredPath = ensureDefaultModelsConfigFile(tmpWs, true);
+      expect(ensuredPath).toBe(path.join(tmpWs, ".duo", "models.json"));
+      saveModelRegistryConfig({ defaultModel: "mimo", models: { mimo: { baseUrl: "https://api.xiaomimimo.com/v1", model: "mimo-v2.6-pro", label: "MiMo-2.6" } } }, tmpWs, true);
+      expect(loadModelRegistryConfig(tmpWs).defaultModel).toBe("mimo");
+
+      // 2) 验证外部业务系统接入：includeBuiltinTools: false + extraTools + details 双通道 + terminate: true 省掉二次 LLM 请求
+      const genuiTool: AdapterToolContract<{ title: string }> = {
+        name: "genui_surface",
+        description: "生成前端图表组件树",
+        parameters: z.object({ title: z.string() }),
+        readonly: true,
+        execute: async ({ title }) => ({
+          content: `已生成图表：${title}`,
+          details: { surfaceId: "s_revenue", chartType: "bar", title, rows: 25 },
+          terminate: true,
+        }),
+      };
+
+      let llmCallCount = 0;
+      let exposedToolNames: string[] = [];
+      const mockProvider: LlmProvider = {
+        async chat(_messages, tools = []) {
+          llmCallCount += 1;
+          exposedToolNames = tools.map((t) => t.name);
+          return {
+            role: "assistant",
+            content: "为您展示今年各区域营收对比柱状图：",
+            toolCalls: [{ id: "call_genui_1", name: "genui_surface", arguments: { title: "区域营收对比" } }],
+          };
+        },
+      };
+
+      const sessionFile = path.join(tmpWs, ".duo", "bi-session.jsonl");
+      let capturedHookDetails: unknown;
+      const res1 = await runAgentSession("画各区域营收柱状图", {
+        workspaceRoot: tmpWs,
+        sessionFile,
+        provider: mockProvider,
+        includeBuiltinTools: false,
+        extraTools: [genuiTool],
+        quiet: true,
+        onAfterToolCall: (_call, result) => {
+          capturedHookDetails = result.details;
+        },
+      });
+
+      // 只暴露了业务工具，不包含 read_file/edit_file/run_bash
+      expect(exposedToolNames).toEqual(["genui_surface"]);
+      // terminate: true 生效：工具跑完当场结束，只调了 1 次 LLM（没有发第 2 次请求）
+      expect(llmCallCount).toBe(1);
+      expect(res1.finalAnswer).toBe("为您展示今年各区域营收对比柱状图：");
+      expect(capturedHookDetails).toEqual({ surfaceId: "s_revenue", chartType: "bar", title: "区域营收对比", rows: 25 });
+      expect(res1.toolDetails?.call_genui_1).toEqual({ surfaceId: "s_revenue", chartType: "bar", title: "区域营收对比", rows: 25 });
+
+      // 3) 验证落盘的 .jsonl 不含 details/terminate 大字段，且第 2 轮续聊 100% 通过会话树配对检查
+      const rawJsonl = fs.readFileSync(sessionFile, "utf-8");
+      expect(rawJsonl).not.toContain("surfaceId");
+      const res2 = await runAgentSession("再切到华东区看明细", {
+        workspaceRoot: tmpWs,
+        sessionFile,
+        leafId: res1.leafId ?? undefined,
+        provider: {
+          async chat(messages) {
+            llmCallCount += 1;
+            expect(messages.some((m) => m.role === "tool" && m.content === "已生成图表：区域营收对比")).toBe(true);
+            return { role: "assistant", content: "华东区明细已为您更新。" };
+          },
+        },
+        includeBuiltinTools: false,
+        extraTools: [genuiTool],
+        quiet: true,
+      });
+      expect(llmCallCount).toBe(2);
+      expect(res2.finalAnswer).toBe("华东区明细已为您更新。");
+    } finally {
+      fs.rmSync(tmpWs, { recursive: true, force: true });
+    }
   });
 });

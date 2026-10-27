@@ -8,6 +8,13 @@ import { resolveSafePath, type SandboxGrants } from "./sandbox-policy.js";
 
 export { resolveSafePath, type SandboxGrants };
 
+export interface AdapterToolOutputObject { content: string; images?: ImageAttachment[]; details?: unknown; terminate?: boolean; }
+export type AdapterToolOutput = string | AdapterToolOutputObject;
+export interface AdapterToolResultMessage extends ToolResultMessage { details?: unknown; terminate?: boolean; }
+export interface AdapterToolContract<TArgs = any> extends Omit<ToolContract<TArgs>, "execute"> {
+  execute: (args: TArgs) => Promise<AdapterToolOutput> | AdapterToolOutput;
+}
+
 const ReadFileArgsSchema = z.object({
   path: z.string().min(1).describe("要读取的文件路径（支持工作区相对路径或已授权技能路径）"),
   startLine: z.number().int().min(0).optional().describe("起始行号（1-based，可选）"),
@@ -28,48 +35,26 @@ const GrepArgsSchema = z.object({
 export const IGNORED_DIRS = new Set([".git", "node_modules", ".sessions", ".debug", "venv", ".venv", "__pycache__", "dist", "build", ".next"]);
 export const BINARY_EXT_RE = /\.(png|jpe?g|gif|webp|ico|pdf|zip|tar|gz|woff2?|ttf|eot|mp[34]|mov|pyc|so|dylib|dll|exe|db|sqlite3?|lock)$/i;
 
-async function runGrepSearch(
-  workspaceRoot: string,
-  args: z.infer<typeof GrepArgsSchema>,
-  grants?: SandboxGrants,
-): Promise<string> {
-  const realRoot = resolveSafePath(workspaceRoot, ".", "read", grants);
-  const fullPath = resolveSafePath(workspaceRoot, args.path, "read", grants);
+async function runGrepSearch(workspaceRoot: string, args: z.infer<typeof GrepArgsSchema>, grants?: SandboxGrants): Promise<string> {
+  const realRoot = resolveSafePath(workspaceRoot, ".", "read", grants), fullPath = resolveSafePath(workspaceRoot, args.path, "read", grants);
   const stat = await fs.stat(fullPath);
   const files = stat.isDirectory()
     ? (await fs.readdir(fullPath, { recursive: true, withFileTypes: true }))
-        .filter((e) => {
-          if (!e.isFile() || BINARY_EXT_RE.test(e.name)) return false;
-          const relParts = path.relative(fullPath, e.parentPath).split(path.sep);
-          return !relParts.some((p) => IGNORED_DIRS.has(p));
-        })
+        .filter((e) => e.isFile() && !BINARY_EXT_RE.test(e.name) && !path.relative(fullPath, e.parentPath).split(path.sep).some((p) => IGNORED_DIRS.has(p)))
         .map((e) => path.join(e.parentPath, e.name))
     : [fullPath];
-
   let regex: RegExp;
-  try {
-    regex = new RegExp(args.pattern, "i");
-  } catch {
-    const escaped = args.pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    regex = new RegExp(escaped, "i");
-  }
-  const ctx = Math.min(Math.max(0, args.contextLines ?? 0), 15);
-  const matches: string[] = [];
+  try { regex = new RegExp(args.pattern, "i"); } catch { regex = new RegExp(args.pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i"); }
+  const ctx = Math.min(Math.max(0, args.contextLines ?? 0), 15), matches: string[] = [];
   for (const file of files) {
-    const stat = await fs.stat(file).catch(() => null);
-    if (!stat || !stat.isFile() || stat.size > 512_000) continue;
+    const fStat = await fs.stat(file).catch(() => null);
+    if (!fStat || !fStat.isFile() || fStat.size > 512_000) continue;
     const raw = await fs.readFile(file, "utf-8").catch(() => "");
     if (!raw || raw.includes("\u0000")) continue;
-    const lines = raw.split("\n");
-    const rel = toPosixRelative(realRoot, file);
+    const lines = raw.split("\n"), rel = toPosixRelative(realRoot, file);
     lines.forEach((line, idx) => {
       if (regex.test(line)) {
-        const start = Math.max(0, idx - ctx);
-        const end = Math.min(lines.length - 1, idx + ctx);
-        const snippet = lines
-          .slice(start, end + 1)
-          .map((l) => l.trim())
-          .join(" | ");
+        const snippet = lines.slice(Math.max(0, idx - ctx), Math.min(lines.length - 1, idx + ctx) + 1).map((l) => l.trim()).join(" | ");
         matches.push(`${rel}:${idx + 1}: ${snippet}`);
       }
     });
@@ -200,13 +185,13 @@ export function createBuiltinTools(workspaceRoot: string = process.cwd(), grants
 async function executeSingleToolCall(
   call: ToolCall,
   toolMap: Map<string, ToolContract<any>>,
-): Promise<ToolResultMessage> {
+): Promise<AdapterToolResultMessage> {
   const tool = toolMap.get(call.name);
   if (!tool) {
     return { role: "tool", toolCallId: call.id, name: call.name, content: `未知工具: ${call.name}`, isError: true };
   }
   try {
-    const output = await tool.execute(tool.parameters.parse(call.arguments));
+    const output = (await tool.execute(tool.parameters.parse(call.arguments))) as AdapterToolOutput;
     if (typeof output === "object" && output !== null && "content" in output) {
       return {
         role: "tool",
@@ -214,6 +199,8 @@ async function executeSingleToolCall(
         name: call.name,
         content: String(output.content),
         ...(output.images && output.images.length > 0 ? { images: output.images } : {}),
+        ...(output.details !== undefined ? { details: output.details } : {}),
+        ...(output.terminate !== undefined ? { terminate: Boolean(output.terminate) } : {}),
         isError: false,
       };
     }
@@ -227,7 +214,7 @@ async function executeSingleToolCall(
 export async function executeToolCalls(
   toolCalls: readonly ToolCall[],
   tools: readonly ToolContract<any>[],
-): Promise<ToolResultMessage[]> {
+): Promise<AdapterToolResultMessage[]> {
   const toolMap = new Map(tools.map((t) => [t.name, t]));
   const hasWriteOrSequentialTool = toolCalls.some((c) => toolMap.get(c.name)?.readonly === false);
 

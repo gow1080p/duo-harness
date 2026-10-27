@@ -7,7 +7,7 @@ import { runAgentSession, type RunSessionOptions } from "./cli.js";
 import { expandAtMentions } from "./context-mention.js";
 import { loadAndFormatWireCost } from "./cost-tracker.js";
 import { type ConversationTurnSummary, extractConversationTurns, formatRecentHistoryRecap, formatSnapshotsDiff, loadProjectMeta, loadProjectRedoBatches, loadProjectSnapshots, type ProjectSessionPaths, resolveProjectSessionPaths, resolveTargetWorkspace, saveProjectMeta, saveProjectSnapshots } from "./project-store.js";
-import { createRouterProvider, type ModelMode, resolveActiveModelTarget } from "./router.js";
+import { createRouterProvider, listAvailableModelModes, type ModelMode, resolveActiveModelTarget } from "./router.js";
 import { appendJsonlEntries, loadJsonlEntries } from "./store.js";
 import { computeTurnMetrics, type FileDiffSummaryItem, summarizeSnapshotsDiff } from "./ui-logger.js";
 import { createSandboxGrants, type SandboxGrants } from "./sandbox-policy.js";
@@ -39,8 +39,8 @@ function loadDiskEntries(sessionFile: string): SessionEntry[] {
 }
 
 function syncStateFromDisk(st: ControllerMutableState): SessionEntry[] {
-  const entries = loadDiskEntries(st.paths.sessionFile), meta = loadProjectMeta(st.paths.metaFile);
-  st.modelMode = meta.modelMode === "auto" || meta.modelMode === "deepseek" || meta.modelMode === "mimo" || meta.modelMode === "agy" || meta.modelMode === "openai" ? meta.modelMode : "auto";
+  const entries = loadDiskEntries(st.paths.sessionFile), meta = loadProjectMeta(st.paths.metaFile), validModes = listAvailableModelModes(st.paths.workspaceRoot);
+  st.modelMode = meta.modelMode && validModes.includes(meta.modelMode) ? meta.modelMode : "auto";
   if (meta.activeLeafId === "__root__") st.leafId = entries[0]?.id ?? null;
   else if (meta.activeLeafId && entries.some((e) => e.id === meta.activeLeafId)) st.leafId = meta.activeLeafId;
   else st.leafId = entries.length > 0 ? entries[entries.length - 1]!.id : null;
@@ -54,7 +54,7 @@ function buildStatusSummary(st: ControllerMutableState): SessionStatusSummary {
   const rootId = entries[0]?.id ?? null, isNew = !st.leafId || st.leafId === rootId || entries.length <= 1;
   const turns = extractConversationTurns(entries, st.leafId);
   const cur = isNew ? undefined : (turns.find((t) => t.isCurrentLeaf) ?? turns[turns.length - 1]);
-  const target = resolveActiveModelTarget(st.paths.wireLogFile, !isNew, st.modelMode);
+  const target = resolveActiveModelTarget(st.paths.wireLogFile, !isNew, st.modelMode, Date.now(), false, st.paths.workspaceRoot);
   return {
     projectKey: st.paths.projectKey, projectName: path.basename(st.paths.workspaceRoot) || "root",
     workspaceRoot: st.paths.workspaceRoot, isNew, activeTurnIndex: cur?.turnIndex ?? null,
