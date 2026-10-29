@@ -221,32 +221,4 @@ export function discoverOsLsProcess(): { pid: string; token: string; ports: numb
   return { pid, token, ports };
 }
 
-export function resolveDefaultOpenTarget(workspaceRoot: string, recentPaths: readonly string[] = []): string {
-  for (let i = recentPaths.length - 1; i >= 0; i--) {
-    const candidate = path.resolve(workspaceRoot, recentPaths[i]!);
-    if (fs.existsSync(candidate)) return candidate;
-  }
-  try {
-    const entries = fs.readdirSync(workspaceRoot, { withFileTypes: true }).filter((e) => e.isFile() && !e.name.startsWith("."));
-    const preferred = entries.find((e) => /\.(?:html?|svg|pdf|md)$/i.test(e.name)) ?? entries[0];
-    if (preferred) return path.join(workspaceRoot, preferred.name);
-  } catch {}
-  return workspaceRoot;
-}
-
-export function openInDefaultApp(targetPathOrUrl: string, workspaceRoot = process.cwd()): { ok: boolean; resolved: string; error?: string } {
-  const raw = targetPathOrUrl.trim();
-  const isUrl = /^(?:https?|file):\/\//i.test(raw);
-  const resolved = isUrl ? raw : path.resolve(workspaceRoot, expandHomePath(raw));
-  if (!isUrl && !fs.existsSync(resolved)) return { ok: false, resolved, error: `未找到目标文件或目录: ${resolved}` };
-  try {
-    const cmd = process.platform === "win32" ? "rundll32.exe" : process.platform === "darwin" ? "open" : "xdg-open";
-    const args = process.platform === "win32" ? ["url.dll,FileProtocolHandler", resolved] : [resolved];
-    const child = spawn(cmd, args, { detached: true, stdio: "ignore", windowsHide: true });
-    child.on("error", () => {});
-    child.unref();
-    return { ok: true, resolved };
-  } catch (err) {
-    return { ok: false, resolved, error: err instanceof Error ? err.message : String(err) };
-  }
-}
+export { type MdPreviewLaunchResult, launchMarkdownPreview, openInDefaultApp, resolveDefaultMdTarget, resolveDefaultOpenTarget } from "./md-preview.js";

@@ -17,16 +17,12 @@ export function restorePastedNewlines(line: string): string { return line.split(
 export function getPromptVisualCols(promptStr: string): number { return getVisualCols(promptStr.split("\n").pop() ?? ""); }
 
 function buildDiffOrOpenDropdown(line: string, currentWorkspaceRoot: string, homeBaseDir?: string): DropdownItem[] {
-  const isDiff = line.startsWith("/diff "), cmdPrefix = line.startsWith("/shot ") ? "/shot" : "/open";
-  const filter = line.slice(6).trim().toLowerCase();
-  const snaps = loadProjectSnapshots(resolveProjectSessionPaths(currentWorkspaceRoot, homeBaseDir).snapshotsFile);
-  const top = snaps[snaps.length - 1];
+  const isDiff = line.startsWith("/diff "), cmdPrefix = line.startsWith("/shot ") ? "/shot" : "/open", filter = line.slice(6).trim().toLowerCase();
+  const snaps = loadProjectSnapshots(resolveProjectSessionPaths(currentWorkspaceRoot, homeBaseDir).snapshotsFile), top = snaps[snaps.length - 1];
   const files = summarizeSnapshotsDiff(top?.turnId ? snaps.filter((s) => s.turnId === top.turnId) : snaps, currentWorkspaceRoot, false);
   if (isDiff) {
     const items: DropdownItem[] = files.map((d, i) => ({
-      label: `/diff ${d.file}`,
-      desc: `[#${i + 1}] ${d.isNew ? `新建 +${d.newLines} 行` : `+${d.addedLines} / -${d.removedLines} 行 (${d.edits}处修改)`}`,
-      fillText: `/diff ${d.file}`,
+      label: `/diff ${d.file}`, desc: `[#${i + 1}] ${d.isNew ? `新建 +${d.newLines} 行` : `+${d.addedLines} / -${d.removedLines} 行 (${d.edits}处修改)`}`, fillText: `/diff ${d.file}`,
     }));
     items.push(
       { label: "/diff full", desc: "🔍 展开本轮全部修改代码行（不折叠长片段）", fillText: "/diff full" },
@@ -35,14 +31,18 @@ function buildDiffOrOpenDropdown(line: string, currentWorkspaceRoot: string, hom
     return items.filter((m) => !filter || m.label.toLowerCase().includes(filter) || m.desc.toLowerCase().includes(filter));
   }
   const seen = new Set<string>(), items: DropdownItem[] = [];
+  if (cmdPrefix === "/open" && fs.existsSync(path.join(currentWorkspaceRoot, ".debug", "plan.md"))) {
+    seen.add(".debug/plan.md");
+    items.push({ label: "/open .debug/plan.md", desc: "📝 预览并实时编辑当前规划方案 (.debug/plan.md)", fillText: "/open .debug/plan.md" });
+  }
   for (const d of files) {
-    seen.add(d.file);
-    items.push({ label: `${cmdPrefix} ${d.file}`, desc: `🌐 ${cmdPrefix === "/shot" ? "无头截图预览" : "打开本轮修改文件"} (${d.file})`, fillText: `${cmdPrefix} ${d.file}` });
+    if (!seen.has(d.file)) { seen.add(d.file); items.push({ label: `${cmdPrefix} ${d.file}`, desc: `🌐 ${cmdPrefix === "/shot" ? "无头截图预览" : "打开本轮修改文件"} (${d.file})`, fillText: `${cmdPrefix} ${d.file}` }); }
   }
   try {
     for (const e of fs.readdirSync(currentWorkspaceRoot, { withFileTypes: true })) {
       if (e.isFile() && !e.name.startsWith(".") && !seen.has(e.name)) {
-        items.push({ label: `${cmdPrefix} ${e.name}`, desc: `📄 ${cmdPrefix === "/shot" ? "截取网页/文件预览图" : "用系统默认应用打开"} ${e.name}`, fillText: `${cmdPrefix} ${e.name}` });
+        const isMd = /\.(?:md|markdown)$/i.test(e.name);
+        items.push({ label: `${cmdPrefix} ${e.name}`, desc: `${isMd && cmdPrefix === "/open" ? "📝 预览与编辑 Markdown" : cmdPrefix === "/shot" ? "📄 截取网页/文件预览图" : "📄 用系统默认应用打开"} ${e.name}`, fillText: `${cmdPrefix} ${e.name}` });
       }
     }
   } catch {}
@@ -66,17 +66,12 @@ export function buildDropdownItems(line: string, currentWorkspaceRoot: string, h
     return baseItems.filter((m) => !filter || m.label.toLowerCase().includes(filter) || m.desc.toLowerCase().includes(filter));
   }
   if (line.startsWith("/resume ") || line.startsWith("/branch ")) {
-    const filter = line.replace(/^\/(?:resume|branch)\s+/, "").trim().toLowerCase();
-    const sFile = resolveProjectSessionPaths(currentWorkspaceRoot, homeBaseDir).sessionFile;
+    const filter = line.replace(/^\/(?:resume|branch)\s+/, "").trim().toLowerCase(), sFile = resolveProjectSessionPaths(currentWorkspaceRoot, homeBaseDir).sessionFile;
     const turns = extractConversationTurns(fs.existsSync(sFile) ? loadJsonlEntries(sFile) : [], activeLeafId).reverse();
     const items: DropdownItem[] = turns
       .filter((t) => !filter || `#${t.turnIndex}`.includes(filter) || t.userText.toLowerCase().includes(filter) || t.leafEntryId.includes(filter))
       .slice(0, 7)
-      .map((t) => ({
-        label: `/resume #${t.turnIndex}`,
-        desc: `${t.isCurrentLeaf ? "[●当前续接] " : `[${t.toolSteps}步] `}👤 ${t.userText.slice(0, 22)} -> 🤖 ${(t.replyText || "未完成").slice(0, 26)}`,
-        fillText: `/resume #${t.turnIndex}`, expandOnly: false,
-      }));
+      .map((t) => ({ label: `/resume #${t.turnIndex}`, desc: `${t.isCurrentLeaf ? "[●当前续接] " : `[${t.toolSteps}步] `}👤 ${t.userText.slice(0, 22)} -> 🤖 ${(t.replyText || "未完成").slice(0, 26)}`, fillText: `/resume #${t.turnIndex}`, expandOnly: false }));
     items.push({ label: "/new", desc: "✨ 开启全新空白对话 (保留旧对话记录，随时可 /resume 切回)", fillText: "/new", expandOnly: false });
     return items;
   }
@@ -84,14 +79,11 @@ export function buildDropdownItems(line: string, currentWorkspaceRoot: string, h
   if (line.startsWith("/skill ") || line === "/skills") return buildSkillDropdownItems(line, currentWorkspaceRoot);
   if (line.startsWith("/cd ")) {
     const filter = line.slice(4).trim().toLowerCase();
-    const sorted = [...listManagedProjects(homeBaseDir)].sort((a, b) => (a.workspaceRoot === currentWorkspaceRoot ? 1 : 0) - (b.workspaceRoot === currentWorkspaceRoot ? 1 : 0) || a.projectKey.localeCompare(b.projectKey));
-    return sorted
+    return [...listManagedProjects(homeBaseDir)]
+      .sort((a, b) => (a.workspaceRoot === currentWorkspaceRoot ? 1 : 0) - (b.workspaceRoot === currentWorkspaceRoot ? 1 : 0) || a.projectKey.localeCompare(b.projectKey))
       .filter((p) => !filter || path.basename(p.workspaceRoot).toLowerCase().includes(filter) || p.projectKey.toLowerCase().includes(filter))
       .slice(0, 8)
-      .map((p) => {
-        const name = path.basename(p.workspaceRoot);
-        return { label: `/cd ${name}`, desc: `[${p.workspaceRoot === currentWorkspaceRoot ? "●当前项目" : `${p.entryCount}条记录`}] ${p.workspaceRoot}`, fillText: `/cd ${name}`, expandOnly: false };
-      });
+      .map((p) => ({ label: `/cd ${path.basename(p.workspaceRoot)}`, desc: `[${p.workspaceRoot === currentWorkspaceRoot ? "●当前项目" : `${p.entryCount}条记录`}] ${p.workspaceRoot}`, fillText: `/cd ${path.basename(p.workspaceRoot)}`, expandOnly: false }));
   }
   if (line.startsWith("/") && !line.includes(" ")) {
     return SLASH_COMMANDS.filter((c) => c.cmd.trim().startsWith(line.trim())).map((c) => ({
@@ -104,9 +96,7 @@ export function buildDropdownItems(line: string, currentWorkspaceRoot: string, h
 export function findMethodKey(rl: any, name: string): string | symbol | null {
   if (typeof rl?.[name] === "function") return name;
   for (let cur = rl; cur && cur !== Object.prototype; cur = Object.getPrototypeOf(cur)) {
-    for (const sym of Object.getOwnPropertySymbols(cur)) {
-      if (sym.description === name && typeof cur[sym] === "function") return sym;
-    }
+    for (const sym of Object.getOwnPropertySymbols(cur)) if (sym.description === name && typeof cur[sym] === "function") return sym;
   }
   return null;
 }
@@ -118,8 +108,7 @@ function formatDropdownRows(items: DropdownItem[], selectedIdx: number, line: st
   const winStart = items.length > MAX_MENU_ROWS ? Math.max(0, Math.min(selectedIdx - 3, items.length - MAX_MENU_ROWS)) : 0;
   const visible = items.slice(winStart, winStart + MAX_MENU_ROWS);
   const text = visible.map((item, i) => {
-    const active = winStart + i === selectedIdx;
-    const clipped = truncateCols(`${active ? "❯ " : "  "}${padCols(item.label, labelWidth)} ${item.desc}`, maxCols);
+    const active = winStart + i === selectedIdx, clipped = truncateCols(`${active ? "❯ " : "  "}${padCols(item.label, labelWidth)} ${item.desc}`, maxCols);
     return `\r\n\x1b[2K${active ? `\x1b[36;1m${clipped}\x1b[0m` : `\x1b[90m${clipped}\x1b[0m`}`;
   }).join("");
   return { text, rows: visible.length };
@@ -131,32 +120,21 @@ function isPasteShortcutKey(s: string, key?: { name?: string; ctrl?: boolean; me
 
 function handleInactiveRunKey(s: string, key: { name?: string; ctrl?: boolean; meta?: boolean } | undefined, curBuf: string, hooks?: LiveDropdownRuntimeHooks): string {
   if (key?.name === "escape" || s === "\x1b") return "";
-  if (key?.name === "return" || key?.name === "enter") {
-    const msg = restorePastedNewlines(curBuf).trim();
-    if (msg) hooks?.onSteerLine?.(msg);
-    return "";
-  }
+  if (key?.name === "return" || key?.name === "enter") { const msg = restorePastedNewlines(curBuf).trim(); if (msg) hooks?.onSteerLine?.(msg); return ""; }
   if (key?.name === "backspace") return Array.from(curBuf).slice(0, -1).join("");
-  if (typeof s === "string" && !key?.ctrl && !key?.meta && s >= " ") return curBuf + s;
-  return curBuf;
+  return typeof s === "string" && !key?.ctrl && !key?.meta && s >= " " ? curBuf + s : curBuf;
 }
 
 function insertTextAtCursor(rl: any, text: string, refreshLine: () => void): void {
   const curLine: string = typeof rl.line === "string" ? rl.line : "", curCursor: number = typeof rl.cursor === "number" ? rl.cursor : curLine.length;
   if (curCursor === curLine.length && /^\/[a-z]+\s*$/i.test(curLine) && text.trimStart().toLowerCase().startsWith(`${curLine.trim().toLowerCase()} `)) {
-    rl.line = text.trimStart();
-    rl.cursor = rl.line.length;
-    refreshLine();
-    return;
+    rl.line = text.trimStart(); rl.cursor = rl.line.length; refreshLine(); return;
   }
-  rl.line = curLine.slice(0, curCursor) + text + curLine.slice(curCursor);
-  rl.cursor = curCursor + text.length;
-  refreshLine();
+  rl.line = curLine.slice(0, curCursor) + text + curLine.slice(curCursor); rl.cursor = curCursor + text.length; refreshLine();
 }
 
 function checkAutoClipboardExpand(rl: any, wsRoot: string, lastFailed: string, refreshLine: () => void): string {
-  const curLine = typeof rl.line === "string" ? rl.line : "", curCursor = typeof rl.cursor === "number" ? rl.cursor : curLine.length;
-  const beforeCursor = curLine.slice(0, curCursor);
+  const curLine = typeof rl.line === "string" ? rl.line : "", curCursor = typeof rl.cursor === "number" ? rl.cursor : curLine.length, beforeCursor = curLine.slice(0, curCursor);
   if (/(?:^|\s)@clipboard\s$/.test(beforeCursor) && beforeCursor !== lastFailed) {
     const exp = tryExpandClipboardInLine(curLine, curCursor, wsRoot, false);
     if (exp) { rl.line = exp.line; rl.cursor = exp.cursor; refreshLine(); return ""; }
@@ -183,43 +161,19 @@ function applyChosenDropdownItem(
   return "submit";
 }
 
-function flushBracketedPaste(
-  rawPaste: string, rl: any, isActivePrompt: () => boolean, hooks: LiveDropdownRuntimeHooks | undefined,
-  menuShown: boolean, getPromptCols: () => number, clearMenu: (cols: number) => void, refreshLine: () => void, renderMenu: () => void, steerBuf: string,
-): string {
-  const clean = encodePastedNewlines(rawPaste);
-  if (!clean) return steerBuf;
-  if (isActivePrompt() || hooks?.isApprovalActive?.()) {
-    if (isActivePrompt() && menuShown) {
-      const prevLine = typeof rl.line === "string" ? rl.line : "", prevCursor = typeof rl.cursor === "number" ? rl.cursor : prevLine.length;
-      clearMenu(getPromptCols() + getPromptVisualCols(prevLine.slice(0, prevCursor)));
-    }
-    insertTextAtCursor(rl, clean, refreshLine);
-    if (isActivePrompt()) renderMenu();
-    return steerBuf;
-  }
-  return steerBuf + clean;
-}
-
 export function attachLiveSlashDropdown(
   rl: any, isActivePrompt: () => boolean, getPromptCols: () => number, getWorkspaceRoot: () => string,
   homeBaseDir?: string, getActiveLeafId?: () => string | null, hooks?: LiveDropdownRuntimeHooks,
 ): () => void {
   const ttyKey = findMethodKey(rl, "_ttyWrite"), refreshKey = findMethodKey(rl, "_refreshLine");
-  const inTty = Boolean(rl?.input?.isTTY || process.stdin.isTTY), outTty = Boolean(rl?.output?.isTTY || process.stdout.isTTY);
-  if (!inTty || !outTty || !ttyKey) return () => {};
+  if (!Boolean(rl?.input?.isTTY || process.stdin.isTTY) || !Boolean(rl?.output?.isTTY || process.stdout.isTTY) || !ttyKey) return () => {};
   const origTtyWrite = rl[ttyKey].bind(rl), refreshLine = () => { if (refreshKey && typeof rl[refreshKey] === "function") rl[refreshKey](); };
   let menuShown = false, renderedRows = 0, selectedIdx = 0, lastLine = "", dismissedLine: string | null = null, lastFailedClip = "", inBracketedPaste = false, pasteBuffer = "", steerBuf = "";
   let pasteResetTimer: ReturnType<typeof setTimeout> | undefined;
   process.stdout.write("\x1b[?2004h");
   const disableBracketedPaste = () => { if (pasteResetTimer) clearTimeout(pasteResetTimer); if (process.stdout.isTTY) process.stdout.write("\x1b[?2004l"); };
   process.once("exit", disableBracketedPaste);
-
-  const clearMenu = (cursorCols: number) => {
-    if (!menuShown) return;
-    process.stdout.write(`\r\n\x1b[J\x1b[1A\r\x1b[${cursorCols}C`);
-    menuShown = false; renderedRows = 0;
-  };
+  const clearMenu = (cursorCols: number) => { if (menuShown) { process.stdout.write(`\r\n\x1b[J\x1b[1A\r\x1b[${cursorCols}C`); menuShown = false; renderedRows = 0; } };
   const renderMenu = () => {
     if (!isActivePrompt()) return;
     const line: string = typeof rl.line === "string" ? rl.line : "", cursor: number = typeof rl.cursor === "number" ? rl.cursor : line.length;
@@ -234,33 +188,29 @@ export function attachLiveSlashDropdown(
     process.stdout.write(`${text}\x1b[J\x1b[${renderedRows}A\r\x1b[${cursorCols}C`);
   };
   const flushPasteBuffer = () => {
-    steerBuf = flushBracketedPaste(pasteBuffer, rl, isActivePrompt, hooks, menuShown, getPromptCols, clearMenu, refreshLine, renderMenu, steerBuf);
-    pasteBuffer = "";
+    const clean = encodePastedNewlines(pasteBuffer); pasteBuffer = "";
+    if (!clean) return;
+    if (isActivePrompt() || hooks?.isApprovalActive?.()) {
+      if (isActivePrompt() && menuShown) clearMenu(getPromptCols() + getPromptVisualCols(String(rl.line ?? "").slice(0, Number(rl.cursor ?? 0))));
+      insertTextAtCursor(rl, clean, refreshLine);
+      if (isActivePrompt()) renderMenu();
+    } else steerBuf += clean;
   };
-
   rl[ttyKey] = function (s: string, key?: { name?: string; sequence?: string; ctrl?: boolean; meta?: boolean }) {
     if ((key?.ctrl && key?.name === "c") || s === "\x03") {
-      inBracketedPaste = false; pasteBuffer = "";
-      if (pasteResetTimer) clearTimeout(pasteResetTimer);
+      inBracketedPaste = false; pasteBuffer = ""; if (pasteResetTimer) clearTimeout(pasteResetTimer);
       if (!isActivePrompt() && !hooks?.isApprovalActive?.()) hooks?.onAbortRun?.();
       return origTtyWrite(s, key);
     }
-    const rawSeq = typeof s === "string" ? s : (key?.sequence ?? "");
-    const isPasteStart = key?.name === "paste-start" || rawSeq.includes("\x1b[200~");
-    const isPasteEnd = key?.name === "paste-end" || rawSeq.includes("\x1b[201~");
+    const rawSeq = typeof s === "string" ? s : (key?.sequence ?? ""), isPasteStart = key?.name === "paste-start" || rawSeq.includes("\x1b[200~"), isPasteEnd = key?.name === "paste-end" || rawSeq.includes("\x1b[201~");
     if (inBracketedPaste || isPasteStart || isPasteEnd) {
       if (isPasteStart) inBracketedPaste = true;
       if (key?.name !== "paste-start" && key?.name !== "paste-end") pasteBuffer += rawSeq.replace(/\x1b\[20[01]~/g, "");
       if (pasteResetTimer) clearTimeout(pasteResetTimer);
-      if (isPasteEnd) { inBracketedPaste = false; flushPasteBuffer(); }
-      else pasteResetTimer = setTimeout(() => { inBracketedPaste = false; flushPasteBuffer(); }, 150);
+      if (isPasteEnd) { inBracketedPaste = false; flushPasteBuffer(); } else pasteResetTimer = setTimeout(() => { inBracketedPaste = false; flushPasteBuffer(); }, 150);
       return;
     }
-    if (!isActivePrompt()) {
-      if (hooks?.isApprovalActive?.()) return origTtyWrite(s, key);
-      steerBuf = handleInactiveRunKey(s, key, steerBuf, hooks);
-      return;
-    }
+    if (!isActivePrompt()) { if (hooks?.isApprovalActive?.()) return origTtyWrite(s, key); steerBuf = handleInactiveRunKey(s, key, steerBuf, hooks); return; }
     steerBuf = "";
     const line: string = typeof rl.line === "string" ? rl.line : "", cursor: number = typeof rl.cursor === "number" ? rl.cursor : line.length;
     if (isPasteShortcutKey(s, key)) {
@@ -270,14 +220,10 @@ export function attachLiveSlashDropdown(
     }
     if (key?.name === "escape" && menuShown) { dismissedLine = line; return clearMenu(getPromptCols() + getPromptVisualCols(line.slice(0, cursor))); }
     const items = menuShown ? buildDropdownItems(line, getWorkspaceRoot(), homeBaseDir, getActiveLeafId?.(), cursor) : [];
-    if (items.length > 0 && (key?.name === "up" || key?.name === "down")) {
-      selectedIdx = key.name === "down" ? (selectedIdx + 1) % items.length : (selectedIdx - 1 + items.length) % items.length;
-      return renderMenu();
-    }
+    if (items.length > 0 && (key?.name === "up" || key?.name === "down")) { selectedIdx = key.name === "down" ? (selectedIdx + 1) % items.length : (selectedIdx - 1 + items.length) % items.length; return renderMenu(); }
     const isRightAtEnd = key?.name === "right" && cursor === line.length;
     if (items.length > 0 && (key?.name === "tab" || isRightAtEnd || key?.name === "return" || key?.name === "enter")) {
-      const chosen = items[selectedIdx] ?? items[0]!;
-      if (applyChosenDropdownItem(rl, chosen, line, key?.name, isRightAtEnd, getWorkspaceRoot(), homeBaseDir, getActiveLeafId?.(), refreshLine, renderMenu, clearMenu, getPromptCols) === "expanded") return;
+      if (applyChosenDropdownItem(rl, items[selectedIdx] ?? items[0]!, line, key?.name, isRightAtEnd, getWorkspaceRoot(), homeBaseDir, getActiveLeafId?.(), refreshLine, renderMenu, clearMenu, getPromptCols) === "expanded") return;
       return origTtyWrite(s, key);
     }
     if (key?.name === "return" || key?.name === "enter") { clearMenu(getPromptCols() + getPromptVisualCols(line)); return origTtyWrite(s, key); }

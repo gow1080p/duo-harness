@@ -964,6 +964,39 @@ describe("Stage 3: 写工具 (edit_file/run_bash/rollback_version)、暂停审�
     expect(secondErrMsg?.content).toContain("[系统防卡死提示：该操作已连续 2 次出现相同报错");
     expect(cSeen[3]?.some((m) => m.role === "user" && m.content.includes("再补充一句总结"))).toBe(true);
 
+    // 7. Markdown 预览与实时编辑服务 (md-preview.ts) 渲染、原子写盘与默认目标解析测试
+    const { createMdPreviewServer, launchMarkdownPreview, openInDefaultApp, resolveDefaultMdTarget, resolveDefaultOpenTarget } = await import("../src/adapters/md-preview.js");
+    const mdWs = path.join(tmpBase, "md-ws");
+    fs.mkdirSync(path.join(mdWs, ".debug"), { recursive: true });
+    fs.writeFileSync(path.join(mdWs, "README.md"), "# 初始标题\n\n> [!NOTE]\n> 提示内容\n", "utf-8");
+    fs.writeFileSync(path.join(mdWs, "index.html"), "<h1>Home</h1>\n", "utf-8");
+    expect(resolveDefaultMdTarget(mdWs)).toBe(path.join(mdWs, "README.md"));
+    fs.writeFileSync(path.join(mdWs, ".debug", "plan.md"), "# 规划草案\n", "utf-8");
+    expect(resolveDefaultMdTarget(mdWs)).toBe(path.join(mdWs, ".debug", "plan.md"));
+    expect(resolveDefaultOpenTarget(mdWs, ["index.html"])).toBe(path.join(mdWs, "index.html"));
+    expect(openInDefaultApp(".debug/plan.md", mdWs).ok).toBe(true);
+    expect(launchMarkdownPreview("non-existent.md", mdWs).ok).toBe(false);
+    expect(launchMarkdownPreview("new-note.md", mdWs, { allowCreate: true }).ok).toBe(true);
+
+    const previewSrv = await createMdPreviewServer(path.join(mdWs, "README.md"));
+    try {
+      const docRes = await fetch(`${previewSrv.url}/api/doc`).then((r) => r.json()) as { ok: boolean; content: string; html: string };
+      expect(docRes.ok).toBe(true);
+      expect(docRes.content).toContain("# 初始标题");
+      expect(docRes.html).toContain("md-alert alert-note");
+
+      const saveRes = await fetch(`${previewSrv.url}/api/save`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: "# 修改后标题\n\n- 条目 1\n" }),
+      }).then((r) => r.json()) as { ok: boolean; html: string };
+      expect(saveRes.ok).toBe(true);
+      expect(saveRes.html).toContain("修改后标题");
+      expect(fs.readFileSync(path.join(mdWs, "README.md"), "utf-8")).toBe("# 修改后标题\n\n- 条目 1\n");
+    } finally {
+      await previewSrv.close();
+    }
+
     fs.rmSync(tmpBase, { recursive: true, force: true });
   });
 });

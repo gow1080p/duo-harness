@@ -11,7 +11,8 @@
     "./coding": "./src/coding.ts"
   },
   "bin": {
-    "duo": "./bin/duo.mjs"
+    "duo": "./bin/duo.mjs",
+    "mdp": "./bin/mdp.mjs"
   },
   "engines": {
     "node": ">=22.0.0"
@@ -20,6 +21,7 @@
     "play": "tsx play.ts",
     "chat": "tsx src/adapters/repl.ts",
     "ask": "tsx src/adapters/cli.ts",
+    "mdp": "node ./bin/mdp.mjs",
     "review": "tsx src/adapters/reviewer.ts",
     "serve": "tsx src/adapters/rpc-server.ts",
     "xray": "tsx src/adapters/xray.ts",
