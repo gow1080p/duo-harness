@@ -183,14 +183,33 @@ function applyChosenDropdownItem(
   return "submit";
 }
 
+function flushBracketedPaste(
+  rawPaste: string, rl: any, isActivePrompt: () => boolean, hooks: LiveDropdownRuntimeHooks | undefined,
+  menuShown: boolean, getPromptCols: () => number, clearMenu: (cols: number) => void, refreshLine: () => void, renderMenu: () => void, steerBuf: string,
+): string {
+  const clean = encodePastedNewlines(rawPaste);
+  if (!clean) return steerBuf;
+  if (isActivePrompt() || hooks?.isApprovalActive?.()) {
+    if (isActivePrompt() && menuShown) {
+      const prevLine = typeof rl.line === "string" ? rl.line : "", prevCursor = typeof rl.cursor === "number" ? rl.cursor : prevLine.length;
+      clearMenu(getPromptCols() + getPromptVisualCols(prevLine.slice(0, prevCursor)));
+    }
+    insertTextAtCursor(rl, clean, refreshLine);
+    if (isActivePrompt()) renderMenu();
+    return steerBuf;
+  }
+  return steerBuf + clean;
+}
+
 export function attachLiveSlashDropdown(
   rl: any, isActivePrompt: () => boolean, getPromptCols: () => number, getWorkspaceRoot: () => string,
   homeBaseDir?: string, getActiveLeafId?: () => string | null, hooks?: LiveDropdownRuntimeHooks,
 ): () => void {
   const ttyKey = findMethodKey(rl, "_ttyWrite"), refreshKey = findMethodKey(rl, "_refreshLine");
-  if (!process.stdin.isTTY || !process.stdout.isTTY || !ttyKey) return () => {};
+  const inTty = Boolean(rl?.input?.isTTY || process.stdin.isTTY), outTty = Boolean(rl?.output?.isTTY || process.stdout.isTTY);
+  if (!inTty || !outTty || !ttyKey) return () => {};
   const origTtyWrite = rl[ttyKey].bind(rl), refreshLine = () => { if (refreshKey && typeof rl[refreshKey] === "function") rl[refreshKey](); };
-  let menuShown = false, renderedRows = 0, selectedIdx = 0, lastLine = "", dismissedLine: string | null = null, lastFailedClip = "", inBracketedPaste = false, steerBuf = "";
+  let menuShown = false, renderedRows = 0, selectedIdx = 0, lastLine = "", dismissedLine: string | null = null, lastFailedClip = "", inBracketedPaste = false, pasteBuffer = "", steerBuf = "";
   let pasteResetTimer: ReturnType<typeof setTimeout> | undefined;
   process.stdout.write("\x1b[?2004h");
   const disableBracketedPaste = () => { if (pasteResetTimer) clearTimeout(pasteResetTimer); if (process.stdout.isTTY) process.stdout.write("\x1b[?2004l"); };
@@ -214,29 +233,27 @@ export function attachLiveSlashDropdown(
     renderedRows = rows; menuShown = true;
     process.stdout.write(`${text}\x1b[J\x1b[${renderedRows}A\r\x1b[${cursorCols}C`);
   };
+  const flushPasteBuffer = () => {
+    steerBuf = flushBracketedPaste(pasteBuffer, rl, isActivePrompt, hooks, menuShown, getPromptCols, clearMenu, refreshLine, renderMenu, steerBuf);
+    pasteBuffer = "";
+  };
 
-  rl[ttyKey] = function (s: string, key?: { name?: string; ctrl?: boolean; meta?: boolean }) {
+  rl[ttyKey] = function (s: string, key?: { name?: string; sequence?: string; ctrl?: boolean; meta?: boolean }) {
     if ((key?.ctrl && key?.name === "c") || s === "\x03") {
-      inBracketedPaste = false;
+      inBracketedPaste = false; pasteBuffer = "";
       if (pasteResetTimer) clearTimeout(pasteResetTimer);
       if (!isActivePrompt() && !hooks?.isApprovalActive?.()) hooks?.onAbortRun?.();
       return origTtyWrite(s, key);
     }
-    if (typeof s === "string" && (inBracketedPaste || s.includes("\x1b[200~"))) {
-      if (s.includes("\x1b[200~")) inBracketedPaste = true;
-      if (s.includes("\x1b[201~")) inBracketedPaste = false;
+    const rawSeq = typeof s === "string" ? s : (key?.sequence ?? "");
+    const isPasteStart = key?.name === "paste-start" || rawSeq.includes("\x1b[200~");
+    const isPasteEnd = key?.name === "paste-end" || rawSeq.includes("\x1b[201~");
+    if (inBracketedPaste || isPasteStart || isPasteEnd) {
+      if (isPasteStart) inBracketedPaste = true;
+      if (key?.name !== "paste-start" && key?.name !== "paste-end") pasteBuffer += rawSeq.replace(/\x1b\[20[01]~/g, "");
       if (pasteResetTimer) clearTimeout(pasteResetTimer);
-      if (inBracketedPaste) pasteResetTimer = setTimeout(() => { inBracketedPaste = false; }, 150);
-      const clean = encodePastedNewlines(s.replace(/\x1b\[20[01]~/g, ""));
-      if (!clean) return;
-      if (isActivePrompt() || hooks?.isApprovalActive?.()) {
-        if (isActivePrompt() && menuShown) {
-          const prevLine = typeof rl.line === "string" ? rl.line : "", prevCursor = typeof rl.cursor === "number" ? rl.cursor : prevLine.length;
-          clearMenu(getPromptCols() + getPromptVisualCols(prevLine.slice(0, prevCursor)));
-        }
-        insertTextAtCursor(rl, clean, refreshLine);
-        if (isActivePrompt()) renderMenu();
-      } else steerBuf += clean;
+      if (isPasteEnd) { inBracketedPaste = false; flushPasteBuffer(); }
+      else pasteResetTimer = setTimeout(() => { inBracketedPaste = false; flushPasteBuffer(); }, 150);
       return;
     }
     if (!isActivePrompt()) {

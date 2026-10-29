@@ -72,8 +72,13 @@ export function zodObjectToJsonSchema(schema?: z.ZodTypeAny): Record<string, unk
   return { type: "object", properties, ...(required.length > 0 ? { required } : {}) };
 }
 
-export function toOpenAiMessages(messages: Message[], workspaceRoot = process.cwd(), allowImages = true): Record<string, unknown>[] {
-  const lastUserIdx = messages.map((m) => m.role).lastIndexOf("user");
+export function toOpenAiMessages(
+  messages: Message[],
+  workspaceRoot = process.cwd(),
+  allowImages = true,
+  stripOldReasoning = false,
+): Record<string, unknown>[] {
+  const lastUserIdx = stripOldReasoning ? messages.map((m) => m.role).lastIndexOf("user") : -1;
   const outParams: Record<string, unknown>[] = [];
   const seenTurnImages = new Set<string>();
   for (let i = 0; i < messages.length; i++) {
@@ -81,7 +86,7 @@ export function toOpenAiMessages(messages: Message[], workspaceRoot = process.cw
     if (msg.role === "assistant") {
       const hasTools = Boolean(msg.toolCalls && msg.toolCalls.length > 0);
       const out: Record<string, unknown> = { role: "assistant", content: msg.content || (hasTools ? null : "") };
-      if (i > lastUserIdx && msg.reasoningContent !== undefined) out.reasoning_content = msg.reasoningContent;
+      if ((!stripOldReasoning || i > lastUserIdx) && msg.reasoningContent !== undefined) out.reasoning_content = msg.reasoningContent;
       if (msg.toolCalls && msg.toolCalls.length > 0) {
         out.tool_calls = msg.toolCalls.map((tc) => ({ id: tc.id, type: "function", function: { name: tc.name, arguments: JSON.stringify(tc.arguments) } }));
       }

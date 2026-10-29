@@ -83,6 +83,17 @@ describe("Stage 3: 写工具 (edit_file/run_bash/rollback_version)、暂停审�
     const out = await bashTool!.execute({ command: "echo hello-stage3" });
     expect(out).toBe("hello-stage3");
 
+    // 验证 run_bash 支持在合法子目录中执行，且对重复的前置 cd 子目录 && 自动幂等剥离（防 Double-cd 报错）
+    const subDir = path.join(tmpRoot, "frontend");
+    fs.mkdirSync(subDir, { recursive: true });
+    const cwdOut = await bashTool!.execute({ command: "pwd", cwd: "frontend" });
+    expect(cwdOut).toContain("frontend");
+    const doubleCdOut = await bashTool!.execute({ command: "cd frontend && pwd", cwd: "frontend" });
+    expect(doubleCdOut).toContain("frontend");
+
+    // 验证 run_bash 传入不存在的 cwd 抛出友好提示，不盲目崩溃
+    await expect(bashTool!.execute({ command: "pwd", cwd: "non_existent_dir" })).rejects.toThrow("工作目录不存在");
+
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   });
 
@@ -458,6 +469,52 @@ describe("Stage 3: 写工具 (edit_file/run_bash/rollback_version)、暂停审�
     );
     expect(mixedWriteTree).toContain("💻 运行终端命令: venv/bin/python -c \"import fastapi\"");
 
+    // 验证 run_bash 带 cwd 时的步骤预览、审批确认框完整保留工作目录语义，且自动剥离默认 PATH 导出噪音与重复前置 cd
+    const bashWithCwdCalls = [
+      {
+        id: "b_cwd_1",
+        name: "run_bash",
+        arguments: {
+          command: 'export PATH="/opt/homebrew/bin:$PATH" && pnpm add pdfjs-dist 2>&1 | tail -5',
+          cwd: "frontend",
+        },
+      },
+    ];
+    const cwdStepTree = formatStepToolCalls(2, bashWithCwdCalls, new Map([["run_bash", false]]), "/app");
+    expect(cwdStepTree).toContain("💻 运行终端命令 [frontend]: pnpm add pdfjs-dist | tail -5");
+
+    const cwdApprovalBox = formatApprovalBox(bashWithCwdCalls, "/app");
+    expect(cwdApprovalBox).toContain("│ 📂 执行目录: frontend");
+    expect(cwdApprovalBox).toContain("│ 💻 待执行命令 (frontend): pnpm add pdfjs-dist | tail -5");
+
+    const multiStepCwdBox = formatApprovalBox(
+      [{ id: "b_cwd_2", name: "run_bash", arguments: { command: "cd frontend && pnpm add pdfjs-dist && pnpm run build", cwd: "frontend" } }],
+      "/app",
+    );
+    expect(multiStepCwdBox).toContain("│ 📂 执行目录: frontend");
+    expect(multiStepCwdBox).toContain("│ 💻 待执行命令 (frontend · 共 2 步):");
+    expect(multiStepCwdBox).toContain("$ pnpm add pdfjs-dist");
+    expect(multiStepCwdBox).toContain("$ pnpm run build");
+
+    // 验证当 cwd 在子目录但命令显式 cd 回工作区根目录时，审批框绝不隐瞒 cd . 动作
+    const cdBackToRootBox = formatApprovalBox(
+      [{ id: "b_cwd_3", name: "run_bash", arguments: { command: "cd /app && rm -rf dist", cwd: "frontend" } }],
+      "/app",
+    );
+    expect(cdBackToRootBox).toContain("│ 📂 执行目录: frontend");
+    expect(cdBackToRootBox).toContain("$ cd .");
+    expect(cdBackToRootBox).toContain("$ rm -rf dist");
+
+    // 验证跨目录 initialCwd 下 isReadonlyBashCommand 不误放行，且 ~ 路径正确归一化
+    expect(isReadonlyBashCommand("ls", undefined, "/app/ws", "/app/outside")).toBe(false);
+    const homeWs = path.join(os.homedir(), "duo-virtual-ws");
+    const tildeBox = formatApprovalBox(
+      [{ id: "b_cwd_4", name: "run_bash", arguments: { command: "cd ~/duo-virtual-ws/frontend && npm test", cwd: "~/duo-virtual-ws/frontend" } }],
+      homeWs,
+    );
+    expect(tildeBox).toContain("│ 📂 执行目录: frontend");
+    expect(tildeBox).toContain("│ 💻 待执行命令 (frontend): npm test");
+
     // 验证用户在审批框按 Ctrl+C (signal.abort) 时立即终止本轮循环，绝不继续发起后续 LLM 请求，且闭合 tool_calls
     let llmCallCount = 0;
     const turnAbort = new AbortController();
@@ -640,10 +697,11 @@ describe("Stage 3: 写工具 (edit_file/run_bash/rollback_version)、暂停审�
     expect(askRes.modifiedFiles[0]?.addedLines).toBe(1);
     expect(askRes.modifiedFiles[0]?.removedLines).toBe(1);
     const diffAfterAsk = ctrl.getDiff();
+    const plainDiff = diffAfterAsk.formattedText.replace(/\x1b\[[0-9;]*m/g, "");
     expect(diffAfterAsk.totalSnapshots).toBe(1);
-    expect(diffAfterAsk.formattedText).toContain("index.html");
-    expect(diffAfterAsk.formattedText).toContain("- <title>旧标题</title>");
-    expect(diffAfterAsk.formattedText).toContain("+ <title>新标题</title>");
+    expect(plainDiff).toContain("index.html");
+    expect(plainDiff).toContain("- <title>旧标题</title>");
+    expect(plainDiff).toContain("+ <title>新标题</title>");
     expect(ctrl.getDiff("all").files[0]?.isNew).toBe(false);
     const undoInvalid = await ctrl.undo("invalid_arg");
     expect(undoInvalid.rolledBackCount).toBe(0);

@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as vm from "node:vm";
-import { isPathInside, shortenWorkspaceText } from "./platform.js";
+import { expandHomePath, isPathInside, shortenWorkspaceText, toPosixPath } from "./platform.js";
 import { discoverAvailableSkills, formatSkillsSystemIndex } from "./skill-loader.js";
 
 const SAFE_READONLY_VERBS_RE =
@@ -17,8 +17,50 @@ const GIT_READONLY_SUBCMD_RE =
 const RUNTIME_VERSION_RE =
   /^(?:(?:node|python3?|pip3?|npm|pnpm|yarn|bun|tsc|cargo|rustc|uvicorn|vite)\s+(?:-v|--version|-V)|go\s+version|(?:(?:npx|pnpm|yarn|bunx?)\s+)?tsc(?:\s+(?:--noEmit|--pretty(?:\s+(?:true|false))?|--skipLibCheck|--strict|-p\s+(?:"__STR__"|\S+)|--project\s+(?:"__STR__"|\S+)))*\s+--noEmit(?:\s+(?:--pretty(?:\s+(?:true|false))?|--skipLibCheck|--strict|-p\s+(?:"__STR__"|\S+)|--project\s+(?:"__STR__"|\S+)))*)\s*$/;
 
-export function cleanDisplayBash(rawCmd: string, workspaceRoot?: string): string[] {
-  const short = shortenWorkspaceText(rawCmd.trim(), workspaceRoot);
+function resolveRealOrParent(targetPath: string): string {
+  const abs = path.resolve(targetPath);
+  if (fs.existsSync(abs)) { try { return fs.realpathSync(abs); } catch { return abs; } }
+  const parent = path.dirname(abs);
+  return parent === abs ? abs : path.join(resolveRealOrParent(parent), path.basename(abs));
+}
+
+export function normalizeBashCommandForCwd(rawCmd: string, workspaceRoot?: string, execCwd?: string): string {
+  const trimmed = rawCmd.trim().replace(/^\s*cd\s+(?:"\."|'\.'|\.)\s*(?:&&|;)\s*/, "");
+  if (!workspaceRoot || !execCwd) return trimmed;
+  const m = trimmed.match(/^cd\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))\s*(?:&&|;)\s*([\s\S]+)$/);
+  if (!m) return trimmed;
+  const rawTarget = (m[1] ?? m[2] ?? m[3] ?? "").trim(), rest = m[4]!.trim();
+  if (!rawTarget || !rest) return trimmed;
+  const home = os.homedir(), cdTarget = expandHomePath(rawTarget.replace(/\$HOME|\$\{HOME\}|%USERPROFILE%/gi, home), home);
+  const normExec = resolveRealOrParent(execCwd), normFromRoot = resolveRealOrParent(path.resolve(workspaceRoot, cdTarget));
+  const fromExec = path.resolve(execCwd, cdTarget);
+  if (normFromRoot === normExec && (path.isAbsolute(cdTarget) || !fs.existsSync(fromExec))) return rest;
+  return trimmed;
+}
+
+export function resolveBashWorkingDir(
+  args: Record<string, unknown>,
+  workspaceRoot?: string,
+): { rawCwd: string; relCwd: string; effectiveCwd: string | undefined; command: string } {
+  const rawCwd = typeof args.cwd === "string" ? args.cwd.trim() : "", home = os.homedir();
+  const expandedCwd = rawCwd ? expandHomePath(rawCwd.replace(/\$HOME|\$\{HOME\}|%USERPROFILE%/gi, home), home) : "";
+  const effectiveCwd = expandedCwd && workspaceRoot ? path.resolve(workspaceRoot, expandedCwd) : workspaceRoot;
+  const command = normalizeBashCommandForCwd(String(args.command ?? ""), workspaceRoot, effectiveCwd);
+  let relCwd = "";
+  if (rawCwd && workspaceRoot && effectiveCwd) {
+    const normRoot = resolveRealOrParent(workspaceRoot), normExec = resolveRealOrParent(effectiveCwd);
+    relCwd = isPathInside(normExec, normRoot) ? toPosixPath(path.relative(normRoot, normExec)) : shortenWorkspaceText(expandedCwd, workspaceRoot);
+  } else if (rawCwd) relCwd = shortenWorkspaceText(expandedCwd, workspaceRoot);
+  relCwd = relCwd.replace(/^\.\/+/, "").replace(/\/+$/, "");
+  return { rawCwd, relCwd: relCwd === "." ? "" : relCwd, effectiveCwd, command };
+}
+
+export function cleanDisplayBash(rawCmd: string, workspaceRoot?: string, effectiveCwd?: string): string[] {
+  const normalized = normalizeBashCommandForCwd(rawCmd, workspaceRoot, effectiveCwd);
+  const inSubdir = Boolean(workspaceRoot && effectiveCwd && resolveRealOrParent(effectiveCwd) !== resolveRealOrParent(workspaceRoot));
+  const short = inSubdir && /^cd\s+/i.test(normalized)
+    ? `cd ${shortenWorkspaceText(normalized.replace(/^cd\s+/i, ""), workspaceRoot)}`
+    : shortenWorkspaceText(normalized.trim(), workspaceRoot);
   const rawParts =
     short.match(
       /(?:\s*&&\s*echo\s+(?!(?:['"]?(?:===+|---+)))(?:[^;&'"]|'[^']*'|"(?:[^"\\]|\\.)*")+|'[^']*'|"(?:[^"\\]|\\.)*"|\b(?:for|while|until)\b(?:[^'"]|'[^']*'|"(?:[^"\\]|\\.)*")+?\bdone\b|\bif\b(?:[^'"]|'[^']*'|"(?:[^"\\]|\\.)*")+?\bfi\b|[^;&'"]+|(?<!&)&(?!&))+/g,
@@ -26,6 +68,7 @@ export function cleanDisplayBash(rawCmd: string, workspaceRoot?: string): string
   const parts = rawParts
     .map((s) => s.trim().replace(/\s+2>&1(?=\s*$|\s*\|)/g, ""))
     .filter((s) => s && !/^echo(?:\s+(?:'(?:===+|---+)(?:.*(?:===+|---+))?'|"(?:===+|---+)(?:.*(?:===+|---+))?"|---+|===+))?$/.test(s))
+    .filter((s, _, arr) => !(arr.length > 1 && /^export\s+PATH=(?:"[^"]*\/(?:homebrew|usr\/local)\/bin[^"]*\$PATH[^"]*"|'[^']*\/(?:homebrew|usr\/local)\/bin[^']*\$PATH[^']*'|[^\s;|]*\/(?:homebrew|usr\/local)\/bin[^\s;|]*\$PATH[^\s;|]*)$/i.test(s)))
     .filter((s, _, arr) => !(arr.length > 1 && /^echo\s+['"]?[^'"]*(?:exit|\$\?)[^'"]*['"]?$/i.test(s)));
   return parts.length > 0 ? parts : [short];
 }
@@ -119,6 +162,7 @@ function isSafeSingleBashSegment(seg: string, workspaceRoot?: string, baseDir = 
 
 export function isReadonlyBashCommand(cmd: string, explicitReadonly?: boolean, workspaceRoot?: string, initialCwd = workspaceRoot): boolean {
   if (explicitReadonly === false) return false;
+  if (workspaceRoot && initialCwd && isTokenPathEscaped(initialCwd, workspaceRoot, workspaceRoot)) return false;
   const raw = cmd.trim();
   if (!raw || /`|\$\(|\$'|\$\{|\$(?:HOME|USERPROFILE|[A-Z0-9_]*KEY|[A-Z0-9_]*TOKEN|[A-Z0-9_]*SECRET)|%[A-Za-z0-9_]+%|[\n\r]/i.test(raw)) return false;
   const unquoted = raw.replace(/['"]/g, "").replace(/(?:^|\s)(?:-o\s*|--output(?:=|\s+))\/dev\/null(?=\s|$|;|\||&)/g, " ");

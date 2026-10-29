@@ -262,16 +262,40 @@ describe("Stage 5: 自主探路代码审查特工 (reviewer.ts)、RepoMap 与轻
     expect(replaySummary.totalCostCny).toBe(0);
     expect(formatCostReport(replaySummary)).toContain("离线回放模式");
 
-    // 5. 同回合保留 reasoning_content、跨旧回合自动剥离 + X-Ray 零黑盒透视校验
-    const openAiPayload = toOpenAiMessages([
+    // 5. 默认跨回合保留 reasoning_content 锁死多轮 KV 前缀（亦支持显式 stripOldReasoning）+ X-Ray 零黑盒透视校验
+    const multiTurnMsgs: Message[] = [
       { role: "user", content: "第1轮问题" },
-      { role: "assistant", content: "第1轮回答", reasoningContent: "旧回合思考应被剥离" },
+      { role: "assistant", content: "第1轮回答", reasoningContent: "旧回合思考保留以锁死MiMo多轮KV缓存前缀" },
       { role: "user", content: "第2轮问题" },
       { role: "assistant", content: "", reasoningContent: "当前回合工具步思考应保留", toolCalls: [{ id: "t1", name: "list_dir", arguments: {} }] },
       { role: "tool", toolCallId: "t1", name: "list_dir", content: "src", isError: false },
-    ]);
-    expect(openAiPayload[1]!.reasoning_content).toBeUndefined();
+    ];
+    const openAiPayload = toOpenAiMessages(multiTurnMsgs);
+    expect(openAiPayload[1]!.reasoning_content).toBe("旧回合思考保留以锁死MiMo多轮KV缓存前缀");
     expect(openAiPayload[3]!.reasoning_content).toBe("当前回合工具步思考应保留");
+    const strippedPayload = toOpenAiMessages(multiTurnMsgs, process.cwd(), true, true);
+    expect(strippedPayload[1]!.reasoning_content).toBeUndefined();
+    expect(strippedPayload[3]!.reasoning_content).toBe("当前回合工具步思考应保留");
+
+    // 6. 因果前缀压缩：当首条 user 含图片且后续工具输出超水位时，优先折叠工具输出而不改写 head[1]，且追加新回合保持 100% 前缀不变
+    const causalBase: Message[] = [
+      { role: "system", content: "sys" },
+      { role: "user", content: "带图首问", images: [{ path: ".debug/a.png", mimeType: "image/png", byteSize: 64_000 }] },
+      { role: "assistant", content: "", toolCalls: [{ id: "r1", name: "read_file", arguments: { path: "big.ts" } }] },
+      { role: "tool", toolCallId: "r1", name: "read_file", content: "X".repeat(25_000), isError: false },
+      { role: "assistant", content: "首轮完成" },
+      { role: "user", content: "第2轮追问" },
+      { role: "assistant", content: "", toolCalls: [{ id: "r2", name: "read_file", arguments: { path: "cur.ts" } }] },
+      { role: "tool", toolCallId: "r2", name: "read_file", content: "Y".repeat(5_000), isError: false },
+    ];
+    const compTurn2 = compactMessages(causalBase, { maxTotalChars: 30_000, keepRecentMessages: 3 });
+    expect((compTurn2[1] as Extract<Message, { role: "user" }>).images?.length).toBe(1);
+    expect(compTurn2[3]!.content).toContain("[已折叠历史工具输出");
+    const compTurn3 = compactMessages([...causalBase, { role: "assistant", content: "第2轮完成" }, { role: "user", content: "第3轮追问" }], {
+      maxTotalChars: 30_000,
+      keepRecentMessages: 3,
+    });
+    expect(compTurn3.slice(0, compTurn2.length)).toEqual(compTurn2);
 
     const xray = analyzeSessionXray(".sessions/play.jsonl", ".sessions/http-wire.json");
     expect(formatXrayReport(xray)).toContain("每步消息与工具调用明细");

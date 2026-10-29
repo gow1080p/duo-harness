@@ -20,7 +20,7 @@ import { killTrackedChildren } from "./write-tools.js";
 
 export { buildPlanContextPrompt, createReplCompleter, listManagedProjects, type ManagedProjectSummary, PLAN_MODE_CONTEXT_PROMPT, type ProjectSessionPaths, resolveGoalTaskAndContext, resolveProjectSessionPaths, savePlanArtifact, verifyGoalCompletion };
 function wrapOsc133Prompt(label: string): string {
-  return process.stdout.isTTY ? `\x1b]133;A\x07${label}\x1b]133;B\x07` : label;
+  return process.stdout.isTTY ? `\x1b[?2004h\x1b]133;A\x07${label}\x1b]133;B\x07` : label;
 }
 function formatPrompt(ctrl: SessionController): string {
   const st = ctrl.getStatus(), short = st.projectName.length > 18 ? `${st.projectName.slice(0, 15)}...` : st.projectName;
@@ -134,6 +134,7 @@ async function promptUserApproval(
   const isEsc = Boolean(meta?.hasEscalated), reasons = meta?.escalatedReasons ?? [], hasExt = (meta?.externalDirs?.length ?? 0) > 0;
   if (!isEsc && st.autoApprove) { console.log(`  ⚡ [本轮免问已自动放行 ${toolCalls.length} 项工作区操作]`); return { approved: true }; }
   st.inMainPrompt = false; st.inApprovalPrompt = true;
+  if (typeof (rl as any).line === "string") { (rl as any).line = ""; (rl as any).cursor = 0; }
   const initialBox = formatApprovalBox(toolCalls, workspaceRoot, false, reasons), dHint = initialBox.includes("已折叠") ? " | d=展开全部详情" : "";
   console.log(initialBox);
   try {

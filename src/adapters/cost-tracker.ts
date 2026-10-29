@@ -178,8 +178,9 @@ export function summarizeWireCost(
 }
 
 export interface TurnMetricsSummary {
-  activeModel: string; turnCostCny: number; sessionCostCny: number; totalCostCny: number;
-  cacheHitRatePct: number; contextTokens: number; stepCacheTrajectory: string;
+  activeModel: string; turnCostCny: number; turnSavedCny: number; sessionCostCny: number; totalCostCny: number;
+  cacheHitRatePct: number; sessionCacheHitRatePct: number; lastStepCacheHitRatePct: number;
+  contextTokens: number; stepCacheTrajectory: string;
 }
 
 export function computeTurnMetrics(wireLogFile: string, stepsUsed: number, isReplay = false): TurnMetricsSummary | null {
@@ -201,12 +202,16 @@ export function computeTurnMetrics(wireLogFile: string, stepsUsed: number, isRep
     const turnHit = turnRounds.reduce((acc, r) => acc + r.cacheHitTokens, 0);
     const lastRound = turnRounds[turnRounds.length - 1];
     const stepCacheTrajectory = turnRounds.map((r) => `#${r.round}(${r.billCacheRatePct.toFixed(0)}%)`).join("→");
+    const turnRate = turnIn > 0 ? (turnHit / turnIn) * 100 : sSession.overallCacheRatePct;
     return {
       activeModel: lastRound?.model || "unknown",
       turnCostCny: turnRounds.reduce((a, r) => a + r.costCny, 0),
+      turnSavedCny: turnRounds.reduce((a, r) => a + r.savedCny, 0),
       sessionCostCny: sessionRounds.reduce((a, r) => a + r.costCny, 0),
       totalCostCny: s.totalCostCny,
-      cacheHitRatePct: turnIn > 0 ? (turnHit / turnIn) * 100 : s.overallCacheRatePct,
+      cacheHitRatePct: turnRate,
+      sessionCacheHitRatePct: sSession.overallCacheRatePct,
+      lastStepCacheHitRatePct: lastRound?.billCacheRatePct ?? turnRate,
       contextTokens: lastRound?.promptTokens ?? 0,
       stepCacheTrajectory,
     };

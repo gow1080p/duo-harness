@@ -54,11 +54,12 @@ function inspectSingleWireRound(
   const mutatedIndices: number[] = [];
   const compareLen = Math.min(prevMsgs.length, currentMsgs.length);
 
+  const isDeepSeek = /deepseek/i.test(String(entry.requestBody?.model ?? ""));
   let prefixBroken = false;
   for (let i = 0; i < compareLen; i++) {
-    const { reasoning_content: _p, ...prevClean } = prevMsgs[i] ?? {};
-    const { reasoning_content: _c, ...currClean } = currentMsgs[i] ?? {};
-    const same = JSON.stringify(prevClean) === JSON.stringify(currClean);
+    const pRaw = prevMsgs[i] ?? {}, cRaw = currentMsgs[i] ?? {};
+    const { reasoning_content: _p, ...pClean } = pRaw, { reasoning_content: _c, ...cClean } = cRaw;
+    const same = JSON.stringify(isDeepSeek ? pClean : pRaw) === JSON.stringify(isDeepSeek ? cClean : cRaw);
     if (same && !prefixBroken) lockedPrefixCount += 1;
     else if (!same) { prefixBroken = true; mutatedIndices.push(i); }
   }
@@ -68,7 +69,10 @@ function inspectSingleWireRound(
     const mIdx = mutatedIndices[0]!;
     const pMsg = (prevMsgs[mIdx] ?? {}) as Record<string, any>, cMsg = (currentMsgs[mIdx] ?? {}) as Record<string, any>;
     const role = cMsg.role === "tool" ? `tool:${cMsg.name ?? ""}` : String(cMsg.role ?? "msg");
-    firstMutationDiff = `msg[${mIdx}](${role}): "${measureWireMsg(pMsg).preview}" ➔ "${measureWireMsg(cMsg).preview}"`;
+    const pPrev = measureWireMsg(pMsg).preview, cPrev = measureWireMsg(cMsg).preview;
+    firstMutationDiff = pPrev === cPrev && pMsg.reasoning_content !== cMsg.reasoning_content
+      ? `msg[${mIdx}](${role}): reasoning_content(${realStrLen(pMsg.reasoning_content)}字 ➔ ${realStrLen(cMsg.reasoning_content)}字)`
+      : `msg[${mIdx}](${role}): "${pPrev}" ➔ "${cPrev}"`;
   }
 
   let lastUserIdx = -1;
@@ -79,7 +83,7 @@ function inspectSingleWireRound(
   for (let i = 0; i < currentMsgs.length; i++) {
     const m = currentMsgs[i]!;
     const stat = measureWireMsg(m);
-    const activeReasonLen = i > lastUserIdx && m.role === "assistant" ? realStrLen(m.reasoning_content) : 0;
+    const activeReasonLen = m.role === "assistant" ? realStrLen(m.reasoning_content) : 0;
     totalChars += stat.chars + activeReasonLen;
     if (stat.folded) foldedCount += 1;
     if (m.role === "assistant" && typeof m.reasoning_content === "string" && m.reasoning_content.length > 0) {

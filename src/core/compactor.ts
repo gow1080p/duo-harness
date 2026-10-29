@@ -133,18 +133,20 @@ function isProtectedToolMsg(unit: IndexedUnit, msg: Message, protectedPaths?: Re
 }
 
 function foldUnitToolsUpTo(head: Message[], units: IndexedUnit[], limitIdx: number, maxToolChars: number, chars: number, target: number, protectedPaths?: ReadonlySet<string>, lastUserIdx = -1): number {
-  for (let i = 0; i < head.length && i < limitIdx && chars > target; i++) {
-    const m = head[i]!, folded = foldSingleMessage(m, maxToolChars, i >= lastUserIdx);
-    if (folded !== m) { chars -= estimateBaseChars([m]) - estimateBaseChars([folded]); head[i] = folded; }
-  }
-  for (const pass of ["args", "tools"] as const) {
+  for (const pass of ["args", "tools", "users"] as const) {
     for (const unit of units) {
       for (let j = 0; j < unit.msgs.length && chars > target; j++) {
         const globalIdx = unit.startIdx + j, msg = unit.msgs[j]!;
         if (globalIdx >= limitIdx) break;
-        if (pass === "args" ? msg.role === "tool" : msg.role !== "tool" || isProtectedToolMsg(unit, msg, protectedPaths)) continue;
+        if (pass === "args" ? msg.role !== "assistant" : pass === "tools" ? msg.role !== "tool" || isProtectedToolMsg(unit, msg, protectedPaths) : msg.role !== "user") continue;
         const folded = foldSingleMessage(msg, maxToolChars, globalIdx >= lastUserIdx);
         if (folded !== msg) { chars -= estimateBaseChars([msg]) - estimateBaseChars([folded]); unit.msgs[j] = folded; }
+      }
+    }
+    if (pass === "users") {
+      for (let i = 0; i < head.length && i < limitIdx && chars > target; i++) {
+        const m = head[i]!, folded = foldSingleMessage(m, maxToolChars, i >= lastUserIdx);
+        if (folded !== m) { chars -= estimateBaseChars([m]) - estimateBaseChars([folded]); head[i] = folded; }
       }
     }
   }
@@ -169,22 +171,25 @@ function recordEvictedUnit(unit: IndexedUnit, readFiles: Set<string>, modFiles: 
 /** KV 缓存友好型裁剪纯函数：纯前缀因果扫描 0..i（含跨轮峰值），超水位时优先折叠历史 edit_file 参数与无关输出，100% 锁死前序缓存 */
 export function compactMessages(messages: readonly Message[], options: CompactorOptions = {}): Message[] {
   const maxTotalChars = options.maxTotalChars ?? 128_000, keepRecentMessages = options.keepRecentMessages ?? 16, maxToolOutputChars = options.maxToolOutputChars ?? 200;
-  const headCount = messages[0]?.role === "system" && messages[1]?.role === "user" ? 2 : 1, lastUserIdx = messages.map((m) => m.role).lastIndexOf("user");
+  const headCount = messages[0]?.role === "system" && messages[1]?.role === "user" ? 2 : 1;
   if (messages.length <= headCount + 1) return [...messages];
   const lowWaterMark = Math.floor(maxTotalChars * 0.65), headPrefix = messages.slice(0, headCount), activeUnits: IndexedUnit[] = [];
   const evictedReads = new Set<string>(), evictedMods = new Set<string>(), evictedNotes: string[] = [];
-  let runningChars = estimateBaseChars(headPrefix), evictedUnits = 0;
+  let runningChars = estimateBaseChars(headPrefix), evictedUnits = 0, curLastUserIdx = headCount > 1 ? 1 : -1;
   for (const unit of groupIntoAtomicUnits(messages.slice(headCount), headCount)) {
-    if (unit.msgs[0]?.role === "user") for (const u of activeUnits) { runningChars -= u.reasonChars ?? 0; u.reasonChars = 0; }
+    if (unit.msgs[0]?.role === "user") {
+      curLastUserIdx = unit.startIdx;
+      for (const u of activeUnits) { runningChars -= u.reasonChars ?? 0; u.reasonChars = 0; }
+    }
     const reasonChars = unit.msgs.reduce((s, m) => s + (m.role === "assistant" && m.reasoningContent ? m.reasoningContent.length : 0), 0);
     activeUnits.push({ ...unit, msgs: [...unit.msgs], reasonChars });
     runningChars += estimateBaseChars(unit.msgs) + reasonChars;
     if (runningChars <= maxTotalChars) continue;
     const recentIdx = Math.max(headCount, unit.endIdx + 1 - keepRecentMessages), nearIdx = Math.max(headCount, unit.startIdx), lim3 = unit.msgs[0]?.role === "user" ? unit.startIdx : unit.endIdx + 1, protectedPaths = collectProtectedReadPaths(activeUnits, recentIdx);
     for (const [lim, prot] of [[recentIdx, protectedPaths], [nearIdx, protectedPaths], [lim3, undefined]] as const) {
-      if (runningChars > maxTotalChars) runningChars = foldUnitToolsUpTo(headPrefix, activeUnits, lim, maxToolOutputChars, runningChars, lowWaterMark, prot, lastUserIdx);
+      if (runningChars > maxTotalChars) runningChars = foldUnitToolsUpTo(headPrefix, activeUnits, lim, maxToolOutputChars, runningChars, lowWaterMark, prot, curLastUserIdx);
     }
-    if (runningChars > maxTotalChars) while (activeUnits.length > 1 && runningChars > lowWaterMark && activeUnits[0]!.startIdx < lastUserIdx) {
+    if (runningChars > maxTotalChars) while (activeUnits.length > 1 && runningChars > lowWaterMark && activeUnits[0]!.startIdx < curLastUserIdx) {
       const ev = activeUnits.shift()!;
       runningChars -= estimateBaseChars(ev.msgs) + (ev.reasonChars ?? 0);
       evictedUnits++;

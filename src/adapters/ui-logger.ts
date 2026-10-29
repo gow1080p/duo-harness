@@ -1,19 +1,12 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ToolCall, ToolResultMessage } from "../core/contracts.js";
-import { buildDefaultSystemPrompt, cleanDisplayBash, isReadonlyBashCommand } from "./bash-policy.js";
+import { buildDefaultSystemPrompt, cleanDisplayBash, isReadonlyBashCommand, resolveBashWorkingDir } from "./bash-policy.js";
 import { computeTurnMetrics, type TurnMetricsSummary } from "./cost-tracker.js";
-import {
-  extractChangedHunk, extractCodeOutline, type FileDiffSummaryItem, formatIntraLineDiffPair,
-  highlightCodeLine, normalizeEditsArray, summarizeSnapshotsDiff, truncateVisualCols,
-} from "./diff-presenter.js";
+import { extractChangedHunk, extractCodeOutline, type FileDiffSummaryItem, formatIntraLineDiffPair, highlightCodeLine, normalizeEditsArray, summarizeSnapshotsDiff, truncateVisualCols } from "./diff-presenter.js";
 import { formatClickablePath, getCharVisualWidth, getVisualCols, padCols, shortenWorkspaceText } from "./platform.js";
 
-export {
-  buildDefaultSystemPrompt, cleanDisplayBash, computeTurnMetrics, type FileDiffSummaryItem,
-  getCharVisualWidth, getVisualCols, isReadonlyBashCommand, normalizeEditsArray,
-  shortenWorkspaceText, summarizeSnapshotsDiff, type TurnMetricsSummary,
-};
+export { buildDefaultSystemPrompt, cleanDisplayBash, computeTurnMetrics, type FileDiffSummaryItem, getCharVisualWidth, getVisualCols, isReadonlyBashCommand, normalizeEditsArray, shortenWorkspaceText, summarizeSnapshotsDiff, type TurnMetricsSummary };
 
 function formatInlineMarkdown(line: string, restore = ""): string {
   const rst = `\x1b[0m${restore}`;
@@ -225,11 +218,11 @@ export function formatStepToolCalls(step: number, calls: readonly ToolCall[], re
     } else if (call.name === "grep") items.push({ isWrite: false, text: `🔍 搜索代码: "${String(args.pattern ?? "")}" (${relPath})` });
     else if (call.name === "rollback_version") items.push({ isWrite: true, text: `🔄 回退版本: 撤回最近 ${String(args.stepsBack ?? 1)} 步修改` });
     else if (call.name === "run_bash") {
-      const rawCmd = String(args.command ?? "").trim();
-      const isRo = isReadonlyBashCommand(rawCmd, args.readonly as boolean | undefined, workspaceRoot);
-      const parts = cleanDisplayBash(rawCmd, workspaceRoot);
-      const ordered = !isRo && parts.length > 1 ? [...parts.filter((p) => !isReadonlyBashCommand(p, undefined, workspaceRoot)), ...parts.filter((p) => isReadonlyBashCommand(p, undefined, workspaceRoot))] : parts;
-      items.push({ isWrite: !isRo, text: `${isRo ? "📊 统计/查询命令" : "💻 运行终端命令"}: ${truncateVisualCols(ordered.join(" · "), 64)}` });
+      const { relCwd, effectiveCwd, command } = resolveBashWorkingDir(args, workspaceRoot);
+      const isRo = isReadonlyBashCommand(command, args.readonly as boolean | undefined, workspaceRoot, effectiveCwd);
+      const parts = cleanDisplayBash(command, workspaceRoot, effectiveCwd);
+      const ordered = !isRo && parts.length > 1 ? [...parts.filter((p) => !isReadonlyBashCommand(p, undefined, workspaceRoot, effectiveCwd)), ...parts.filter((p) => isReadonlyBashCommand(p, undefined, workspaceRoot, effectiveCwd))] : parts;
+      items.push({ isWrite: !isRo, text: `${isRo ? "📊 统计/查询命令" : "💻 运行终端命令"}${relCwd ? ` [${relCwd}]` : ""}: ${truncateVisualCols(ordered.join(" · "), 64)}` });
     } else {
       items.push({ isWrite: readonlyMap.get(call.name) === false, text: `🔧 调用工具 ${call.name}: ${truncateVisualCols(JSON.stringify(args), 54)}` });
     }
@@ -261,7 +254,8 @@ export function formatApprovalBox(toolCalls: readonly ToolCall[], workspaceRoot?
   const icon = isEsc ? "🚨" : groupedEdits.size > 0 && bashCount > 0 ? "⚠️ " : groupedEdits.size > 0 ? "📝" : "💻";
   const lines: string[] = [`\n┌─ ${icon} [${isEsc ? "跨界/系统级提权确认：" : "待确认：本次"}${scopeParts.join(" · ") || "申请执行工具操作"}${expandAll ? " · 已展开全部明细" : ""}] ──────────────`];
   for (const r of escalatedReasons) lines.push(`│ \x1b[33m⚠️ 提权原因: ${r}\x1b[0m`);
-  const maxHunks = expandAll ? 1000 : 4, maxLines = expandAll ? 120 : 2, maxCols = expandAll ? 140 : 66;
+  const defaultCols = Math.max(66, Math.min((process.stdout.columns || 96) - 8, 120));
+  const maxHunks = expandAll ? 1000 : 4, maxLines = expandAll ? 120 : 2, maxCols = expandAll ? 140 : defaultCols;
   for (const [rel, { rawPath, hunks }] of groupedEdits.entries()) {
     const existed = Boolean(workspaceRoot && fs.existsSync(path.resolve(workspaceRoot, rawPath)));
     const diffs = hunks.map((h) => extractChangedHunk(h.oldText, h.newText));
@@ -287,10 +281,12 @@ export function formatApprovalBox(toolCalls: readonly ToolCall[], workspaceRoot?
     if (c.name === "edit_file") continue;
     const args = (c.arguments ?? {}) as Record<string, unknown>;
     if (c.name === "run_bash") {
-      const parts = cleanDisplayBash(String(args.command ?? ""), workspaceRoot), maxBash = expandAll ? 100 : 6;
-      if (parts.length === 1 && getVisualCols(parts[0]!) <= 58) lines.push(`│ 💻 待执行命令: ${parts[0]}`);
+      const { relCwd, effectiveCwd, command } = resolveBashWorkingDir(args, workspaceRoot);
+      const parts = cleanDisplayBash(command, workspaceRoot, effectiveCwd), maxBash = expandAll ? 100 : 6;
+      if (relCwd) lines.push(`│ 📂 执行目录: ${relCwd}`);
+      if (parts.length === 1 && getVisualCols(parts[0]!) <= 58) lines.push(`│ 💻 待执行命令${relCwd ? ` (${relCwd})` : ""}: ${parts[0]}`);
       else {
-        lines.push(`│ 💻 待执行命令 (共 ${parts.length} 步):`);
+        lines.push(`│ 💻 待执行命令 (${relCwd ? `${relCwd} · ` : ""}共 ${parts.length} 步):`);
         for (const p of parts.slice(0, maxBash)) lines.push(`│   $ ${truncateVisualCols(p, maxCols)}`);
         if (parts.length > maxBash) lines.push(`│   \x1b[90m... (其余 ${parts.length - maxBash} 步已折叠，输入 d 展开)\x1b[0m`);
       }
@@ -339,9 +335,14 @@ export function formatCompactTurnFooter(
   const durTag = elapsedMs !== undefined ? ` · ⏱️ ${formatDurationMs(elapsedMs)}` : "";
   const m = computeTurnMetrics(wireLogFile, stepsUsed, isReplay);
   if (!m) return `${modPrefix}✅ 本轮完成 (${durTag ? `⏱️ ${formatDurationMs(elapsedMs)} · ` : ""}共 ${stepsUsed} 步)`;
+  const savedTag = m.turnSavedCny >= 0.005 ? ` (省¥${m.turnSavedCny.toFixed(2)})` : "";
   const costStr = m.totalCostCny > m.sessionCostCny + 0.00005
-    ? `本轮 ¥${m.turnCostCny.toFixed(4)} / 当前对话 ¥${m.sessionCostCny.toFixed(4)} (项目总计 ¥${m.totalCostCny.toFixed(4)})`
-    : `本轮 ¥${m.turnCostCny.toFixed(4)} / 当前对话 ¥${m.sessionCostCny.toFixed(4)}`;
+    ? `本轮 ¥${m.turnCostCny.toFixed(4)}${savedTag} / 当前对话 ¥${m.sessionCostCny.toFixed(4)} (项目总计 ¥${m.totalCostCny.toFixed(4)})`
+    : `本轮 ¥${m.turnCostCny.toFixed(4)}${savedTag} / 当前对话 ¥${m.sessionCostCny.toFixed(4)}`;
   const ctxTag = m.contextTokens > 0 ? `🧠 ${(m.contextTokens / 1000).toFixed(1)}k词 · ` : "";
-  return `${modPrefix}✅ 本轮完成 (🤖 ${m.activeModel}${durTag} · 共 ${stepsUsed} 步 · 💰 ${costStr} · ${ctxTag}⚡缓存命中 ${m.cacheHitRatePct.toFixed(0)}% · 输入 /xray 查账单)`;
+  const lastStepTag = m.lastStepCacheHitRatePct - m.cacheHitRatePct >= 4 ? `(末步${m.lastStepCacheHitRatePct.toFixed(0)}%)` : "";
+  const cacheTag = Math.abs(m.sessionCacheHitRatePct - m.cacheHitRatePct) >= 1 || lastStepTag
+    ? `⚡缓存 本轮${m.cacheHitRatePct.toFixed(0)}%${lastStepTag} / 累计${m.sessionCacheHitRatePct.toFixed(0)}%`
+    : `⚡缓存命中 ${m.cacheHitRatePct.toFixed(0)}%`;
+  return `${modPrefix}✅ 本轮完成 (🤖 ${m.activeModel}${durTag} · 共 ${stepsUsed} 步 · 💰 ${costStr} · ${ctxTag}${cacheTag} · 输入 /xray 查账单)`;
 }

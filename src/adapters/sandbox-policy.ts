@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { parse as parseShell } from "shell-quote";
 import type { ToolCall } from "../core/contracts.js";
-import { isReadonlyBashCommand } from "./bash-policy.js";
+import { isReadonlyBashCommand, normalizeBashCommandForCwd } from "./bash-policy.js";
 import { expandHomePath, isPathInside, sanitizeSubprocessEnv, SENSITIVE_SUBPROCESS_ENV_RE, toPosixPath } from "./platform.js";
 
 export { sanitizeSubprocessEnv };
@@ -214,8 +214,19 @@ export function analyzeBashSandbox(cmd: string, workspaceRoot: string, grants?: 
     if (SENSITIVE_SUBPROCESS_ENV_RE.test(arg)) return { tier: "deny", reason: `禁止读取敏感环境变量 (${arg})`, externalDirs: [] };
   }
   const home = os.homedir(), realRoot = resolveExistingRealPath(workspaceRoot);
+  const effectiveCwd = initialCwdRel && initialCwdRel !== "." ? path.resolve(workspaceRoot, initialCwdRel) : workspaceRoot;
+  const realCwd = resolveExistingRealPath(effectiveCwd);
   const externalDirs = new Set<string>();
   let escalatedReason: string | undefined;
+
+  if (!isPathInside(realCwd, realRoot)) {
+    const hardDenyCwd = checkHardDeniedPath(realCwd, realRoot, "read");
+    if (hardDenyCwd) return { tier: "deny", reason: `${hardDenyCwd} (cwd: ${initialCwdRel})`, externalDirs: [] };
+    if (!isGrantedBySession(realCwd, "read", grants) && !getBuiltinReadonlySkillRoots(home).some((r) => isPathInside(realCwd, r))) {
+      externalDirs.add(toGrantDir(realCwd));
+      escalatedReason ??= `命令工作目录位于工作区外: ${toPosixPath(realCwd)}`;
+    }
+  }
 
   for (const clean of extractBashCandidatePaths(raw, initialCwdRel, workspaceRoot)) {
     if (!clean || /^\\+$/.test(clean) || /[|^$(){}<>]/.test(clean) || /^(?:https?|file):\/\//i.test(clean)) continue;
@@ -236,7 +247,6 @@ export function analyzeBashSandbox(cmd: string, workspaceRoot: string, grants?: 
   if (SYSTEM_ESCALATED_CMD_RE.test(raw)) escalatedReason ??= `执行系统级或全局特权指令: ${raw.slice(0, 48)}`;
   if (/\b(?:curl|wget)\b/i.test(raw) && !/(?:127\.0\.0\.1|localhost)/i.test(raw)) escalatedReason ??= `发起外部网络请求: ${raw.slice(0, 48)}`;
   if (escalatedReason) return { tier: "ask_escalated", reason: escalatedReason, externalDirs: [...externalDirs] };
-  const effectiveCwd = initialCwdRel && initialCwdRel !== "." ? path.resolve(workspaceRoot, initialCwdRel) : workspaceRoot;
   if (isReadonlyBashCommand(raw, undefined, workspaceRoot, effectiveCwd)) return { tier: "allow", externalDirs: [] };
   return { tier: "ask_workspace", externalDirs: [] };
 }
@@ -245,21 +255,11 @@ export function classifyToolCallRisk(call: ToolCall, workspaceRoot: string, read
   const args = (call.arguments ?? {}) as Record<string, unknown>;
   if (call.name === "run_bash") {
     const rawCwd = typeof args.cwd === "string" ? args.cwd.trim() : "", home = os.homedir(), realRoot = resolveExistingRealPath(workspaceRoot);
-    let initialCwdRel = ".", cwdEscalatedReason: string | undefined, cwdExternalDir: string | undefined;
-    if (rawCwd) {
-      const realCwd = resolveExistingRealPath(path.resolve(workspaceRoot, expandHomePath(rawCwd.replace(/\$HOME|\$\{HOME\}|%USERPROFILE%/gi, home), home)));
-      const hardDeny = checkHardDeniedPath(realCwd, realRoot, "read");
-      if (hardDeny) return { tier: "deny", reason: `${hardDeny} (cwd: ${rawCwd})`, externalDirs: [] };
-      const inRoot = isPathInside(realCwd, realRoot);
-      const inAllowed = inRoot || isGrantedBySession(realCwd, "read", grants) || getBuiltinReadonlySkillRoots(home).some((r) => isPathInside(realCwd, r));
-      initialCwdRel = inRoot ? (toPosixPath(path.relative(realRoot, realCwd)) || ".") : toPosixPath(realCwd);
-      if (!inAllowed) { cwdExternalDir = toGrantDir(realCwd); cwdEscalatedReason = `命令工作目录位于工作区外: ${toPosixPath(realCwd)}`; }
-    }
-    const res = analyzeBashSandbox(String(args.command ?? ""), workspaceRoot, grants, initialCwdRel);
-    if (res.tier === "deny") return res;
-    if (cwdEscalatedReason) {
-      return { tier: "ask_escalated", reason: res.reason ?? cwdEscalatedReason, externalDirs: [...new Set([cwdExternalDir!, ...res.externalDirs])] };
-    }
+    const execCwd = rawCwd ? resolveExistingRealPath(path.resolve(workspaceRoot, expandHomePath(rawCwd.replace(/\$HOME|\$\{HOME\}|%USERPROFILE%/gi, home), home))) : realRoot;
+    const initialCwdRel = isPathInside(execCwd, realRoot) ? (toPosixPath(path.relative(realRoot, execCwd)) || ".") : toPosixPath(execCwd);
+    const normalizedCmd = normalizeBashCommandForCwd(String(args.command ?? ""), workspaceRoot, execCwd);
+    const res = analyzeBashSandbox(normalizedCmd, workspaceRoot, grants, initialCwdRel);
+    if (res.tier === "deny" || res.tier === "ask_escalated") return res;
     return res.tier === "allow" && args.readonly === false ? { tier: "ask_workspace", externalDirs: [] } : res;
   }
   if (call.name === "read_file" || call.name === "list_dir" || call.name === "grep" || call.name === "edit_file") {
@@ -280,7 +280,8 @@ export function isWriteToolCall(call: ToolCall, workspaceRoot: string, readonlyM
   if (call.name === "run_bash") {
     const args = (call.arguments ?? {}) as Record<string, unknown>, rawCwd = typeof args.cwd === "string" ? args.cwd.trim() : "", home = os.homedir();
     const effectiveCwd = rawCwd ? path.resolve(workspaceRoot, expandHomePath(rawCwd.replace(/\$HOME|\$\{HOME\}|%USERPROFILE%/gi, home), home)) : workspaceRoot;
-    return args.readonly === false || !isReadonlyBashCommand(String(args.command ?? ""), undefined, workspaceRoot, effectiveCwd);
+    const normalizedCmd = normalizeBashCommandForCwd(String(args.command ?? ""), workspaceRoot, effectiveCwd);
+    return args.readonly === false || !isReadonlyBashCommand(normalizedCmd, undefined, workspaceRoot, effectiveCwd);
   }
   return readonlyMap.get(call.name) === false || call.name === "edit_file" || call.name === "rollback_version";
 }

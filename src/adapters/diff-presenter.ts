@@ -50,33 +50,63 @@ export function extractCodeOutline(lines: readonly string[]): string[] {
   return symbols;
 }
 
-const BG_REM_LINE = "\x1b[48;2;45;18;22m\x1b[31m";
+const BG_REM_LINE = "\x1b[22;31m\x1b[48;2;45;18;22m";
 const BG_REM_WORD = "\x1b[48;2;115;32;42m\x1b[1;97m";
-const BG_ADD_LINE = "\x1b[48;2;16;46;28m\x1b[32m";
+const BG_ADD_LINE = "\x1b[22;32m\x1b[48;2;16;46;28m";
 const BG_ADD_WORD = "\x1b[48;2;28;105;55m\x1b[1;97m";
 
-export function formatIntraLineDiffPair(oldLine: string, newLine: string, maxCols = 70): { remFormatted: string; addFormatted: string } {
-  const tokenize = (s: string) => s.slice(0, 300).match(/[A-Za-z0-9_]+|\s+|[\u4e00-\u9fa5]+|[^\sA-Za-z0-9_\u4e00-\u9fa5]/g) ?? [s.slice(0, 300)];
-  const oTok = tokenize(oldLine);
-  const nTok = tokenize(newLine);
-  if (oTok.length * nTok.length > 16_000) {
+export function formatIntraLineDiffPair(oldLine: string, newLine: string, maxCols = 88): { remFormatted: string; addFormatted: string } {
+  const cleanOld = oldLine.replace(/\t/g, "  ");
+  const cleanNew = newLine.replace(/\t/g, "  ");
+  if (cleanOld.length * cleanNew.length > 160_000) {
     return {
-      remFormatted: `${BG_REM_LINE}- ${truncateVisualCols(oldLine, maxCols)}\x1b[0m`,
-      addFormatted: `${BG_ADD_LINE}+ ${truncateVisualCols(newLine, maxCols)}\x1b[0m`,
+      remFormatted: `${BG_REM_LINE}- ${truncateCols(cleanOld, maxCols, `${BG_REM_LINE}...`)}\x1b[0m`,
+      addFormatted: `${BG_ADD_LINE}+ ${truncateCols(cleanNew, maxCols, `${BG_ADD_LINE}...`)}\x1b[0m`,
     };
   }
-  const remChanged: string[] = [];
-  const addChanged: string[] = [];
-  for (const part of Diff.diffWords(oldLine.slice(0, 400), newLine.slice(0, 400))) {
-    const tok = part.value.trim();
-    if (!tok) continue;
-    if (part.removed) remChanged.push(tok);
-    else if (part.added) addChanged.push(tok);
+  const parts = Diff.diffWords(cleanOld.slice(0, 400), cleanNew.slice(0, 400));
+  let remInline = "", addInline = "", isFirstRem = true, isFirstAdd = true;
+  let remEndCol = 0, addEndCol = 0, curRemCol = 0, curAddCol = 0;
+  const remChanged: string[] = [], addChanged: string[] = [];
+  for (const part of parts) {
+    if (part.removed) {
+      let val = part.value;
+      if (isFirstRem) {
+        const ws = val.match(/^(\s*)/)?.[1] ?? "";
+        val = val.slice(ws.length);
+        remInline += ws; curRemCol += getVisualCols(ws);
+        isFirstRem = false;
+      }
+      if (val) {
+        remInline += `${BG_REM_WORD}${val}${BG_REM_LINE}`;
+        curRemCol += getVisualCols(val); remEndCol = curRemCol;
+        if (val.trim()) remChanged.push(val.trim());
+      }
+    } else if (part.added) {
+      let val = part.value;
+      if (isFirstAdd) {
+        const ws = val.match(/^(\s*)/)?.[1] ?? "";
+        val = val.slice(ws.length);
+        addInline += ws; curAddCol += getVisualCols(ws);
+        isFirstAdd = false;
+      }
+      if (val) {
+        addInline += `${BG_ADD_WORD}${val}${BG_ADD_LINE}`;
+        curAddCol += getVisualCols(val); addEndCol = curAddCol;
+        if (val.trim()) addChanged.push(val.trim());
+      }
+    } else {
+      if (part.value.trim().length > 0) { isFirstRem = false; isFirstAdd = false; }
+      remInline += part.value; addInline += part.value;
+      curRemCol += getVisualCols(part.value); curAddCol += getVisualCols(part.value);
+    }
   }
-  const remTag = remChanged.length > 0 && remChanged.join("").length < oldLine.trim().length ? ` -${truncateVisualCols(remChanged.join(" "), 20)} ` : "";
-  const addTag = addChanged.length > 0 && addChanged.join("").length < newLine.trim().length ? ` +${truncateVisualCols(addChanged.join(" "), 20)} ` : "";
-  const oClip = truncateVisualCols(oldLine, remTag ? Math.max(20, maxCols - getVisualCols(remTag) - 2) : maxCols);
-  const nClip = truncateVisualCols(newLine, addTag ? Math.max(20, maxCols - getVisualCols(addTag) - 2) : maxCols);
+  const needRemTail = getVisualCols(cleanOld) > maxCols && remEndCol > maxCols - 3 && remChanged.length > 0;
+  const needAddTail = getVisualCols(cleanNew) > maxCols && addEndCol > maxCols - 3 && addChanged.length > 0;
+  const remTag = needRemTail ? ` -${truncateVisualCols(remChanged.join(" "), 20)} ` : "";
+  const addTag = needAddTail ? ` +${truncateVisualCols(addChanged.join(" "), 20)} ` : "";
+  const oClip = truncateCols(remInline, remTag ? Math.max(20, maxCols - getVisualCols(remTag) - 2) : maxCols, `${BG_REM_LINE}...`);
+  const nClip = truncateCols(addInline, addTag ? Math.max(20, maxCols - getVisualCols(addTag) - 2) : maxCols, `${BG_ADD_LINE}...`);
   return {
     remFormatted: `${BG_REM_LINE}- ${oClip}\x1b[0m${remTag ? `  ${BG_REM_WORD}${remTag}\x1b[0m` : ""}`,
     addFormatted: `${BG_ADD_LINE}+ ${nClip}\x1b[0m${addTag ? `  ${BG_ADD_WORD}${addTag}\x1b[0m` : ""}`,

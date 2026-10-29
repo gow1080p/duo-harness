@@ -3,7 +3,7 @@ import { buildBridgePrompt, evaluateAgyQuotaSurplus, parseBridgeReply, stripAgyF
 import { checkFileSyntax } from "../src/adapters/bash-policy.js";
 import { buildAtMentionDropdown, expandAtMentions, runLocalBangCommand, stripAttachedFiles } from "../src/adapters/context-mention.js";
 import { summarizeWireCost } from "../src/adapters/cost-tracker.js";
-import { buildDropdownItems, encodePastedNewlines, restorePastedNewlines } from "../src/adapters/dropdown.js";
+import { attachLiveSlashDropdown, buildDropdownItems, encodePastedNewlines, restorePastedNewlines } from "../src/adapters/dropdown.js";
 import { getVisualCols } from "../src/adapters/platform.js";
 import { extractConversationTurns, loadProjectMeta, resolveProjectSessionPaths, saveProjectMeta } from "../src/adapters/project-store.js";
 import { handleSlashCommand, runOneShotCli } from "../src/adapters/repl.js";
@@ -216,10 +216,10 @@ describe("Step 1.4: src/adapters/router.ts 协议转换与分时路由测试", (
 
     const intraPair = formatIntraLineDiffPair("  return count + 1;", "  return count + 2;", 70);
     expect(intraPair).not.toBeNull();
-    expect(intraPair.remFormatted).toContain("-   return count + 1;");
-    expect(intraPair.addFormatted).toContain("+   return count + 2;");
-    expect(intraPair.remFormatted).toContain("-1");
-    expect(intraPair.addFormatted).toContain("+2");
+    expect(intraPair.remFormatted.replace(/\x1b\[[0-9;]*m/g, "")).toBe("-   return count + 1;");
+    expect(intraPair.addFormatted.replace(/\x1b\[[0-9;]*m/g, "")).toBe("+   return count + 2;");
+    expect(intraPair.remFormatted).toContain("\x1b[48;2;115;32;42m\x1b[1;97m1");
+    expect(intraPair.addFormatted).toContain("\x1b[48;2;28;105;55m\x1b[1;97m2");
 
     // 验证超长行 (>66列) 行尾修改仍能精准提取 Diff 胶囊且总视觉宽度严格受控
     const tailOld = "const res = await client.request(workspaceRoot, { timeout: 3000, retry: false });";
@@ -469,6 +469,28 @@ describe("Step 1.4: src/adapters/router.ts 协议转换与分时路由测试", (
     const encoded = encodePastedNewlines(multi);
     expect(encoded.includes("\n")).toBe(false);
     expect(restorePastedNewlines(encoded)).toBe("line1\nline2\nline3");
+
+    // 验证真实 readline TTY 流下 Bracketed Paste (\x1b[200~ s=undefined, key.name="paste-start") 整块缓冲不提前触发回车、不残留尾行
+    const { PassThrough } = await import("node:stream");
+    const rlPromises = await import("node:readline/promises");
+    const ttyIn = new PassThrough() as any;
+    const ttyOut = new PassThrough() as any;
+    ttyIn.isTTY = true;
+    ttyOut.isTTY = true;
+    const rl = rlPromises.createInterface({ input: ttyIn, output: ttyOut });
+    const detach = attachLiveSlashDropdown(rl, () => true, () => 4, () => process.cwd());
+    try {
+      const qPromise = rl.question("> ");
+      ttyIn.write("\x1b[200~1. 第一行\r\n2. 第二行\n3. 第三行\n4. 第四行\x1b[201~");
+      expect((rl as any).line).toBe(encodePastedNewlines("1. 第一行\r\n2. 第二行\n3. 第三行\n4. 第四行"));
+      ttyIn.write("\r");
+      const rawAns = await qPromise;
+      expect(restorePastedNewlines(rawAns)).toBe("1. 第一行\n2. 第二行\n3. 第三行\n4. 第四行");
+      expect((rl as any).line).toBe("");
+    } finally {
+      detach();
+      rl.close();
+    }
 
     // 验证 inputHistory 逆序持久化、/commit 展开及 runOneShotCli 管道输入 + -y 写操作落盘
     const tmpOneShot = fs.mkdtempSync(path.join(os.tmpdir(), "duo-oneshot-"));

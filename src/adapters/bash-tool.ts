@@ -6,6 +6,7 @@ import * as path from "node:path";
 import { z } from "zod";
 import type { ToolContract } from "../core/contracts.js";
 import { isPathInside, killProcessGroup, resolvePosixShell, toPosixPath } from "./platform.js";
+import { normalizeBashCommandForCwd } from "./bash-policy.js";
 import { analyzeBashSandbox, isSystemEscalatedCommand, resolveExistingRealPath, resolveSafePath } from "./sandbox-policy.js";
 import type { SandboxGrants } from "./tools.js";
 import { isReadonlyBashCommand } from "./ui-logger.js";
@@ -176,16 +177,20 @@ export function createRunBashTool(workspaceRoot: string, signal?: AbortSignal, g
     async execute(args) {
       const rawCwd = args.cwd?.trim();
       const execCwd = rawCwd ? resolveSafePath(workspaceRoot, rawCwd, "read", grants) : workspaceRoot;
+      if (rawCwd && (!fsSync.existsSync(execCwd) || !fsSync.statSync(execCwd).isDirectory())) {
+        throw new Error(`[工作目录不存在] 指定的工作目录 "${rawCwd}" 不存在或不是有效目录，请先通过 list_dir 确认子目录结构。`);
+      }
       const realRoot = resolveExistingRealPath(workspaceRoot);
       const initialCwdRel = isPathInside(execCwd, realRoot) ? (toPosixPath(path.relative(realRoot, execCwd)) || ".") : toPosixPath(execCwd);
-      const check = analyzeBashSandbox(args.command, workspaceRoot, grants, initialCwdRel);
+      const normalizedCmd = normalizeBashCommandForCwd(args.command, workspaceRoot, execCwd);
+      const check = analyzeBashSandbox(normalizedCmd, workspaceRoot, grants, initialCwdRel);
       if (check.tier === "deny") {
         throw new Error(`[沙箱安全拦截] ${check.reason ?? "命令触碰安全红线"}。若缺少配置或 API Key，请立即停止探测并直接向用户询问。`);
       }
-      const isRo = check.tier === "allow" && isReadonlyBashCommand(args.command, args.readonly, workspaceRoot, execCwd);
-      const mode: SandboxMode = isRo ? "readonly" : isSystemEscalatedCommand(args.command) ? "unrestricted" : "workspace_write";
+      const isRo = check.tier === "allow" && isReadonlyBashCommand(normalizedCmd, args.readonly, workspaceRoot, execCwd);
+      const mode: SandboxMode = isRo ? "readonly" : isSystemEscalatedCommand(normalizedCmd) ? "unrestricted" : "workspace_write";
       const timeoutMs = Math.min(Math.max(args.timeoutMs ?? 120_000, 100), 600_000);
-      const res = await runCommandInSandbox(args.command, execCwd, timeoutMs, signal, mode, workspaceRoot, grants);
+      const res = await runCommandInSandbox(normalizedCmd, execCwd, timeoutMs, signal, mode, workspaceRoot, grants);
       if (res.exitCode !== 0) throw new Error(`命令退出码 ${res.exitCode}:\n${res.output}`);
       return res.output;
     },
