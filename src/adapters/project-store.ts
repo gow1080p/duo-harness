@@ -13,7 +13,12 @@ export { formatSnapshotsDiff };
 
 export interface ProjectMetaState {
   projectKey: string; workspaceRoot: string; updatedAt: string; activeLeafId?: string | null;
-  modelMode?: string; lastUndoNotice?: string | null; inputHistory?: string[];
+  modelMode?: string; lastUndoNotice?: string | null; lastPlanLeafId?: string | null;
+  lastExecutedPlanHash?: string | null; inputHistory?: string[];
+}
+
+export function computePlanHash(text: string): string {
+  return crypto.createHash("sha256").update(text.trim(), "utf-8").digest("hex").slice(0, 16);
 }
 
 export function loadProjectMeta(metaFile: string): Partial<ProjectMetaState> {
@@ -34,6 +39,7 @@ export interface ConversationTurnSummary { turnIndex: number; userEntryId: strin
 
 export const SLASH_COMMANDS = [
   { cmd: "/goal ", label: "/goal <目标>", desc: "长程自治模式 (自动放行写操作 + 50步上限 + 完成前自动验证)" },
+  { cmd: "/plan ", label: "/plan <需求>", desc: "只读规划模式 (零写操作探路 + 生成 .debug/plan.md，确认后敲 /goal 执行)" },
   { cmd: "/skill ", label: "/skill <名称>", desc: "按需加载扩展技能规范 (按 ↑/↓ 选择本机或项目 SKILL.md)" },
   { cmd: "/review", label: "/review [文件]", desc: "对本轮修改或指定文件运行 RepoMap + 架构规范独立审查" },
   { cmd: "/commit", label: "/commit [说明]", desc: "检查 git status/diff 并按规范生成中文 Commit 提交与推送" },

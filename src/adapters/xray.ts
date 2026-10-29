@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import type { SessionEntry } from "../core/contracts.js";
 import { extractUsageFromSseLines, padCols, truncateCols } from "./cost-tracker.js";
 import type { HttpWireLogEntry } from "./sse-stream.js";
-import { compactWireLogEntry, loadJsonlEntries, writeFileAtomicSync } from "./store.js";
+import { loadJsonlEntries, writeFileAtomicSync } from "./store.js";
 
 export interface WireRoundXray {
   round: number; model: string; messageCount: number; prevMessageCount: number;
@@ -117,7 +117,7 @@ export function analyzeSessionXray(
 ): SessionXrayReport {
   const entries: SessionEntry[] = fs.existsSync(sessionFile) ? loadJsonlEntries(sessionFile) : [];
   const wireEntries: HttpWireLogEntry[] = fs.existsSync(wireLogFile)
-    ? (JSON.parse(fs.readFileSync(wireLogFile, "utf-8")) as HttpWireLogEntry[]).map(compactWireLogEntry)
+    ? (JSON.parse(fs.readFileSync(wireLogFile, "utf-8")) as HttpWireLogEntry[])
     : [];
 
   const treeNodes = entries.map((e) => {
@@ -136,7 +136,9 @@ export function analyzeSessionXray(
   const wireRounds: WireRoundXray[] = [];
   let prevMsgs: Record<string, unknown>[] = [];
   for (let i = 0; i < wireEntries.length; i++) {
-    const { roundXray, currentMsgs } = inspectSingleWireRound(wireEntries[i]!, i, prevMsgs);
+    const entry = wireEntries[i]!;
+    if (!Array.isArray(entry.requestBody?.messages)) continue;
+    const { roundXray, currentMsgs } = inspectSingleWireRound(entry, i, prevMsgs);
     wireRounds.push(roundXray);
     prevMsgs = currentMsgs;
   }

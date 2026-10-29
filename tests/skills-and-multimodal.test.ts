@@ -9,7 +9,7 @@ import { expandAtMentions, listWorkspaceFiles, parseShotCommandArgs, stripAttach
 import { buildDropdownItems } from "../src/adapters/dropdown.js";
 import { handleSlashCommand, resolveApprovalInput, verifyGoalCompletion } from "../src/adapters/repl.js";
 import { createRouterProvider, resolveActiveModelTarget, toOpenAiMessages } from "../src/adapters/router.js";
-import { analyzeBashSandbox, classifyToolCallRisk, createSandboxGrants } from "../src/adapters/sandbox-policy.js";
+import { analyzeBashSandbox, classifyToolCallRisk, createSandboxGrants, isWriteToolCall } from "../src/adapters/sandbox-policy.js";
 import { createSessionController } from "../src/adapters/session-controller.js";
 import { discoverAvailableSkills, expandSkillSlashCommand, formatSkillsSystemIndex } from "../src/adapters/skill-loader.js";
 import { compactWireLogEntry } from "../src/adapters/store.js";
@@ -461,6 +461,22 @@ describe("Custom SKILL.md Lazy-Loading & Multimodal Image Input", () => {
     expect(analyzeBashSandbox("cat ../outside-dir/*.json", ws).tier).toBe("ask_escalated");
     expect(analyzeBashSandbox("ls -la /", ws).tier).toBe("ask_escalated");
 
+    // 工作区内连跳子目录与子 Shell ((cd backend && ...) && (cd frontend && ...)) 及 cwd 参数严禁误报越界
+    const multiSubdirCmd = 'export PATH="/opt/homebrew/bin:$PATH" && cd backend && go build -o zhiku-server . && ./zhiku-server --self-test && cd ../frontend && pnpm build';
+    expect(analyzeBashSandbox(multiSubdirCmd, ws).tier).toBe("ask_workspace");
+    expect(analyzeBashSandbox("(cd backend && go build .) && (cd frontend && pnpm build)", ws).tier).toBe("ask_workspace");
+    expect(analyzeBashSandbox("cd src && ls && cd -", ws).tier).toBe("allow");
+    expect(classifyToolCallRisk({ id: "c1", name: "run_bash", arguments: { command: "cat ../package.json && cd ../tests && ls", cwd: "src" } }, ws, new Map()).tier).toBe("allow");
+    expect(isWriteToolCall({ id: "c1", name: "run_bash", arguments: { command: "cat ../package.json && cd ../tests && ls", cwd: "src" } }, ws, new Map())).toBe(false);
+    expect(classifyToolCallRisk({ id: "c2", name: "run_bash", arguments: { command: "ls", cwd: "../outside-dir" } }, ws, new Map()).tier).toBe("ask_escalated");
+    expect(classifyToolCallRisk({ id: "c3", name: "run_bash", arguments: { command: "ls", cwd: "~/.ssh" } }, ws, new Map()).tier).toBe("deny");
+    // 真实连跳逃逸工作区 (cd backend && cd ../../outside) 与分号虚假 cd 抵消 .. 仍必须拦截提权
+    expect(analyzeBashSandbox("cd backend && cd ../../outside && ls", ws).tier).toBe("ask_escalated");
+    expect(analyzeBashSandbox("cd non_existent_1/non_existent_2 ; cat ../outside_secret.txt", ws).tier).toBe("ask_escalated");
+    // 借 cd 进主目录读取敏感凭据或 echo + 换行拼接敏感路径必须硬拦截
+    expect(analyzeBashSandbox("cd ~ && cat .ssh/id_rsa", ws).tier).toBe("deny");
+    expect(analyzeBashSandbox("echo checking\ncat ~/.ssh/id_rsa", ws).tier).toBe("deny");
+
     // 提权与普通模式下统一支持 a (及 t 别名)，未知单字母返回 invalid 拦截，中文修改意见正常返回 revise
     expect(resolveApprovalInput("a", true, true)).toEqual({ kind: "approve", autoApprove: true, trustDirectory: true });
     expect(resolveApprovalInput("t", true, true)).toEqual({ kind: "approve", autoApprove: true, trustDirectory: true });
@@ -468,5 +484,102 @@ describe("Custom SKILL.md Lazy-Loading & Multimodal Image Input", () => {
     expect(resolveApprovalInput("x", true, true).kind).toBe("invalid");
     const rev = resolveApprovalInput("背景改成纯黑色，红色只做点缀", true, true);
     expect(rev.kind).toBe("revise");
+  });
+
+  it("8. 竞品能力对齐：shell-quote 多行/Glob 沙箱、run_bash 保尾截断落盘、edit_file BOM/局部模糊匹配/互斥锁、.gitignore 过滤与 <context_archive>", async () => {
+    const tmpWs = fs.mkdtempSync(path.join(os.tmpdir(), "duo-comp-cap-"));
+    try {
+      // 1) A1: shell-quote 多行换行 cd 连跳不误报越界 + $HOME/.ssh/* 敏感路径硬拦截
+      fs.mkdirSync(path.join(tmpWs, "backend"), { recursive: true });
+      fs.mkdirSync(path.join(tmpWs, "frontend"), { recursive: true });
+      const multiLineBuildCmd = 'export PATH="/opt/homebrew/bin:$PATH"\ncd backend\ngo build -o zhiku-server .\n./zhiku-server --self-test\ncd ../frontend\npnpm build && echo "ALL_STAGE2_CHECKS_PASSED"';
+      expect(analyzeBashSandbox(multiLineBuildCmd, tmpWs).tier).toBe("ask_workspace");
+      expect(analyzeBashSandbox("cat $HOME/.ssh/*", tmpWs).tier).toBe("deny");
+      expect(analyzeBashSandbox('cat "$HOME/.aws/credentials"', tmpWs).tier).toBe("deny");
+
+      // 2) B1: runCommandInSandbox 超长输出保尾截断 + 完整日志落盘 + 三处沙箱白名单免确认放行
+      const { runCommandInSandbox, createWriteTools, withFileMutationQueue } = await import("../src/adapters/write-tools.js");
+      const longRes = await runCommandInSandbox(
+        'node -e \'for(let i=1;i<=300;i++) console.log("LINE_"+i+"_"+"x".repeat(40)); console.log("FINAL_TAIL_ERROR_MARKER");\'',
+        tmpWs,
+        10_000,
+        undefined,
+        "workspace_write",
+        tmpWs,
+      );
+      expect(longRes.output).toContain("LINE_1_");
+      expect(longRes.output).toContain("FINAL_TAIL_ERROR_MARKER");
+      const logMatch = longRes.output.match(/完整日志已保存至 ([^\s，,]+\.log)/);
+      expect(logMatch?.[1]).toBeTruthy();
+      const logFile = logMatch![1]!;
+      expect(fs.existsSync(logFile)).toBe(true);
+      expect(classifyToolCallRisk({ id: "r1", name: "read_file", arguments: { path: logFile } }, tmpWs, new Map()).tier).toBe("allow");
+      expect(analyzeBashSandbox(`grep FINAL_TAIL_ERROR_MARKER "${logFile}"`, tmpWs).tier).toBe("allow");
+
+      // 3) B2: edit_file UTF-8 BOM 保留 + 第 5 级 Unicode 局部窗口模糊匹配（不破坏未修改行中文弯引号）+ 同文件互斥锁
+      const writeTools = createWriteTools(tmpWs, []);
+      const editTool = writeTools.find((t) => t.name === "edit_file")!;
+      const bomFile = path.join(tmpWs, "bom-fuzzy.ts");
+      fs.writeFileSync(bomFile, "\uFEFFconst untouched = “保持全角弯引号与——破折号”;\nexport const target = “旧状态” — 1;\n", "utf-8");
+      await editTool.execute({
+        path: "bom-fuzzy.ts",
+        oldText: 'export const target = "旧状态" - 1;',
+        newText: 'export const target = "新状态" - 2;',
+      });
+      const afterBom = fs.readFileSync(bomFile, "utf-8");
+      expect(afterBom.startsWith("\uFEFF")).toBe(true);
+      expect(afterBom).toContain("const untouched = “保持全角弯引号与——破折号”;");
+      expect(afterBom).toContain('export const target = "新状态" - 2;');
+
+      const order: number[] = [];
+      await Promise.all([
+        withFileMutationQueue(bomFile, async () => {
+          await new Promise((r) => setTimeout(r, 15));
+          order.push(1);
+        }),
+        withFileMutationQueue(bomFile, async () => {
+          order.push(2);
+        }),
+      ]);
+      expect(order).toEqual([1, 2]);
+
+      // 4) A3 & B3: .gitignore 目录过滤 + macOS 窄空格截图文件名自适应读取
+      fs.writeFileSync(path.join(tmpWs, ".gitignore"), "custom_build/\n*.gen.ts\n", "utf-8");
+      fs.mkdirSync(path.join(tmpWs, "custom_build"), { recursive: true });
+      fs.writeFileSync(path.join(tmpWs, "custom_build", "bundle.js"), "console.log('ignored');", "utf-8");
+      fs.writeFileSync(path.join(tmpWs, "Screen Shot 2026-10-29 at 10.00.00\u202FAM.txt"), "narrow_space_ok", "utf-8");
+      const builtin = createBuiltinTools(tmpWs);
+      const listOut = String(await builtin.find((t) => t.name === "list_dir")!.execute({ path: "." }));
+      expect(listOut).toContain("custom_build/");
+      expect(listOut).toContain("[已过滤忽略目录");
+      const readOut = String(await builtin.find((t) => t.name === "read_file")!.execute({ path: "Screen Shot 2026-10-29 at 10.00.00 AM.txt" }));
+      expect(readOut).toContain("narrow_space_ok");
+
+      // 5) B4: compactMessages 极限水位淘汰早期单元时生成 <context_archive> 且保持角色交替
+      const longMsgs: Message[] = [
+        { role: "system", content: "sys" },
+        { role: "user", content: "第一轮需求：初始化后端" },
+        { role: "assistant", content: "读取并修改文件", toolCalls: [{ id: "tc1", name: "edit_file", arguments: { path: "backend/store.go", oldText: "", newText: "package main" } }] },
+        { role: "tool", toolCallId: "tc1", name: "edit_file", content: "ok", isError: false },
+        { role: "user", content: "第二轮需求：" + "A".repeat(1500) },
+        { role: "assistant", content: "B".repeat(1500) },
+        { role: "user", content: "第三轮当前需求" },
+      ];
+      const compacted = compactMessages(longMsgs, { maxTotalChars: 2600, keepRecentMessages: 2 });
+      expect(JSON.stringify(compacted)).toContain("<context_archive");
+      expect(JSON.stringify(compacted)).toContain("backend/store.go");
+      for (let i = 1; i < compacted.length; i++) {
+        expect(compacted[i]!.role === "user" && compacted[i - 1]!.role === "user").toBe(false);
+      }
+
+      // 6) B5: extractPlanSteps 与 formatPlanProgressBanner
+      const { formatPlanProgressBanner } = await import("../src/adapters/plan-flow.js");
+      const banner = formatPlanProgressBanner("Plan:\n1. 创建 `backend/store.go`\n2. 创建 `frontend/src/App.tsx`", ["backend/store.go"]);
+      expect(banner).toContain("1/2");
+      expect(banner).toContain("☑ 1.");
+      expect(banner).toContain("☐ 2.");
+    } finally {
+      fs.rmSync(tmpWs, { recursive: true, force: true });
+    }
   });
 });

@@ -102,8 +102,9 @@ export function buildBridgePrompt(messages: Message[], tools: ToolContract<any>[
   const visionNote = hasImages ? "（多模态特例：仅允许对 [用户附加视觉图片] 中的图片绝对路径调用内置 view_file/read_file 查看画面；其余一切操作严禁调内置工具）" : "";
   if (tools.length > 0) {
     const toolDesc = tools.map((t) => {
-      const shape = (t.parameters as any)?.shape as Record<string, any> | undefined;
-      const keys = shape ? Object.keys(shape).map((k) => (typeof shape[k]?.isOptional === "function" && shape[k].isOptional() ? `${k}?` : k)).join(", ") : "";
+      const shape = (t.parameters as any)?.shape as Record<string, any> | undefined, props = (t.inputSchema as any)?.properties as Record<string, any> | undefined;
+      const req = new Set<string>(Array.isArray((t.inputSchema as any)?.required) ? (t.inputSchema as any).required : []);
+      const keys = shape ? Object.keys(shape).map((k) => (typeof shape[k]?.isOptional === "function" && shape[k].isOptional() ? `${k}?` : k)).join(", ") : props ? Object.keys(props).map((k) => (req.has(k) ? k : `${k}?`)).join(", ") : "";
       return `- ${t.name}(${keys}): ${t.description}`;
     }).join("\n");
     parts.push(`【Duo-Harness 桥接协议：严禁直接调用 Antigravity IDE 自身内置工具（严禁调 IDE 的 view_file/read_file/run_command/get-metrics.mjs 或拉起子代理）${visionNote}！若需查看目录、读取文件或执行命令，请从以下 Duo-Harness 宿主工具中选择，并直接输出且仅输出一行纯 JSON（不要加 markdown 代码块包裹）：\n{"content":"","toolCalls":[{"name":"工具名","arguments":{"参数名":"..."}}]}\n可用宿主工具列表：\n${toolDesc}\n若当前上下文已足够回答用户问题，请直接输出最终中文 Markdown 回答】`);

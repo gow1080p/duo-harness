@@ -1,4 +1,5 @@
-import { shortenWorkspaceText, truncateCols } from "./platform.js";
+import * as Diff from "diff";
+import { getVisualCols, shortenWorkspaceText, truncateCols } from "./platform.js";
 import type { FileVersionSnapshot } from "./write-tools.js";
 
 export interface FileDiffSummaryItem {
@@ -30,6 +31,58 @@ export function truncateVisualCols(text: string, maxCols = 66): string {
   return truncateCols(text, maxCols, "...");
 }
 
+export function highlightCodeLine(raw: string): string {
+  const expanded = raw.replace(/\t/g, "  ");
+  if (/^(?:\/\/|#|--)/.test(expanded.trim())) return `\x1b[90m\x1b[3m${expanded}\x1b[0m`;
+  return expanded.replace(
+    /("[^"\\]*(?:\\.[^"\\]*)*"|'[^'\\]*(?:\\.[^'\\]*)*'|`[^`]*`)|\b(package|import|func|type|struct|interface|return|if|else|for|range|switch|case|default|defer|go|var|const|let|export|from|async|await|class|CREATE|TABLE|IF|NOT|EXISTS|INSERT|INTO|VALUES|SELECT|FROM|WHERE|JOIN|ON|UPDATE|SET|ORDER|BY|PRIMARY|KEY)\b/g,
+    (_m, strLit: string | undefined, kw: string | undefined) => (strLit ? `\x1b[32m${strLit}\x1b[0m` : `\x1b[1;35m${kw}\x1b[0m`)
+  );
+}
+
+export function extractCodeOutline(lines: readonly string[]): string[] {
+  const symbols: string[] = [];
+  for (const l of lines) {
+    const m = l.match(/^\s*(?:export\s+)?(?:async\s+)?(?:func\s+(?:\([^)]+\)\s*)?([A-Za-z0-9_]+)|type\s+([A-Za-z0-9_]+)\s+(?:struct|interface)|function\s+([A-Za-z0-9_]+)|class\s+([A-Za-z0-9_]+)|def\s+([A-Za-z0-9_]+)|CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+([A-Za-z0-9_]+))/i);
+    const sym = m?.[1] ? `func ${m[1]}` : m?.[2] ? `type ${m[2]}` : m?.[3] ? `fn ${m[3]}` : m?.[4] ? `class ${m[4]}` : m?.[5] ? `def ${m[5]}` : m?.[6] ? `table ${m[6]}` : "";
+    if (sym && !symbols.includes(sym)) symbols.push(sym);
+  }
+  return symbols;
+}
+
+const BG_REM_LINE = "\x1b[48;2;45;18;22m\x1b[31m";
+const BG_REM_WORD = "\x1b[48;2;115;32;42m\x1b[1;97m";
+const BG_ADD_LINE = "\x1b[48;2;16;46;28m\x1b[32m";
+const BG_ADD_WORD = "\x1b[48;2;28;105;55m\x1b[1;97m";
+
+export function formatIntraLineDiffPair(oldLine: string, newLine: string, maxCols = 70): { remFormatted: string; addFormatted: string } {
+  const tokenize = (s: string) => s.slice(0, 300).match(/[A-Za-z0-9_]+|\s+|[\u4e00-\u9fa5]+|[^\sA-Za-z0-9_\u4e00-\u9fa5]/g) ?? [s.slice(0, 300)];
+  const oTok = tokenize(oldLine);
+  const nTok = tokenize(newLine);
+  if (oTok.length * nTok.length > 16_000) {
+    return {
+      remFormatted: `${BG_REM_LINE}- ${truncateVisualCols(oldLine, maxCols)}\x1b[0m`,
+      addFormatted: `${BG_ADD_LINE}+ ${truncateVisualCols(newLine, maxCols)}\x1b[0m`,
+    };
+  }
+  const remChanged: string[] = [];
+  const addChanged: string[] = [];
+  for (const part of Diff.diffWords(oldLine.slice(0, 400), newLine.slice(0, 400))) {
+    const tok = part.value.trim();
+    if (!tok) continue;
+    if (part.removed) remChanged.push(tok);
+    else if (part.added) addChanged.push(tok);
+  }
+  const remTag = remChanged.length > 0 && remChanged.join("").length < oldLine.trim().length ? ` -${truncateVisualCols(remChanged.join(" "), 20)} ` : "";
+  const addTag = addChanged.length > 0 && addChanged.join("").length < newLine.trim().length ? ` +${truncateVisualCols(addChanged.join(" "), 20)} ` : "";
+  const oClip = truncateVisualCols(oldLine, remTag ? Math.max(20, maxCols - getVisualCols(remTag) - 2) : maxCols);
+  const nClip = truncateVisualCols(newLine, addTag ? Math.max(20, maxCols - getVisualCols(addTag) - 2) : maxCols);
+  return {
+    remFormatted: `${BG_REM_LINE}- ${oClip}\x1b[0m${remTag ? `  ${BG_REM_WORD}${remTag}\x1b[0m` : ""}`,
+    addFormatted: `${BG_ADD_LINE}+ ${nClip}\x1b[0m${addTag ? `  ${BG_ADD_WORD}${addTag}\x1b[0m` : ""}`,
+  };
+}
+
 function stripCommonPairIndent(removed: readonly string[], added: readonly string[]): { removed: string[]; added: string[] } {
   const nonEmpty = [...removed, ...added].filter((l) => l.trim().length > 0);
   const minIndent = nonEmpty.length > 0 ? Math.min(...nonEmpty.map((l) => l.match(/^[ \t]*/)?.[0].length ?? 0)) : 0;
@@ -39,51 +92,15 @@ function stripCommonPairIndent(removed: readonly string[], added: readonly strin
 
 function diffMiddleLines(oMid: readonly string[], nMid: readonly string[]): { removed: string[]; added: string[] } {
   if (oMid.length === 0 || nMid.length === 0) return { removed: [...oMid], added: [...nMid] };
-  if (oMid.length * nMid.length <= 60_000) {
-    const m = oMid.length;
-    const n = nMid.length;
-    const dp = Array.from({ length: m + 1 }, () => new Int32Array(n + 1));
-    for (let i = m - 1; i >= 0; i--) {
-      for (let j = n - 1; j >= 0; j--) {
-        dp[i]![j] = oMid[i] === nMid[j] ? dp[i + 1]![j + 1]! + 1 : Math.max(dp[i + 1]![j]!, dp[i]![j + 1]!);
-      }
-    }
-    const removed: string[] = [];
-    const added: string[] = [];
-    let i = 0;
-    let j = 0;
-    while (i < m || j < n) {
-      if (i < m && j < n && oMid[i] === nMid[j]) {
-        i++;
-        j++;
-      } else if (j < n && (i === m || dp[i]![j + 1]! >= dp[i + 1]![j]!)) {
-        added.push(nMid[j++]!);
-      } else {
-        removed.push(oMid[i++]!);
-      }
-    }
-    return { removed, added };
+  const parts = Diff.diffLines(oMid.join("\n"), nMid.join("\n"));
+  const removed: string[] = [];
+  const added: string[] = [];
+  for (const part of parts) {
+    if (!part.added && !part.removed) continue;
+    const lines = part.value.replace(/\n$/, "").split("\n");
+    if (part.removed) removed.push(...lines);
+    else if (part.added) added.push(...lines);
   }
-  const oCounts = new Map<string, number>();
-  const nCounts = new Map<string, number>();
-  for (const l of oMid) oCounts.set(l, (oCounts.get(l) ?? 0) + 1);
-  for (const l of nMid) nCounts.set(l, (nCounts.get(l) ?? 0) + 1);
-  const removed = oMid.filter((l) => {
-    const c = nCounts.get(l) ?? 0;
-    if (c > 0) {
-      nCounts.set(l, c - 1);
-      return false;
-    }
-    return true;
-  });
-  const added = nMid.filter((l) => {
-    const c = oCounts.get(l) ?? 0;
-    if (c > 0) {
-      oCounts.set(l, c - 1);
-      return false;
-    }
-    return true;
-  });
   return { removed, added };
 }
 
@@ -199,6 +216,11 @@ export function formatSnapshotsDiff(snapshots: readonly FileVersionSnapshot[], w
       const tRem = h.totalRemoved ?? h.removed.length;
       const tAdd = h.totalAdded ?? h.added.length;
       if (hList.length > 1) out.push(`     \x1b[90m@@ 修改片段 #${idx + 1} (-${tRem} / +${tAdd} 行) @@\x1b[0m`);
+      if (h.removed.length === 1 && h.added.length === 1 && tRem === 1 && tAdd === 1) {
+        const pair = formatIntraLineDiffPair(h.removed[0]!, h.added[0]!, opts.full ? 160 : 76);
+        out.push(`     ${pair.remFormatted}`, `     ${pair.addFormatted}`);
+        return;
+      }
       for (const r of h.removed) out.push(`     \x1b[31m- ${r}\x1b[0m`);
       if (tRem > h.removed.length) out.push(`     \x1b[90m  ... (此段其余 ${tRem - h.removed.length} 行删除已折叠，输入 /diff full 查看全部)\x1b[0m`);
       for (const a of h.added) out.push(`     \x1b[32m+ ${a}\x1b[0m`);

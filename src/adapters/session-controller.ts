@@ -8,7 +8,7 @@ import { expandAtMentions } from "./context-mention.js";
 import { loadAndFormatWireCost } from "./cost-tracker.js";
 import { type ConversationTurnSummary, extractConversationTurns, formatRecentHistoryRecap, formatSnapshotsDiff, loadProjectMeta, loadProjectRedoBatches, loadProjectSnapshots, type ProjectSessionPaths, resolveProjectSessionPaths, resolveTargetWorkspace, saveProjectMeta, saveProjectSnapshots } from "./project-store.js";
 import { createRouterProvider, listAvailableModelModes, type ModelMode, resolveActiveModelTarget } from "./router.js";
-import { appendJsonlEntries, loadJsonlEntries } from "./store.js";
+import { appendJsonlEntries, loadJsonlEntries, withSessionLock } from "./store.js";
 import { computeTurnMetrics, type FileDiffSummaryItem, summarizeSnapshotsDiff } from "./ui-logger.js";
 import { createSandboxGrants, type SandboxGrants } from "./sandbox-policy.js";
 import { type FileVersionSnapshot, redoFileSnapshots, rollbackFileSnapshots } from "./write-tools.js";
@@ -40,8 +40,9 @@ function loadDiskEntries(sessionFile: string): SessionEntry[] {
 
 function syncStateFromDisk(st: ControllerMutableState): SessionEntry[] {
   const entries = loadDiskEntries(st.paths.sessionFile), meta = loadProjectMeta(st.paths.metaFile), validModes = listAvailableModelModes(st.paths.workspaceRoot);
+  const rootId = entries[0]?.parentId === null && entries[0]?.message.role === "system" ? entries[0].id : null;
   st.modelMode = meta.modelMode && validModes.includes(meta.modelMode) ? meta.modelMode : "auto";
-  if (meta.activeLeafId === "__root__") st.leafId = entries[0]?.id ?? null;
+  if (meta.activeLeafId === "__root__") st.leafId = rootId;
   else if (meta.activeLeafId && entries.some((e) => e.id === meta.activeLeafId)) st.leafId = meta.activeLeafId;
   else st.leafId = entries.length > 0 ? entries[entries.length - 1]!.id : null;
   st.snapshots = loadProjectSnapshots(st.paths.snapshotsFile);
@@ -75,46 +76,48 @@ export function squashTurnSnapshots(snapshots: FileVersionSnapshot[], startIndex
 }
 
 async function executeControllerAsk(st: ControllerMutableState, prompt: string, runOpts: Partial<RunSessionOptions> = {}): Promise<TurnExecutionSummary> {
-  syncStateFromDisk(st);
-  const meta = loadProjectMeta(st.paths.metaFile);
-  const { expandedPrompt, attachedPaths, attachedImages } = expandAtMentions(prompt, st.paths.workspaceRoot, 300, st.sandboxGrants);
-  if (attachedPaths.length > 0) console.log(`📎 [已自动附加 ${attachedPaths.length} 个文件/图片上下文]: ${attachedPaths.join(", ")}`);
-  const effectivePrompt = meta.lastUndoNotice
-    ? `${expandedPrompt}\n\n[系统提示：${meta.lastUndoNotice}。若本轮仅为普通问答请直接作答，严禁调用 run_bash；若后续需查看或修改该文件，请用免确认的 read_file / list_dir 读取最新状态]`
-    : expandedPrompt;
-  saveProjectMeta(st.paths.metaFile, { activeLeafId: null, ...(meta.lastUndoNotice ? { lastUndoNotice: null } : {}) });
-  const snapStart = st.snapshots.length, turnId = `turn_${Date.now()}`;
-  const persistTurnSnapshots = () => {
-    for (let i = snapStart; i < st.snapshots.length; i++) {
-      if (!st.snapshots[i]!.turnId) { st.snapshots[i]!.turnId = turnId; st.redoBatches.length = 0; }
-    }
-    saveProjectSnapshots(st.paths.snapshotsFile, st.snapshots, st.redoBatches);
-  };
-  let finalLeafId = st.leafId;
-  try {
-    const res = await runAgentSession(effectivePrompt, {
-      ...runOpts, workspaceRoot: st.paths.workspaceRoot, sessionFile: st.paths.sessionFile, wireLogFile: st.paths.wireLogFile,
-      leafId: st.leafId ?? undefined, provider: runOpts.provider ?? st.provider, snapshots: st.snapshots, redoBatches: st.redoBatches, sandboxGrants: st.sandboxGrants,
-      userImages: runOpts.userImages ?? attachedImages, onSnapshotChange: persistTurnSnapshots, enableWriteTools: runOpts.enableWriteTools ?? true, showCostReport: runOpts.showCostReport ?? false,
-    });
-    finalLeafId = res.leafId;
-    squashTurnSnapshots(st.snapshots, snapStart, turnId);
-    const turnSnaps = st.snapshots.slice(snapStart), m = computeTurnMetrics(st.paths.wireLogFile, res.stepsUsed), status = buildStatusSummary(st);
-    return {
-      finalAnswer: res.finalAnswer, stepsUsed: res.stepsUsed, leafId: res.leafId, activeModel: m?.activeModel ?? status.activeModel,
-      turnCostCny: m?.turnCostCny ?? 0, totalCostCny: m?.totalCostCny ?? 0, cacheHitRatePct: m?.cacheHitRatePct ?? 0,
-      modifiedFiles: summarizeSnapshotsDiff(turnSnaps, st.paths.workspaceRoot),
+  return withSessionLock(st.paths.sessionFile, async () => {
+    syncStateFromDisk(st);
+    const meta = loadProjectMeta(st.paths.metaFile);
+    const { expandedPrompt, attachedPaths, attachedImages } = expandAtMentions(prompt, st.paths.workspaceRoot, 300, st.sandboxGrants);
+    if (attachedPaths.length > 0) console.log(`📎 [已自动附加 ${attachedPaths.length} 个文件/图片上下文]: ${attachedPaths.join(", ")}`);
+    const effectivePrompt = meta.lastUndoNotice
+      ? `${expandedPrompt}\n\n[系统提示：${meta.lastUndoNotice}。若本轮仅为普通问答请直接作答，严禁调用 run_bash；若后续需查看或修改该文件，请用免确认的 read_file / list_dir 读取最新状态]`
+      : expandedPrompt;
+    saveProjectMeta(st.paths.metaFile, { activeLeafId: null, ...(meta.lastUndoNotice ? { lastUndoNotice: null } : {}) });
+    const snapStart = st.snapshots.length, turnId = `turn_${Date.now()}`;
+    const persistTurnSnapshots = () => {
+      for (let i = snapStart; i < st.snapshots.length; i++) {
+        if (!st.snapshots[i]!.turnId) { st.snapshots[i]!.turnId = turnId; st.redoBatches.length = 0; }
+      }
+      saveProjectSnapshots(st.paths.snapshotsFile, st.snapshots, st.redoBatches);
     };
-  } catch (err) {
-    const disk = loadDiskEntries(st.paths.sessionFile), last = disk[disk.length - 1];
-    if (last && last.message.role !== "user") finalLeafId = last.id;
-    else if (!finalLeafId && disk[0]) finalLeafId = disk[0].id;
-    if (st.snapshots.length > snapStart) console.log(`💾 [本轮中途异常前已落盘 ${st.snapshots.length - snapStart} 处文件修改 · 可直接输入“继续”接力收尾，或输入 /diff 查看 | /undo 撤回]`);
-    throw err;
-  } finally {
-    st.leafId = finalLeafId; squashTurnSnapshots(st.snapshots, snapStart, turnId);
-    saveProjectMeta(st.paths.metaFile, { activeLeafId: finalLeafId }); persistTurnSnapshots();
-  }
+    let finalLeafId = st.leafId;
+    try {
+      const res = await runAgentSession(effectivePrompt, {
+        ...runOpts, workspaceRoot: st.paths.workspaceRoot, sessionFile: st.paths.sessionFile, wireLogFile: st.paths.wireLogFile,
+        leafId: st.leafId ?? undefined, provider: runOpts.provider ?? st.provider, snapshots: st.snapshots, redoBatches: st.redoBatches, sandboxGrants: st.sandboxGrants,
+        userImages: runOpts.userImages ?? attachedImages, onSnapshotChange: persistTurnSnapshots, enableWriteTools: runOpts.enableWriteTools ?? true, showCostReport: runOpts.showCostReport ?? false,
+      });
+      finalLeafId = res.leafId;
+      squashTurnSnapshots(st.snapshots, snapStart, turnId);
+      const turnSnaps = st.snapshots.slice(snapStart), m = computeTurnMetrics(st.paths.wireLogFile, res.stepsUsed), status = buildStatusSummary(st);
+      return {
+        finalAnswer: res.finalAnswer, stepsUsed: res.stepsUsed, leafId: res.leafId, activeModel: m?.activeModel ?? status.activeModel,
+        turnCostCny: m?.turnCostCny ?? 0, totalCostCny: m?.totalCostCny ?? 0, cacheHitRatePct: m?.cacheHitRatePct ?? 0,
+        modifiedFiles: summarizeSnapshotsDiff(turnSnaps, st.paths.workspaceRoot),
+      };
+    } catch (err) {
+      const disk = loadDiskEntries(st.paths.sessionFile), last = disk[disk.length - 1];
+      if (last && last.message.role !== "user") finalLeafId = last.id;
+      else if (!finalLeafId && disk[0]) finalLeafId = disk[0].id;
+      if (st.snapshots.length > snapStart) console.log(`💾 [本轮中途异常前已落盘 ${st.snapshots.length - snapStart} 处文件修改 · 可直接输入“继续”接力收尾，或输入 /diff 查看 | /undo 撤回]`);
+      throw err;
+    } finally {
+      st.leafId = finalLeafId; squashTurnSnapshots(st.snapshots, snapStart, turnId);
+      saveProjectMeta(st.paths.metaFile, { activeLeafId: finalLeafId }); persistTurnSnapshots();
+    }
+  }, runOpts.signal);
 }
 
 async function executeControllerUndo(st: ControllerMutableState, arg = "turn") {
@@ -189,7 +192,8 @@ export function createSessionController(options: SessionControllerOptions = {}) 
     listTurns: (): ConversationTurnSummary[] => extractConversationTurns(syncStateFromDisk(st), st.leafId),
     newSession: (): SessionStatusSummary => {
       st.sandboxGrants.reset();
-      st.leafId = loadDiskEntries(st.paths.sessionFile)[0]?.id ?? null;
+      const first = loadDiskEntries(st.paths.sessionFile)[0];
+      st.leafId = first?.parentId === null && first?.message.role === "system" ? first.id : null;
       saveProjectMeta(st.paths.metaFile, { activeLeafId: "__root__" });
       return buildStatusSummary(st);
     },
@@ -236,7 +240,7 @@ export function createSessionController(options: SessionControllerOptions = {}) 
     clearHistory: (): SessionStatusSummary => {
       for (const f of [st.paths.sessionFile, st.paths.wireLogFile, st.paths.snapshotsFile]) if (fs.existsSync(f)) fs.unlinkSync(f);
       st.leafId = null; st.snapshots.length = 0; st.redoBatches.length = 0; st.sandboxGrants.reset();
-      saveProjectMeta(st.paths.metaFile, { activeLeafId: null, lastUndoNotice: null });
+      saveProjectMeta(st.paths.metaFile, { activeLeafId: null, lastUndoNotice: null, lastPlanLeafId: null, lastExecutedPlanHash: null });
       return buildStatusSummary(st);
     },
     compact: () => executeControllerCompact(st),

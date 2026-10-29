@@ -2,8 +2,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { AssistantMessageSchema, type AssistantMessage, type LlmStreamEvent, type ToolCall } from "../core/contracts.js";
 import type { HttpWireLogEntry } from "./cost-tracker.js";
-import { compactWireLogEntry, writeFileAtomicSync } from "./store.js";
-import { formatMarkdownLine, getCharVisualWidth, getVisualCols, wrapReasoningLines } from "./ui-logger.js";
+import { compactWireLogEntry, slimWireLogEntryForArchive, writeFileAtomicSync } from "./store.js";
+import { formatMarkdownLine, formatWrappedMarkdownLine, getCharVisualWidth, getVisualCols, renderMarkdownTable, wrapReasoningLines } from "./ui-logger.js";
 import { syncXrayCacheSnapshot } from "./xray.js";
 
 export { formatMarkdownLine, getVisualCols, type HttpWireLogEntry, wrapReasoningLines };
@@ -146,16 +146,33 @@ function slicePreviewText(text: string, startCols: number, maxCols: number): { o
   return { out, nextCols: cols };
 }
 
+function formatReasoningBox(reasoningRaw: string, columns = 80): { text: string; rows: number } {
+  const allLines = wrapReasoningLines(reasoningRaw, Math.max(20, columns - 6));
+  if (allLines.length <= 5) return { text: `💭 \x1b[2m\x1b[3m${allLines.join("\n   ")}`, rows: allLines.length };
+  const tail = allLines.slice(-5);
+  return {
+    text: `💭 \x1b[2m[思考中 ${reasoningRaw.length} 字 · 实时滚动]\x1b[0m\n   \x1b[2m\x1b[3m${tail.join("\n   ")}\x1b[0m`,
+    rows: tail.length + 1,
+  };
+}
+
+function formatCommittedLine(currentLine: string, linePrefix: string, inCodeBlock: boolean, maxCols: number): { out: string; nextInCodeBlock: boolean } {
+  if (inCodeBlock || /^\s*```/.test(currentLine)) {
+    const { text: formatted, nextInCodeBlock } = formatMarkdownLine(currentLine, inCodeBlock);
+    return { out: `${linePrefix ? `${linePrefix.trimEnd()}\n` : ""}${formatted}`, nextInCodeBlock };
+  }
+  const pfxCols = getVisualCols(linePrefix), pad = pfxCols > 0 ? " ".repeat(pfxCols) : "";
+  const wrapped = formatWrappedMarkdownLine(currentLine, maxCols - pfxCols);
+  return { out: wrapped.map((l, idx) => (idx === 0 ? `${linePrefix}${l}` : `${pad}${l}`)).join("\n"), nextInCodeBlock: false };
+}
+
 export function createStreamRenderer(stream: { write: (s: string) => unknown; columns?: number } = process.stdout) {
   let inReasoning = false, hasStartedContent = false, inCodeBlock = false;
   let currentLine = "", linePrefix = "", previewCols = 0, toolName = "", toolChars = 0, reasoningRaw = "", reasoningRows = 0;
+  let pendingTableLines: string[] = [], tablePrefix = "";
 
-  const clearToolProgress = () => {
-    if (toolChars || toolName) { stream.write("\r\x1b[K"); toolName = ""; toolChars = 0; }
-  };
-  const eraseReasoningBox = () => {
-    if (reasoningRows > 0) { stream.write(`${reasoningRows > 1 ? `\x1b[${reasoningRows - 1}A` : ""}\r\x1b[J`); reasoningRows = 0; }
-  };
+  const clearToolProgress = () => { if (toolChars || toolName) { stream.write("\r\x1b[K"); toolName = ""; toolChars = 0; } };
+  const eraseReasoningBox = () => { if (reasoningRows > 0) { stream.write(`${reasoningRows > 1 ? `\x1b[${reasoningRows - 1}A` : ""}\r\x1b[J`); reasoningRows = 0; } };
   const finishReasoning = () => {
     if (!inReasoning) return;
     const allLines = wrapReasoningLines(reasoningRaw, Math.max(20, (stream.columns ?? 80) - 6));
@@ -163,51 +180,58 @@ export function createStreamRenderer(stream: { write: (s: string) => unknown; co
     else stream.write("\x1b[0m\n");
     inReasoning = false; reasoningRaw = ""; reasoningRows = 0;
   };
+  const flushTable = () => {
+    if (pendingTableLines.length === 0) return;
+    const maxCols = Math.min(Math.max(58, (stream.columns ?? 92) - 4), 108);
+    stream.write(`\r\x1b[K${tablePrefix ? `${tablePrefix}\n` : ""}${renderMarkdownTable(pendingTableLines, maxCols).join("\n")}\n`);
+    pendingTableLines = []; tablePrefix = "";
+  };
   const commitCurrentLine = (withNewline: boolean) => {
-    const { text: formatted, nextInCodeBlock } = formatMarkdownLine(currentLine, inCodeBlock);
+    if (!inCodeBlock && /^\s*\|.*\|\s*$/.test(currentLine)) {
+      if (linePrefix && !tablePrefix) tablePrefix = linePrefix.trimEnd();
+      pendingTableLines.push(currentLine);
+      stream.write("\r\x1b[K");
+      currentLine = linePrefix = ""; previewCols = 0;
+      return;
+    }
+    flushTable();
+    const maxCols = Math.min(Math.max(58, (stream.columns ?? 92) - 4), 108);
+    const { out, nextInCodeBlock } = formatCommittedLine(currentLine, linePrefix, inCodeBlock, maxCols);
     inCodeBlock = nextInCodeBlock;
-    stream.write(`\r\x1b[K${linePrefix}${formatted}${withNewline ? "\n" : ""}`);
+    stream.write(`\r\x1b[K${out}${withNewline ? "\n" : ""}`);
     currentLine = linePrefix = ""; previewCols = 0;
   };
 
   return {
     onReasoning(chunk: string) {
-      clearToolProgress();
+      if (currentLine.length > 0) commitCurrentLine(true);
+      flushTable(); clearToolProgress();
       if (!inReasoning) { stream.write("\n"); inReasoning = true; }
       reasoningRaw += chunk;
-      const allLines = wrapReasoningLines(reasoningRaw, Math.max(20, (stream.columns ?? 80) - 6));
       eraseReasoningBox();
-      if (allLines.length <= 5) {
-        stream.write(`💭 \x1b[2m\x1b[3m${allLines.join("\n   ")}`);
-        reasoningRows = allLines.length;
-      } else {
-        const tail = allLines.slice(-5);
-        stream.write(`💭 \x1b[2m[思考中 ${reasoningRaw.length} 字 · 实时滚动]\x1b[0m\n   \x1b[2m\x1b[3m${tail.join("\n   ")}\x1b[0m`);
-        reasoningRows = tail.length + 1;
-      }
+      const box = formatReasoningBox(reasoningRaw, stream.columns ?? 80);
+      stream.write(box.text);
+      reasoningRows = box.rows;
     },
     onToolCall(name?: string, argsDelta = "") {
-      finishReasoning();
+      if (currentLine.length > 0) commitCurrentLine(true);
+      flushTable(); finishReasoning();
       if (name) toolName = name;
       toolChars += argsDelta.length;
       stream.write(`\r\x1b[K\x1b[2m⏳ 正在生成工具调用 ${toolName || "..."} (${toolChars} 字符)...\x1b[0m`);
     },
     onContent(chunk: string) {
-      finishReasoning();
-      clearToolProgress();
+      finishReasoning(); clearToolProgress();
       if (!hasStartedContent) {
-        linePrefix = "💬 ";
-        previewCols = getVisualCols(linePrefix);
-        stream.write(`\n${linePrefix}`);
-        hasStartedContent = true;
+        linePrefix = "💬 "; previewCols = getVisualCols(linePrefix);
+        stream.write(`\n${linePrefix}`); hasStartedContent = true;
       }
       const parts = chunk.split("\n");
       for (let i = 0; i < parts.length; i++) {
         if (parts[i]) {
           const slice = slicePreviewText(parts[i]!, previewCols, Math.max(20, (stream.columns ?? 80) - 8));
           if (slice.out) stream.write(slice.out);
-          previewCols = slice.nextCols;
-          currentLine += parts[i]!;
+          previewCols = slice.nextCols; currentLine += parts[i]!;
         }
         if (i < parts.length - 1) commitCurrentLine(true);
       }
@@ -218,23 +242,27 @@ export function createStreamRenderer(stream: { write: (s: string) => unknown; co
       else if (evt.type === "tool_call_delta") this.onToolCall(evt.name, evt.argsDelta);
     },
     flush() {
-      finishReasoning();
-      clearToolProgress();
+      finishReasoning(); clearToolProgress();
       if (currentLine.length > 0) commitCurrentLine(false);
+      flushTable();
       if (hasStartedContent) stream.write("\x1b[0m\n");
     },
   };
 }
+
+const MAX_DETAILED_WIRE_ROUNDS = 60;
 
 export function recordHttpWireLog(entry: HttpWireLogEntry, wireFilePath = ".sessions/http-wire.json", resetFile = false): void {
   let existing: HttpWireLogEntry[] = [];
   if (!resetFile && fs.existsSync(wireFilePath)) {
     try {
       const parsed = JSON.parse(fs.readFileSync(wireFilePath, "utf-8"));
-      if (Array.isArray(parsed)) existing = parsed.map(compactWireLogEntry);
+      if (Array.isArray(parsed)) existing = parsed;
     } catch {}
   }
   existing.push(compactWireLogEntry(entry));
-  writeFileAtomicSync(wireFilePath, JSON.stringify(existing, null, 2));
+  const archiveCutoff = existing.length - MAX_DETAILED_WIRE_ROUNDS;
+  for (let i = 0; i < archiveCutoff; i++) existing[i] = slimWireLogEntryForArchive(existing[i]!);
+  writeFileAtomicSync(wireFilePath, JSON.stringify(existing));
   syncXrayCacheSnapshot(wireFilePath);
 }

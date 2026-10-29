@@ -59,7 +59,7 @@ function zodTypeToJsonSchema(fieldSchema: z.ZodTypeAny): { schema: Record<string
   return { schema: withDesc({ type: typeName }), isOptional };
 }
 
-export function zodObjectToJsonSchema(schema: z.ZodTypeAny): Record<string, unknown> {
+export function zodObjectToJsonSchema(schema?: z.ZodTypeAny): Record<string, unknown> {
   if (!(schema instanceof z.ZodObject)) return { type: "object", properties: {} };
   const shape = schema.shape as Record<string, z.ZodTypeAny>;
   const properties: Record<string, unknown> = {};

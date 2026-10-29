@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -11,9 +12,71 @@ import {
 import { assertSessionInvariant, projectToMessages } from "../core/session-tree.js";
 import type { HttpWireLogEntry } from "./cost-tracker.js";
 
+let atomicWriteSeq = 0;
+const heldLocksStorage = new AsyncLocalStorage<Set<string>>();
+const inProcessLocks = new Map<string, Promise<void>>();
+
+async function acquireCrossProcessFileLock(lockFile: string, token: string, signal?: AbortSignal): Promise<void> {
+  fs.mkdirSync(path.dirname(lockFile), { recursive: true });
+  while (true) {
+    if (signal?.aborted) throw new Error("会话排队等待已被取消 (AbortSignal)");
+    try {
+      const fd = fs.openSync(lockFile, "wx");
+      try { fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, ts: Date.now(), token }), "utf-8"); } finally { fs.closeSync(fd); }
+      return;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    }
+    try {
+      const stat = fs.statSync(lockFile), ageMs = Date.now() - stat.mtimeMs;
+      const raw = fs.readFileSync(lockFile, "utf-8").trim();
+      if (!raw) {
+        if (ageMs > 2000) fs.unlinkSync(lockFile);
+      } else {
+        const info = JSON.parse(raw) as { pid?: number; ts?: number }, pid = Number(info.pid);
+        let alive = false;
+        if (Number.isInteger(pid) && pid > 0) {
+          try { process.kill(pid, 0); alive = true; } catch (e: any) { alive = e?.code === "EPERM"; }
+        }
+        if (!alive || Date.now() - Number(info.ts ?? stat.mtimeMs) > 10 * 60_000) { fs.unlinkSync(lockFile); continue; }
+      }
+    } catch {}
+    await new Promise((r) => setTimeout(r, 60));
+  }
+}
+
+export async function withSessionLock<T>(lockTarget: string, fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+  const lockKey = path.resolve(lockTarget), held = heldLocksStorage.getStore();
+  if (held?.has(lockKey)) return fn();
+  const prev = inProcessLocks.get(lockKey) ?? Promise.resolve();
+  let releaseInProcess!: () => void;
+  const currentGate = new Promise<void>((resolve) => { releaseInProcess = resolve; });
+  const chain = prev.then(() => currentGate);
+  inProcessLocks.set(lockKey, chain);
+  await prev;
+  const lockFile = `${lockKey}.lock`, token = `${process.pid}_${Date.now()}_${++atomicWriteSeq}`;
+  let fileAcquired = false;
+  try {
+    await acquireCrossProcessFileLock(lockFile, token, signal);
+    fileAcquired = true;
+    const nextHeld = new Set(held);
+    nextHeld.add(lockKey);
+    return await heldLocksStorage.run(nextHeld, fn);
+  } finally {
+    if (fileAcquired) {
+      try {
+        const cur = JSON.parse(fs.readFileSync(lockFile, "utf-8")) as { token?: string };
+        if (cur.token === token) fs.unlinkSync(lockFile);
+      } catch {}
+    }
+    releaseInProcess();
+    if (inProcessLocks.get(lockKey) === chain) inProcessLocks.delete(lockKey);
+  }
+}
+
 export function writeFileAtomicSync(filePath: string, content: string): void {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  const tmpFile = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  const tmpFile = `${filePath}.${process.pid}.${Date.now()}.${++atomicWriteSeq}.tmp`;
   try {
     fs.writeFileSync(tmpFile, content, "utf-8");
     fs.renameSync(tmpFile, filePath);
@@ -164,5 +227,19 @@ export function compactWireLogEntry(entry: HttpWireLogEntry): HttpWireLogEntry {
     requestBody: { ...restBody, ...(messages !== undefined ? { messages } : {}) },
     rawSseLines: usageLines.length > 0 ? usageLines.slice(-2) : fallbackLines,
     assembledMessage: compactWireMessage(entry.assembledMessage as Record<string, any>) as AssistantMessage,
+  };
+}
+
+export function slimWireLogEntryForArchive(entry: HttpWireLogEntry): HttpWireLogEntry {
+  const reqBody = (entry.requestBody ?? {}) as Record<string, any>;
+  if (!Array.isArray(reqBody.messages) && entry.assembledMessage === undefined) return entry;
+  const msgs = Array.isArray(reqBody.messages) ? reqBody.messages : [];
+  const messageCount = Array.isArray(reqBody.messages) ? msgs.length : Number(reqBody.messageCount ?? 0);
+  const isSessionStart = Array.isArray(reqBody.messages) ? !msgs.some((m: any) => m?.role === "assistant") : Boolean(reqBody.isSessionStart);
+  return {
+    roundTimestamp: entry.roundTimestamp,
+    apiUrl: entry.apiUrl,
+    requestBody: { model: reqBody.model, messageCount, isSessionStart },
+    rawSseLines: entry.rawSseLines,
   };
 }

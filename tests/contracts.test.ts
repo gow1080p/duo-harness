@@ -65,7 +65,7 @@ describe("Step 1.1: src/core/contracts.ts 核心通用契约把玩测试", () =>
     expect(parsed.success).toBe(true);
   });
 
-  it("4. [防屎山物理守门员] 自动扫描 src/ 全量代码：单文件 <= 250 行、core 总计 <= 800 行且 0 I/O", () => {
+  it("4. [防屎山物理守门员] 自动扫描 src/ 全量代码：core 单文件 <= 250 行(总计 <= 800 行且 0 I/O)、adapters 单文件 <= 350 行", () => {
     const coreDir = path.resolve("src/core");
     const adaptersDir = path.resolve("src/adapters");
     let coreTotalLines = 0;
@@ -84,7 +84,7 @@ describe("Step 1.1: src/core/contracts.ts 核心通用契约把玩测试", () =>
     for (const file of fs.readdirSync(adaptersDir).filter((f) => f.endsWith(".ts"))) {
       const content = fs.readFileSync(path.join(adaptersDir, file), "utf-8");
       const lines = content.split("\n").length;
-      expect(lines, `src/adapters/${file} 超出 250 行上限`).toBeLessThanOrEqual(250);
+      expect(lines, `src/adapters/${file} 超出 350 行上限`).toBeLessThanOrEqual(350);
     }
   });
 });

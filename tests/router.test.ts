@@ -17,7 +17,8 @@ import {
 } from "../src/adapters/router.js";
 import { assembleSsePayloads, createStreamRenderer, formatMarkdownLine, readOpenAiSseStream } from "../src/adapters/sse-stream.js";
 import { compactWireLogEntry } from "../src/adapters/store.js";
-import { formatApprovalBox } from "../src/adapters/ui-logger.js";
+import { formatIntraLineDiffPair, highlightCodeLine } from "../src/adapters/diff-presenter.js";
+import { formatApprovalBox, renderMarkdownDocument } from "../src/adapters/ui-logger.js";
 import { z } from "zod";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -141,12 +142,17 @@ describe("Step 1.4: src/adapters/router.ts 协议转换与分时路由测试", (
     expect(out).toContain("💭 \x1b[2m\x1b[3mLet me think\n   about this");
     expect(out).toContain("⏳ 正在生成工具调用 read_file");
     expect(out).toContain("▍ 标题");
-    expect(out).toContain("├────────────────────────────────────────┤");
+    expect(out).toContain("┌─");
+    expect(out).toContain("─┼─");
+    expect(out).toContain("└─");
     expect(out).toContain("\x1b[1;97m改动最大\x1b[0m");
     expect(out).toContain("\x1b[1;97m过时文件未动\x1b[0m");
     expect(out).toContain("\x1b[36mmain.py\x1b[0m");
     expect(out).toContain("────────────────────────────────────────");
     expect(formatMarkdownLine("### 1. `.gitignore` 问题", false).text).toContain("▸ 1.");
+    const multiCodeGlob = formatMarkdownLine("检查 `src/*.ts` 和 `test/*.ts`", false).text;
+    expect(multiCodeGlob).toContain("src/*.ts");
+    expect(multiCodeGlob).toContain("test/*.ts");
     const absPkg = path.resolve(process.cwd(), "package.json");
     const mdInline = formatMarkdownLine(`页面是根目录下的 package.json（完整路径 ${absPkg}），或点 \`package.json\``, false).text;
     expect(mdInline).not.toContain("\x1b]8;;");
@@ -154,6 +160,16 @@ describe("Step 1.4: src/adapters/router.ts 协议转换与分时路由测试", (
     const mdCode = formatMarkdownLine(absPkg, true).text;
     expect(mdCode).not.toContain("\x1b]8;;");
     expect(mdCode).toContain(absPkg);
+
+    // 验证表格最末行无尾随换行紧接 tool_call_delta 时不被腰斩拆成两个表格
+    const tblToolChunks: string[] = [];
+    const rTbl = createStreamRenderer({ write: (s) => tblToolChunks.push(s), columns: 80 });
+    rTbl.onEvent({ type: "content_delta", text: "| 模块 | 状态 |\n| --- | --- |\n| repl | 正常 |" });
+    rTbl.onEvent({ type: "tool_call_delta", index: 0, name: "list_dir", argsDelta: "{}" });
+    rTbl.flush();
+    const tblToolOut = tblToolChunks.join("");
+    expect((tblToolOut.match(/┌─/g) ?? []).length).toBe(1);
+    expect(tblToolOut).toContain("repl");
 
     // 验证长思考 (>5行) 原地 5 行滚动预览 + 结束时自动收拢为 [已思考 N 字] 摘要
     const longReasonChunks: string[] = [];
@@ -164,6 +180,58 @@ describe("Step 1.4: src/adapters/router.ts 协议转换与分时路由测试", (
     const longOut = longReasonChunks.join("");
     expect(longOut).toContain("[思考中");
     expect(longOut).toContain("[已思考");
+
+    // 验证静态 Markdown 渲染器（/plan view 代码块智能折叠 + AST 符号骨架 + 行内 Diff 高亮胶囊）
+    const samplePlan = [
+      "# Stage 1 实施计划",
+      "> 1. 所有外部环境均已预置就绪，**零 Python 依赖**。",
+      "```go",
+      "package main",
+      "import (",
+      '  "database/sql"',
+      '  "fmt"',
+      '  "net/http"',
+      '  "os"',
+      '  "strings"',
+      ")",
+      "type Store struct { db *sql.DB }",
+      "func NewStore(path string) (*Store, error) {",
+      "  return nil, nil",
+      "}",
+      "func (s *Store) GetDoc(id string) error {",
+      "  return nil",
+      "}",
+      "func main() {",
+      '  fmt.Println("ok")',
+      "}",
+      "```",
+    ].join("\n");
+    const foldedMd = renderMarkdownDocument(samplePlan, { expandCodeBlocks: false, maxCols: 76 });
+    expect(foldedMd).toContain("🔎 核心符号骨架");
+    expect(foldedMd).toContain("type Store · func NewStore");
+    expect(foldedMd).toContain("/plan full");
+    const fullMd = renderMarkdownDocument(samplePlan, { expandCodeBlocks: true, maxCols: 76 });
+    expect(fullMd).not.toContain("🔎 核心符号骨架");
+    expect(fullMd).toContain("main() {");
+
+    const intraPair = formatIntraLineDiffPair("  return count + 1;", "  return count + 2;", 70);
+    expect(intraPair).not.toBeNull();
+    expect(intraPair.remFormatted).toContain("-   return count + 1;");
+    expect(intraPair.addFormatted).toContain("+   return count + 2;");
+    expect(intraPair.remFormatted).toContain("-1");
+    expect(intraPair.addFormatted).toContain("+2");
+
+    // 验证超长行 (>66列) 行尾修改仍能精准提取 Diff 胶囊且总视觉宽度严格受控
+    const tailOld = "const res = await client.request(workspaceRoot, { timeout: 3000, retry: false });";
+    const tailNew = "const res = await client.request(workspaceRoot, { timeout: 3000, retry: true });";
+    const tailDiff = formatIntraLineDiffPair(tailOld, tailNew, 66);
+    expect(tailDiff.remFormatted).toContain("-false");
+    expect(tailDiff.addFormatted).toContain("+true");
+    expect(getVisualCols(tailDiff.remFormatted.replace(/\x1b\[[0-9;]*m/g, ""))).toBeLessThanOrEqual(68);
+
+    // 验证字符串字面量内的 SQL/Go 关键字不会被二次正则染色冲掉外层绿色
+    const sqlLine = highlightCodeLine('const q = "SELECT * FROM users";');
+    expect(sqlLine).toContain('\x1b[32m"SELECT * FROM users"\x1b[0m');
   });
 
   it("5. 同会话模型粘性保缓存路由 (auto 续聊锁定上一轮模型，/new 或 /model 显式切换)", () => {

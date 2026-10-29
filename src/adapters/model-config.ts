@@ -104,7 +104,7 @@ export function loadModelRegistryConfig(workspaceRoot = process.cwd(), customCon
   };
   const globalFile = process.env.DUO_MODELS_CONFIG?.trim() || path.join(os.homedir(), ".duo-harness", "models.json");
   const wsFile = customConfigPath ? path.resolve(workspaceRoot, customConfigPath) : path.join(path.resolve(workspaceRoot), ".duo", "models.json");
-  const globalCfg = readJsonConfigSafe(globalFile);
+  const globalCfg = Boolean(process.env.VITEST) && !process.env.DUO_MODELS_CONFIG?.trim() ? {} : readJsonConfigSafe(globalFile);
   const wsCfg = readJsonConfigSafe(wsFile);
   const mergedModels: Record<string, ModelEndpointConfig> = { ...builtinModels };
   for (const src of [globalCfg.models, wsCfg.models]) {

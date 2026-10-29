@@ -4,14 +4,14 @@ import * as path from "node:path";
 import { z } from "zod";
 import type { ToolContract } from "../core/contracts.js";
 import { checkFileSyntax } from "./bash-policy.js";
-import { createRunBashTool, killProcessGroup, runCommandInSandbox } from "./bash-tool.js";
+import { createRunBashTool, killProcessGroup, killTrackedChildren, runCommandInSandbox } from "./bash-tool.js";
 import { extractChangedHunk } from "./diff-presenter.js";
 import { expandHomePath, toPosixRelative } from "./platform.js";
 import { writeFileAtomicSync } from "./store.js";
 import { resolveSafePath, type SandboxGrants } from "./tools.js";
 import { checkHardDeniedPath, resolveExistingRealPath } from "./sandbox-policy.js";
 
-export { createRunBashTool, killProcessGroup, runCommandInSandbox };
+export { createRunBashTool, killProcessGroup, killTrackedChildren, runCommandInSandbox };
 
 const SingleEditItemSchema = z.object({
   oldText: z.string().describe("原文件中待替换的精确代码片段"),
@@ -96,6 +96,49 @@ function minLeadingIndent(lines: readonly string[]): number {
   return Number.isFinite(min) ? min : 0;
 }
 
+function normalizeFuzzyLine(line: string): string {
+  return line
+    .normalize("NFKC")
+    .trimEnd()
+    .replace(/[\u2018\u2019\u201A\u201B]/g, "'")
+    .replace(/[\u201C\u201D\u201E\u201F]/g, '"')
+    .replace(/[\u2010\u2011\u2012\u2013\u2014\u2015\u2212]/g, "-")
+    .replace(/[\u00A0\u2002-\u200A\u202F\u205F\u3000]/g, " ");
+}
+
+function tryIndentOrFuzzyReplace(wLines: readonly string[], oLines: readonly string[], nLines: readonly string[], eol: string, filePath: string, fuzzy: boolean): string | null {
+  if (!oLines.some((l) => l.trim().length > 0)) return null;
+  const oldIndent = minLeadingIndent(oLines);
+  const norm = fuzzy ? normalizeFuzzyLine : (s: string) => s.trimEnd();
+  const matches: { idx: number; winIndent: number; indentChar: string }[] = [];
+  for (let i = 0; i <= wLines.length - oLines.length; i++) {
+    const win = wLines.slice(i, i + oLines.length), winIndent = minLeadingIndent(win);
+    const ok = oLines.every((ol, j) => {
+      const wl = win[j] ?? "";
+      if (!ol.trim() || !wl.trim()) return !ol.trim() && !wl.trim();
+      return norm(wl.slice(winIndent)) === norm(ol.slice(oldIndent));
+    });
+    if (ok) {
+      const firstNonEmpty = win.find((l) => l.trim().length > 0) ?? "";
+      matches.push({ idx: i, winIndent, indentChar: firstNonEmpty.startsWith("\t") ? "\t" : " " });
+    }
+  }
+  if (matches.length > 1) {
+    throw new Error(`oldText 在 ${filePath} 中出现了 ${matches.length} 次 (位于第 ${matches.map((m) => m.idx + 1).join(", ")} 行)，请补充前后几行保证唯一匹配`);
+  }
+  if (matches.length === 1) {
+    const { idx, winIndent, indentChar } = matches[0]!, delta = winIndent - oldIndent;
+    const shiftedNew = nLines.map((nl) => {
+      if (!nl.trim()) return "";
+      if (delta >= 0) return indentChar.repeat(delta) + nl;
+      const lead = nl.match(/^[ \t]*/)?.[0]?.length ?? 0;
+      return nl.slice(Math.min(lead, -delta));
+    });
+    return [...wLines.slice(0, idx), ...shiftedNew, ...wLines.slice(idx + oLines.length)].join(eol);
+  }
+  return null;
+}
+
 function replaceSingleItem(workingContent: string, oldText: string, newText: string, filePath: string, wasCreatedEmpty: boolean): string {
   if (wasCreatedEmpty && workingContent === "") throw new Error(`文件不存在，无法替换 oldText: ${filePath}`);
   const exactCount = workingContent.split(oldText).length - 1;
@@ -125,61 +168,62 @@ function replaceSingleItem(workingContent: string, oldText: string, newText: str
   if (matchIdxs.length > 1) {
     throw new Error(`oldText 在 ${filePath} 中出现了 ${matchIdxs.length} 次 (位于第 ${matchIdxs.map((i) => i + 1).join(", ")} 行)，请补充前后几行保证唯一匹配`);
   }
-  if (oLines.some((l) => l.trim().length > 0)) {
-    const oldIndent = minLeadingIndent(oLines), indentMatches: { idx: number; winIndent: number; indentChar: string }[] = [];
-    for (let i = 0; i <= wLines.length - oLines.length; i++) {
-      const win = wLines.slice(i, i + oLines.length), winIndent = minLeadingIndent(win);
-      const ok = oLines.every((ol, j) => {
-        const wl = win[j] ?? "";
-        if (!ol.trim() || !wl.trim()) return !ol.trim() && !wl.trim();
-        return wl.slice(winIndent).trimEnd() === ol.slice(oldIndent).trimEnd();
-      });
-      if (ok) {
-        const firstNonEmpty = win.find((l) => l.trim().length > 0) ?? "";
-        indentMatches.push({ idx: i, winIndent, indentChar: firstNonEmpty.startsWith("\t") ? "\t" : " " });
-      }
-    }
-    if (indentMatches.length === 1) {
-      const { idx, winIndent, indentChar } = indentMatches[0]!, delta = winIndent - oldIndent;
-      const shiftedNew = nLines.map((nl) => {
-        if (!nl.trim()) return "";
-        if (delta >= 0) return indentChar.repeat(delta) + nl;
-        const lead = nl.match(/^[ \t]*/)?.[0]?.length ?? 0;
-        return nl.slice(Math.min(lead, -delta));
-      });
-      return [...wLines.slice(0, idx), ...shiftedNew, ...wLines.slice(idx + oLines.length)].join(eol);
-    }
-    if (indentMatches.length > 1) {
-      throw new Error(`oldText 在 ${filePath} 中出现了 ${indentMatches.length} 次 (位于第 ${indentMatches.map((m) => m.idx + 1).join(", ")} 行)，请补充前后几行保证唯一匹配`);
-    }
-  }
+  const indentReplaced = tryIndentOrFuzzyReplace(wLines, oLines, nLines, eol, filePath, false);
+  if (indentReplaced !== null) return indentReplaced;
+  const fuzzyReplaced = tryIndentOrFuzzyReplace(wLines, oLines, nLines, eol, filePath, true);
+  if (fuzzyReplaced !== null) return fuzzyReplaced;
   throw new Error(`在 ${filePath} 中未找到匹配的 oldText，请先用 read_file 确认原文件内容`);
+}
+
+const fileMutationQueues = new Map<string, Promise<unknown>>();
+
+export async function withFileMutationQueue<T>(filePath: string, fn: () => Promise<T>): Promise<T> {
+  const key = resolveExistingRealPath(filePath);
+  const prev = fileMutationQueues.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const next = new Promise<void>((r) => { release = r; });
+  const chained = prev.then(() => next);
+  fileMutationQueues.set(key, chained);
+  await prev;
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (fileMutationQueues.get(key) === chained) fileMutationQueues.delete(key);
+  }
 }
 
 async function applyFileEdit(workspaceRoot: string, snapshots: FileVersionSnapshot[], args: z.infer<typeof EditFileArgsSchema>, onSnapshotChange?: () => void, grants?: SandboxGrants): Promise<string> {
   const fullPath = resolveSafePath(workspaceRoot, args.path, "write", grants);
-  const beforeContent = fsSync.existsSync(fullPath) ? await fs.readFile(fullPath, "utf-8") : null;
-  const hasBatch = Array.isArray(args.edits) && args.edits.length > 0;
-  if (!hasBatch && (args.oldText === undefined || args.newText === undefined)) throw new Error(`edit_file 参数缺失：必须提供 oldText/newText 或非空 edits 数组`);
-  const editList = hasBatch ? args.edits! : [{ oldText: args.oldText!, newText: args.newText! }];
-  if (editList.length > 1 && editList.some((item) => item.oldText === "")) throw new Error(`批量 edits 中禁止混入 oldText 为空串的全量覆盖项: ${args.path}`);
+  return withFileMutationQueue(fullPath, async () => {
+    const rawBefore = fsSync.existsSync(fullPath) ? await fs.readFile(fullPath, "utf-8") : null;
+    const bom = rawBefore?.startsWith("\uFEFF") ? "\uFEFF" : "";
+    const beforeBody = rawBefore !== null && bom ? rawBefore.slice(1) : rawBefore;
+    const hasBatch = Array.isArray(args.edits) && args.edits.length > 0;
+    if (!hasBatch && (args.oldText === undefined || args.newText === undefined)) throw new Error(`edit_file 参数缺失：必须提供 oldText/newText 或非空 edits 数组`);
+    const editList = hasBatch ? args.edits! : [{ oldText: args.oldText!, newText: args.newText! }];
+    if (editList.length > 1 && editList.some((item) => item.oldText === "")) throw new Error(`批量 edits 中禁止混入 oldText 为空串的全量覆盖项: ${args.path}`);
 
-  let workingContent = beforeContent ?? "";
-  for (const item of editList) {
-    workingContent = item.oldText === "" ? item.newText : replaceSingleItem(workingContent, item.oldText, item.newText, args.path, beforeContent === null);
-  }
+    let workingContent = beforeBody ?? "";
+    for (const item of editList) {
+      const cleanOld = item.oldText.startsWith("\uFEFF") ? item.oldText.slice(1) : item.oldText;
+      const cleanNew = item.newText.startsWith("\uFEFF") ? item.newText.slice(1) : item.newText;
+      workingContent = cleanOld === "" ? cleanNew : replaceSingleItem(workingContent, cleanOld, cleanNew, args.path, rawBefore === null);
+    }
 
-  writeFileAtomicSync(fullPath, workingContent);
-  const relPath = toPosixRelative(resolveSafePath(workspaceRoot, ".", "read", grants), fullPath) || args.path;
-  const version = snapshots.length + 1;
-  snapshots.push({ version, path: relPath, beforeContent, afterContent: workingContent, timestamp: Date.now(), hunkCount: editList.length });
-  onSnapshotChange?.();
-  const hunks = editList.map((e) => extractChangedHunk(e.oldText, e.newText));
-  const added = beforeContent === null ? workingContent.split(/\r?\n/).length : hunks.reduce((a, h) => a + h.added.length, 0);
-  const removed = beforeContent === null ? 0 : hunks.reduce((a, h) => a + h.removed.length, 0);
-  const baseMsg = `已写入文件: ${relPath} (共应用 ${editList.length} 处修改 · +${added} / -${removed} 行，当前版本 v${version}，语法自检已通过)`;
-  const syntaxErr = checkFileSyntax(relPath, workingContent);
-  return syntaxErr ? `已写入文件: ${relPath} (v${version})\n⚠️ [语法自检未通过] 检测到语法错误:\n${syntaxErr}\n请立即调用 edit_file 修复上述语法错误后再结束本轮回答。` : baseMsg;
+    const finalContent = bom + workingContent;
+    writeFileAtomicSync(fullPath, finalContent);
+    const relPath = toPosixRelative(resolveSafePath(workspaceRoot, ".", "read", grants), fullPath) || args.path;
+    const version = snapshots.length + 1;
+    snapshots.push({ version, path: relPath, beforeContent: rawBefore, afterContent: finalContent, timestamp: Date.now(), hunkCount: editList.length });
+    onSnapshotChange?.();
+    const hunks = editList.map((e) => extractChangedHunk(e.oldText, e.newText));
+    const added = rawBefore === null ? workingContent.split(/\r?\n/).length : hunks.reduce((a, h) => a + h.added.length, 0);
+    const removed = rawBefore === null ? 0 : hunks.reduce((a, h) => a + h.removed.length, 0);
+    const baseMsg = `已写入文件: ${relPath} (共应用 ${editList.length} 处修改 · +${added} / -${removed} 行，当前版本 v${version}，语法自检已通过)`;
+    const syntaxErr = checkFileSyntax(relPath, workingContent);
+    return syntaxErr ? `已写入文件: ${relPath} (v${version})\n⚠️ [语法自检未通过] 检测到语法错误:\n${syntaxErr}\n请立即调用 edit_file 修复上述语法错误后再结束本轮回答。` : baseMsg;
+  });
 }
 
 export function createWriteTools(workspaceRoot: string = process.cwd(), snapshots: FileVersionSnapshot[] = [], signal?: AbortSignal, onSnapshotChange?: () => void, grants?: SandboxGrants): ToolContract<any>[] {

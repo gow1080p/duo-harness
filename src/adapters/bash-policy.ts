@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import * as vm from "node:vm";
 import { isPathInside, shortenWorkspaceText } from "./platform.js";
@@ -45,33 +46,36 @@ export function buildDefaultSystemPrompt(workspaceRoot: string): string {
   ].join("\n");
 }
 
-function isTokenPathEscaped(rawToken: string, workspaceRoot?: string): boolean {
+function isTokenPathEscaped(rawToken: string, workspaceRoot?: string, baseDir = workspaceRoot): boolean {
   const val = rawToken.replace(/^--?[a-zA-Z0-9_-]+=/, "").replace(/([\\/])[*?[\]]+(?=[\\/]|$)/g, "$1_").replace(/[*?[\]]+/g, "");
   if (!val || val.startsWith("-") || val === '"__STR__"' || val === '"__LOCAL_URL__"' || /^\\+$/.test(val) || /[|^$(){}<>]/.test(val)) return false;
   if (val === '"__PATH_ESCAPE__"' || /^~(?:[\\/]|$)/.test(val)) return true;
   if (/^(?:\/tmp\/|\/private\/tmp\/|\/dev\/null\b|\/\/[a-zA-Z0-9_?-]+$)/.test(val)) return false;
+  if (/^duo-bash-[a-zA-Z0-9_-]+\.log$/i.test(path.basename(val)) && [os.tmpdir(), fs.existsSync(os.tmpdir()) ? fs.realpathSync(os.tmpdir()) : os.tmpdir(), "/tmp", "/private/tmp"].some((r) => isPathInside(path.resolve(val), r))) return false;
   const hasDotDot = /(?:^|[\\/])\.\.(?:[\\/]|$)/.test(val);
   if (hasDotDot || /^(?:[A-Za-z]:[\\/]|\/)/.test(val)) {
     if (!workspaceRoot) return true;
     const root = fs.existsSync(workspaceRoot) ? fs.realpathSync(workspaceRoot) : path.resolve(workspaceRoot);
-    const cand = path.resolve(root, val);
+    const base = baseDir && fs.existsSync(baseDir) ? fs.realpathSync(baseDir) : path.resolve(baseDir ?? root);
+    const cand = path.resolve(base, val);
     const realCand = fs.existsSync(cand) ? fs.realpathSync(cand) : cand;
     return !isPathInside(realCand, root);
   }
   if (workspaceRoot) {
     const root = fs.existsSync(workspaceRoot) ? fs.realpathSync(workspaceRoot) : path.resolve(workspaceRoot);
-    const cand = path.resolve(root, val);
+    const base = baseDir && fs.existsSync(baseDir) ? fs.realpathSync(baseDir) : path.resolve(baseDir ?? root);
+    const cand = path.resolve(base, val);
     if (fs.existsSync(cand) && !isPathInside(fs.realpathSync(cand), root)) return true;
   }
   return false;
 }
 
-function isSafeSingleBashSegment(seg: string, workspaceRoot?: string): { ok: boolean; isReadVerb: boolean } {
+function isSafeSingleBashSegment(seg: string, workspaceRoot?: string, baseDir = workspaceRoot): { ok: boolean; isReadVerb: boolean } {
   const core = seg.trim().replace(/^(?:(?:LC_ALL|LANG|TZ|TERM|COLORTERM)=(?:"__STR__"|\S+)\s+|(?:command|do|if|then|elif|else)\s+)*/, "");
   if (!core || core.includes('"__PATH_ESCAPE__"')) return { ok: false, isReadVerb: false };
   if (/^cd(?:\s+(\S+))?$/.test(core)) {
     const cdTarget = core.match(/^cd(?:\s+(\S+))?$/)?.[1];
-    if (!cdTarget || isTokenPathEscaped(cdTarget, workspaceRoot)) return { ok: false, isReadVerb: false };
+    if (!cdTarget || isTokenPathEscaped(cdTarget, workspaceRoot, baseDir)) return { ok: false, isReadVerb: false };
     return { ok: true, isReadVerb: false };
   }
   if (/^(?:sleep\s+\d+(?:\.\d+)?|for\s+[a-zA-Z_]\w*\s+in(?:\s+(?:"__STR__"|\S+))+|done|fi)$/.test(core)) {
@@ -79,7 +83,7 @@ function isSafeSingleBashSegment(seg: string, workspaceRoot?: string): { ok: boo
   }
   if (/^(?:\[\s+.+\s+\]|\[\[\s+.+\s+\]\])$/.test(core)) {
     const innerTokens = core.replace(/^\[\[?\s+|\s+\]\]?$/g, "").split(/\s+/);
-    if (innerTokens.some((t) => isTokenPathEscaped(t, workspaceRoot))) return { ok: false, isReadVerb: false };
+    if (innerTokens.some((t) => isTokenPathEscaped(t, workspaceRoot, baseDir))) return { ok: false, isReadVerb: false };
     return { ok: true, isReadVerb: true };
   }
   const tokens = core.split(/\s+/);
@@ -87,7 +91,7 @@ function isSafeSingleBashSegment(seg: string, workspaceRoot?: string): { ok: boo
   if (!first || first.includes("/") || first === '"__STR__"' || first === '"__LOCAL_URL__"' || first === '"__SED_UNSAFE__"') {
     return { ok: false, isReadVerb: false };
   }
-  if (tokens.slice(1).some((t) => isTokenPathEscaped(t, workspaceRoot))) {
+  if (tokens.slice(1).some((t) => isTokenPathEscaped(t, workspaceRoot, baseDir))) {
     return { ok: false, isReadVerb: false };
   }
   if (first === "sed" && (core.includes('"__SED_UNSAFE__"') || tokens.find((t, i) => i > 0 && !t.startsWith("-")) !== '"__STR__"')) {
@@ -113,7 +117,7 @@ function isSafeSingleBashSegment(seg: string, workspaceRoot?: string): { ok: boo
   return { ok: false, isReadVerb: false };
 }
 
-export function isReadonlyBashCommand(cmd: string, explicitReadonly?: boolean, workspaceRoot?: string): boolean {
+export function isReadonlyBashCommand(cmd: string, explicitReadonly?: boolean, workspaceRoot?: string, initialCwd = workspaceRoot): boolean {
   if (explicitReadonly === false) return false;
   const raw = cmd.trim();
   if (!raw || /`|\$\(|\$'|\$\{|\$(?:HOME|USERPROFILE|[A-Z0-9_]*KEY|[A-Z0-9_]*TOKEN|[A-Z0-9_]*SECRET)|%[A-Za-z0-9_]+%|[\n\r]/i.test(raw)) return false;
@@ -136,7 +140,7 @@ export function isReadonlyBashCommand(cmd: string, explicitReadonly?: boolean, w
         (workspaceRoot && process.platform !== "win32" && /^\/(?!dev\/null\b|tmp\/|private\/tmp\/)/.test(inner))
       )
     ) {
-      if (isTokenPathEscaped(inner, workspaceRoot)) return '"__PATH_ESCAPE__"';
+      if (isTokenPathEscaped(inner, workspaceRoot, initialCwd)) return '"__PATH_ESCAPE__"';
     }
     const body = inner.replace(/\bs([^\w\s])(?:\\.|(?!\1).)*\1(?:\\.|(?!\1).)*\1/g, "/").replace(/\/(?:\\.|[^/])*\//g, "/");
     return /\/[gIimMp0-9]*[ewW]|(?:^|[;{}!\s$0-9])[ewW](?:\s|$)/.test(body) ? '"__SED_UNSAFE__"' : '"__STR__"';
@@ -147,7 +151,7 @@ export function isReadonlyBashCommand(cmd: string, explicitReadonly?: boolean, w
   const segments = cleaned.split(/\s*(?:\|\||&&|;|\|)\s*/);
   let hasReadVerb = false;
   for (const seg of segments) {
-    const check = isSafeSingleBashSegment(seg, workspaceRoot);
+    const check = isSafeSingleBashSegment(seg, workspaceRoot, initialCwd);
     if (!check.ok) return false;
     if (check.isReadVerb) hasReadVerb = true;
   }

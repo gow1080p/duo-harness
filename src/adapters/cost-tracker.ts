@@ -9,7 +9,7 @@ export interface HttpWireLogEntry {
   apiUrl: string;
   requestBody: Record<string, unknown>;
   rawSseLines: string[];
-  assembledMessage: AssistantMessage;
+  assembledMessage?: AssistantMessage;
 }
 
 export interface RoundCostMetric {
@@ -152,7 +152,9 @@ export function summarizeWireCost(
     if (!usage) return;
     const rates = resolveUnitRates(usage.model, entry.roundTimestamp);
     if (!isReplay) periodLabel = rates.periodLabel;
-    const msgCount = Array.isArray(entry.requestBody?.messages) ? entry.requestBody.messages.length : 0;
+    const msgCount = Array.isArray(entry.requestBody?.messages)
+      ? entry.requestBody.messages.length
+      : Number(entry.requestBody?.messageCount ?? 0);
     rounds.push(computeRoundMetric(rounds.length + 1, msgCount, usage, rates, rounds[rounds.length - 1], isReplay));
   });
 
@@ -188,8 +190,9 @@ export function computeTurnMetrics(wireLogFile: string, stepsUsed: number, isRep
     if (!s || s.rounds.length === 0) return null;
     let startIdx = 0;
     for (let i = entries.length - 1; i >= 0; i--) {
-      const msgs = (entries[i]?.requestBody as { messages?: { role?: string }[] } | undefined)?.messages;
-      if (Array.isArray(msgs) && !msgs.some((m) => m.role === "assistant")) { startIdx = i; break; }
+      const reqBody = entries[i]?.requestBody as { messages?: { role?: string }[]; isSessionStart?: boolean } | undefined;
+      const msgs = reqBody?.messages;
+      if (reqBody?.isSessionStart || (Array.isArray(msgs) && !msgs.some((m) => m.role === "assistant"))) { startIdx = i; break; }
     }
     const sSession = startIdx > 0 ? summarizeWireCost(entries.slice(startIdx), { isReplay }) : s;
     const sessionRounds = sSession.rounds.length > 0 ? sSession.rounds : s.rounds;

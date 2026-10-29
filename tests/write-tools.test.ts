@@ -348,6 +348,20 @@ describe("Stage 3: 写工具 (edit_file/run_bash/rollback_version)、暂停审�
       expect(roBlocked.exitCode).not.toBe(0);
       expect(roBlocked.output).toContain("沙箱提示");
       expect(fs.existsSync(path.join(tmpRoot, "hacked.txt"))).toBe(false);
+
+      // 验证 workspace_write Seatbelt 沙箱：允许写入当前工作区与系统临时目录，物理阻断写入工作区外的兄弟目录
+      const siblingDir = fs.mkdtempSync(path.join(os.tmpdir(), "duo-outside-"));
+      try {
+        const wsWriteOk = await runCommandInSandbox("echo ok > inside.txt && echo tmp > /dev/null", tmpRoot, 5_000, undefined, "workspace_write", tmpRoot);
+        expect(wsWriteOk.exitCode).toBe(0);
+        expect(fs.readFileSync(path.join(tmpRoot, "inside.txt"), "utf-8").trim()).toBe("ok");
+        const outsideTarget = path.join(path.dirname(process.cwd()), `.duo-seatbelt-probe-${process.pid}.txt`);
+        const wsWriteBlocked = await runCommandInSandbox(`touch "${outsideTarget}"`, tmpRoot, 5_000, undefined, "workspace_write", tmpRoot);
+        expect(wsWriteBlocked.exitCode).not.toBe(0);
+        expect(fs.existsSync(outsideTarget)).toBe(false);
+      } finally {
+        fs.rmSync(siblingDir, { recursive: true, force: true });
+      }
     }
 
     // 验证启动后台常驻进程（即使子进程继承了 stdout/stderr 管道未关闭）在主 Shell exit 后 150ms 内返回，不挂死满超时且进程存活
@@ -471,9 +485,12 @@ describe("Stage 3: 写工具 (edit_file/run_bash/rollback_version)、暂停审�
     expect(ctrlCRes.finalAnswer).toContain("[ABORT] 用户按 Ctrl+C 中断了本轮操作");
     expect(ctrlCRes.entries[ctrlCRes.entries.length - 1]?.message.role).toBe("tool");
 
-    // 验证 run_bash timeoutMs > 30000 不会触发 Zod 拒单，且 formatRecentHistoryRecap / formatSnapshotsDiff 正常展示
+    // 验证 run_bash timeoutMs > 30000 不会触发 Zod 拒单，且 killTrackedChildren 与历史摘要正常
     const [, , bashTool] = createWriteTools(process.cwd());
-    expect(bashTool!.parameters.safeParse({ command: "echo ok", timeoutMs: 180_000 }).success).toBe(true);
+    expect(bashTool!.parameters!.safeParse({ command: "echo ok", timeoutMs: 600_000 }).success).toBe(true);
+    const { killTrackedChildren } = await import("../src/adapters/bash-tool.js");
+    expect(typeof killTrackedChildren).toBe("function");
+    killTrackedChildren();
     const { formatRecentHistoryRecap, formatSnapshotsDiff } = await import("../src/adapters/project-store.js");
     const recap = formatRecentHistoryRecap([
       { id: "e0001", parentId: null, timestamp: 1, message: { role: "user", content: "检查项目合理性" } },

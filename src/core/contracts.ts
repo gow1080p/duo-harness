@@ -86,7 +86,7 @@ export type ToolExecuteOutput = string | { content: string; images?: ImageAttach
 export interface ToolContract<TArgs = unknown> {
   name: string;
   description: string;
-  parameters: z.ZodType<TArgs, z.ZodTypeDef, any>;
+  parameters?: z.ZodType<TArgs, z.ZodTypeDef, any>;
   inputSchema?: Record<string, unknown>;
   readonly: boolean;
   execute: (args: TArgs) => Promise<ToolExecuteOutput> | ToolExecuteOutput;

@@ -5,16 +5,15 @@ import { createInitialState, stepAgentLoop } from "../core/loop.js";
 import { assertSessionInvariant, buildSessionEntries, projectToMessages, repairDanglingToolCalls } from "../core/session-tree.js";
 import { createRouterProvider, type ModelMode, resolveRouteTier } from "./router.js";
 import { loadAndFormatWireCost } from "./cost-tracker.js";
-import { appendJsonlEntries, createReplayProvider, loadJsonlEntries } from "./store.js";
+import { appendJsonlEntries, createReplayProvider, loadJsonlEntries, withSessionLock } from "./store.js";
 import { type AdapterToolContract, type AdapterToolResultMessage, createBuiltinTools, executeToolCalls } from "./tools.js";
 import { createWriteTools, type FileVersionSnapshot, rollbackFileSnapshots } from "./write-tools.js";
 import { createSandboxGrants, evaluateBatchCallsRisk, grantApprovedCalls, type SandboxGrants } from "./sandbox-policy.js";
 import { buildDefaultSystemPrompt, formatCompactTurnFooter, formatStepToolCalls, formatToolResultLine, isReadonlyBashCommand } from "./ui-logger.js";
 import { stripAttachedFiles } from "./context-mention.js";
-import { syncXrayCacheSnapshot } from "./xray.js";
 
 export { buildDefaultSystemPrompt, isReadonlyBashCommand };
-export interface ApprovalRequestMeta { hasEscalated: boolean; escalatedReasons: string[]; externalDirs: string[]; }
+export interface ApprovalRequestMeta { hasEscalated: boolean; hasWrite?: boolean; escalatedReasons: string[]; externalDirs: string[]; }
 export interface AfterToolCallDecision { terminate?: boolean; finalAnswer?: string; details?: unknown; }
 
 export interface RunSessionOptions {
@@ -22,7 +21,7 @@ export interface RunSessionOptions {
   tools?: (ToolContract<any> | AdapterToolContract<any>)[]; extraTools?: (ToolContract<any> | AdapterToolContract<any>)[];
   includeBuiltinTools?: boolean; enableWriteTools?: boolean; quiet?: boolean; signal?: AbortSignal;
   workspaceRoot?: string; snapshots?: FileVersionSnapshot[]; redoBatches?: FileVersionSnapshot[][]; sandboxGrants?: SandboxGrants; compactor?: CompactorOptions;
-  maxSteps?: number; systemPrompt?: string; sessionFile?: string; replayFromFile?: string; wireLogFile?: string;
+  maxSteps?: number; systemPrompt?: string; contextPrompt?: string; sessionFile?: string; replayFromFile?: string; wireLogFile?: string;
   showCostReport?: boolean; suppressFinalEcho?: boolean; leafId?: string; userImages?: ImageAttachment[];
   onApprovalRequest?: (toolCalls: ToolCall[], meta?: ApprovalRequestMeta) => Promise<{ approved: boolean; reason?: string; trustDirectory?: boolean }> | { approved: boolean; reason?: string; trustDirectory?: boolean };
   onAfterToolCall?: (call: ToolCall, result: AdapterToolResultMessage) => Promise<AfterToolCallDecision | void> | AfterToolCallDecision | void;
@@ -33,14 +32,14 @@ export interface RunSessionOptions {
 
 interface SessionCursor { persistedCount: number; leafId: string | null; lastErrSig?: string; errStreak?: number; toolDetails: Record<string, unknown>; }
 
-function syncNewMessagesToDisk(sessionFile: string | undefined, recordedEntries: SessionEntry[], allMessages: readonly any[], cursor: SessionCursor, isFirstWrite: boolean, wireLogFile?: string): void {
+function syncNewMessagesToDisk(sessionFile: string | undefined, recordedEntries: SessionEntry[], allMessages: readonly any[], cursor: SessionCursor, isFirstWrite: boolean): void {
   const unsavedMessages = allMessages.slice(cursor.persistedCount);
   if (unsavedMessages.length === 0) return;
   const newEntries = buildSessionEntries(recordedEntries, unsavedMessages, Date.now(), cursor.leafId);
   recordedEntries.push(...newEntries);
   cursor.persistedCount = allMessages.length;
   cursor.leafId = newEntries[newEntries.length - 1]!.id;
-  if (sessionFile) { appendJsonlEntries(sessionFile, newEntries, isFirstWrite); if (wireLogFile) syncXrayCacheSnapshot(wireLogFile); }
+  if (sessionFile) appendJsonlEntries(sessionFile, newEntries, isFirstWrite);
 }
 
 async function executeToolBatchStep(
@@ -105,7 +104,7 @@ async function runSingleEffectStep(
       throw err;
     }
     const calls = reply.toolCalls ?? [], risk = evaluateBatchCallsRisk(calls, wsRoot, readonlyMap, grants);
-    const requiresApproval = risk.callsNeedingApproval.length > 0 && (risk.hasDenied || Boolean(options.onApprovalRequest));
+    const requiresApproval = risk.hasDenied || risk.hasEscalated || (risk.callsNeedingApproval.length > 0 && Boolean(options.onApprovalRequest));
     const next = stepAgentLoop(state, { type: "LLM_REPLIED", message: reply, requiresApproval });
     if (calls.length > 0 && next.effect.type !== "ABORT") {
       log(formatStepToolCalls(state.step + 1, calls, readonlyMap, wsRoot));
@@ -122,7 +121,7 @@ async function runSingleEffectStep(
     }
     const targetCalls = risk.callsNeedingApproval.length > 0 ? risk.callsNeedingApproval : effect.toolCalls;
     const decision = options.onApprovalRequest
-      ? await options.onApprovalRequest(targetCalls, { hasEscalated: risk.hasEscalated, escalatedReasons: risk.escalatedReasons, externalDirs: risk.externalDirs })
+      ? await options.onApprovalRequest(targetCalls, { hasEscalated: risk.hasEscalated, hasWrite: risk.hasWrite, escalatedReasons: risk.escalatedReasons, externalDirs: risk.externalDirs })
       : { approved: false, reason: "未配置审批回调，默认拒绝写或跨界操作" };
     const trustedDirs = decision.approved ? grantApprovedCalls(effect.toolCalls, wsRoot, readonlyMap, grants, Boolean(decision.trustDirectory)) : [];
     log(decision.approved ? (trustedDirs.length > 0 ? `  🟢 已授权并信任外部目录: ${trustedDirs.join(", ")}` : `  🟢 已确认允许执行`) : `  🔴 已拒绝执行: ${decision.reason}`);
@@ -145,33 +144,46 @@ function printCostIfEnabled(options: RunSessionOptions, wireLogFile: string, isR
 
 function initSessionContext(userPrompt: string, workspaceRoot: string, options: RunSessionOptions) {
   let existingEntries: SessionEntry[] = [];
-  if (options.leafId && options.sessionFile) { try { existingEntries = loadJsonlEntries(options.sessionFile); } catch {} }
-  const rawPrior = existingEntries.length > 0 && options.leafId ? projectToMessages(existingEntries, options.leafId) : [];
+  if (options.leafId && options.sessionFile) {
+    try { existingEntries = loadJsonlEntries(options.sessionFile); } catch {}
+  }
+  const resolvedLeafId = options.leafId === "latest" ? existingEntries.at(-1)?.id : options.leafId;
+  const rawPrior = existingEntries.length > 0 && resolvedLeafId ? projectToMessages(existingEntries, resolvedLeafId) : [];
   const existingSystem = rawPrior.length > 1 && rawPrior[0]?.role === "system" ? rawPrior[0].content : undefined;
   const systemPrompt = options.systemPrompt ?? existingSystem ?? buildDefaultSystemPrompt(workspaceRoot);
-  if (rawPrior.length === 1 && rawPrior[0]?.role === "system" && rawPrior[0].content !== systemPrompt && existingEntries[0]?.message.role === "system") {
+  if ((rawPrior.length === 1 || Boolean(options.systemPrompt)) && rawPrior[0]?.role === "system" && rawPrior[0].content !== systemPrompt && existingEntries[0]?.message.role === "system") {
     rawPrior[0] = { role: "system", content: systemPrompt };
     existingEntries[0] = { ...existingEntries[0], message: rawPrior[0] };
     if (options.sessionFile) appendJsonlEntries(options.sessionFile, existingEntries, true);
   }
   const baseState = createInitialState({ systemPrompt, maxSteps: options.maxSteps ?? 20 });
-  const priorMessages = repairDanglingToolCalls(rawPrior.length > 0 ? rawPrior : baseState.messages);
+  const byId = new Map(existingEntries.map((e) => [e.id, e]));
+  let trace = resolvedLeafId ? byId.get(resolvedLeafId) : undefined;
+  while (trace?.parentId && byId.has(trace.parentId)) trace = byId.get(trace.parentId);
+  const hasBrokenChain = existingEntries.length > 0 && (!existingEntries[0] || existingEntries[0].parentId !== null || existingEntries[0].message.role !== "system" || (Boolean(resolvedLeafId) && (!trace || trace.parentId !== null)));
+  const priorMessages = repairDanglingToolCalls(rawPrior.length > 0 && rawPrior[0]?.role === "system" ? rawPrior : (rawPrior.length > 0 ? [{ role: "system", content: systemPrompt }, ...rawPrior] : baseState.messages));
   while (priorMessages.length > 0 && priorMessages[priorMessages.length - 1]!.role === "user") priorMessages.pop();
-  if (options.systemPrompt && priorMessages[0]?.role === "system" && priorMessages[0].content !== systemPrompt) priorMessages[0] = { role: "system", content: systemPrompt };
-  const wasHealed = existingEntries.length > 0 && (priorMessages.length !== rawPrior.length || priorMessages.some((m, i) => m !== rawPrior[i]));
-  const recordedEntries: SessionEntry[] = wasHealed ? buildSessionEntries([], priorMessages, Date.now(), null) : existingEntries;
+  const wasHealed = hasBrokenChain || (rawPrior.length > 0 && existingEntries.length > 0 && (priorMessages.length !== rawPrior.length || priorMessages.some((m, i) => m !== rawPrior[i])));
+  const recordedEntries: SessionEntry[] = wasHealed
+    ? (!hasBrokenChain && existingEntries.length > rawPrior.length
+      ? [...existingEntries, ...buildSessionEntries(existingEntries, priorMessages.slice(1), Date.now(), existingEntries[0]!.id)]
+      : buildSessionEntries([], priorMessages, Date.now(), null))
+    : existingEntries;
   if (wasHealed && options.sessionFile) appendJsonlEntries(options.sessionFile, recordedEntries, true);
   const cursor: SessionCursor = {
-    persistedCount: existingEntries.length > 0 && options.leafId ? priorMessages.length : 0,
-    leafId: wasHealed ? (recordedEntries[recordedEntries.length - 1]?.id ?? null) : (options.leafId ?? null),
+    persistedCount: existingEntries.length > 0 && resolvedLeafId ? priorMessages.length : 0,
+    leafId: wasHealed ? (recordedEntries[recordedEntries.length - 1]?.id ?? null) : (resolvedLeafId ?? null),
     toolDetails: {},
   };
-  const stepRes = stepAgentLoop({ ...baseState, messages: priorMessages }, { type: "START", userPrompt, images: options.userImages });
-  syncNewMessagesToDisk(options.sessionFile, recordedEntries, stepRes.state.messages, cursor, existingEntries.length === 0 && !wasHealed, options.wireLogFile);
+  const fullPrompt = options.contextPrompt?.trim()
+    ? `${userPrompt}\n<context_state>\n[当前外部上下文状态（仅最后一条用户消息代表当前最新状态）]\n${options.contextPrompt.trim()}\n</context_state>`
+    : userPrompt;
+  const stepRes = stepAgentLoop({ ...baseState, messages: priorMessages }, { type: "START", userPrompt: fullPrompt, images: options.userImages });
+  syncNewMessagesToDisk(options.sessionFile, recordedEntries, stepRes.state.messages, cursor, existingEntries.length === 0 && !wasHealed);
   return { stepRes, recordedEntries, cursor };
 }
 
-export async function runAgentSession(
+async function runAgentSessionUnlocked(
   userPrompt: string, options: RunSessionOptions = {},
 ): Promise<{ finalAnswer: string; stepsUsed: number; entries: SessionEntry[]; leafId: string | null; toolDetails?: Record<string, unknown> }> {
   const isReplay = Boolean(options.replayFromFile), turnStartMs = Date.now(), workspaceRoot = options.workspaceRoot ?? process.cwd();
@@ -191,7 +203,7 @@ export async function runAgentSession(
       stepRes = { state: { ...stepRes.state, phase: "error", error: "收到外部取消信号 (AbortSignal)" }, effect: { type: "ABORT", reason: "收到外部取消信号 (AbortSignal)" } };
     }
     if (stepRes.effect.type === "ABORT") {
-      syncNewMessagesToDisk(options.sessionFile, recordedEntries, repairDanglingToolCalls(stepRes.state.messages), cursor, false, wireLogFile);
+      syncNewMessagesToDisk(options.sessionFile, recordedEntries, repairDanglingToolCalls(stepRes.state.messages), cursor, false);
       const turnSnapCount = snapshots.length - snapStartIdx;
       if (turnSnapCount > 0 && !options.signal?.aborted) {
         const rb = await rollbackFileSnapshots(workspaceRoot, snapshots, turnSnapCount, options.onSnapshotChange, options.redoBatches);
@@ -210,7 +222,7 @@ export async function runAgentSession(
         if (!options.quiet) console.log(`  💬 [实时插话已生效] 已向模型注入 ${steers.length} 条补充指令`);
         const nextMsgs = [...stepRes.state.messages, ...steers.map((s) => ({ role: "user" as const, content: `[用户运行中补充指令] ${s}` }))];
         stepRes = { state: { ...stepRes.state, phase: "thinking", step: stepRes.state.step + 1, messages: nextMsgs }, effect: { type: "REQUEST_LLM", messages: nextMsgs } };
-        syncNewMessagesToDisk(options.sessionFile, recordedEntries, stepRes.state.messages, cursor, false, wireLogFile);
+        syncNewMessagesToDisk(options.sessionFile, recordedEntries, stepRes.state.messages, cursor, false);
         continue;
       }
       if (options.verifyCompletion) {
@@ -218,7 +230,7 @@ export async function runAgentSession(
         if (!check.ok) {
           if (!options.quiet) console.log(`🔄 [自动验证未通过，打回重修]: ${check.errorOutput}`);
           stepRes = stepAgentLoop(stepRes.state, { type: "REJECT_COMPLETION", reason: check.errorOutput ?? "验证未通过" });
-          syncNewMessagesToDisk(options.sessionFile, recordedEntries, stepRes.state.messages, cursor, false, wireLogFile);
+          syncNewMessagesToDisk(options.sessionFile, recordedEntries, stepRes.state.messages, cursor, false);
           continue;
         }
         if (!(check as { skipped?: boolean }).skipped && !options.quiet) console.log(`✅ [完成前自动验证通过]`);
@@ -228,7 +240,7 @@ export async function runAgentSession(
     }
     options.onStepEvent?.({ phase: stepRes.state.phase, step: stepRes.state.step, detail: stepRes.effect.type });
     stepRes = await runSingleEffectStep(stepRes, recordedEntries, cursor, provider, tools, readonlyMap, { ...options, workspaceRoot }, grants);
-    if (stepRes.state.phase !== "awaiting_approval" && stepRes.state.phase !== "executing") syncNewMessagesToDisk(options.sessionFile, recordedEntries, stepRes.state.messages, cursor, false, wireLogFile);
+    if (stepRes.state.phase !== "awaiting_approval" && stepRes.state.phase !== "executing") syncNewMessagesToDisk(options.sessionFile, recordedEntries, stepRes.state.messages, cursor, false);
   }
   if (!options.quiet) {
     if (!options.suppressFinalEcho) {
@@ -240,8 +252,19 @@ export async function runAgentSession(
   return { finalAnswer: stepRes.effect.finalAnswer, stepsUsed: stepRes.state.step, entries: recordedEntries, leafId: cursor.leafId, toolDetails: cursor.toolDetails };
 }
 
+export async function runAgentSession(
+  userPrompt: string, options: RunSessionOptions = {},
+): Promise<{ finalAnswer: string; stepsUsed: number; entries: SessionEntry[]; leafId: string | null; toolDetails?: Record<string, unknown> }> {
+  return options.sessionFile && !options.replayFromFile
+    ? withSessionLock(options.sessionFile, () => runAgentSessionUnlocked(userPrompt, options), options.signal)
+    : runAgentSessionUnlocked(userPrompt, options);
+}
+
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
 if (isMain) {
-  const prompt = process.argv.slice(2).join(" ").trim() || "请先用 list_dir 查看当前目录有哪些文件，再读取 package.json 告诉我这个项目的名称和 dependencies。";
-  runAgentSession(prompt, { sessionFile: ".sessions/ask-latest.jsonl", enableWriteTools: true, showCostReport: true }).catch((err) => { console.error("运行出错:", err instanceof Error ? err.message : err); process.exit(1); });
+  const rawArgs = process.argv.slice(2);
+  const useLatest = rawArgs.includes("--continue") || rawArgs.includes("-c");
+  const ctxArg = rawArgs.find((a) => a.startsWith("--context="))?.slice("--context=".length);
+  const prompt = rawArgs.filter((a) => a !== "--continue" && a !== "-c" && !a.startsWith("--context=")).join(" ").trim() || "请先用 list_dir 查看当前目录有哪些文件，再读取 package.json 告诉我这个项目的名称和 dependencies。";
+  runAgentSession(prompt, { sessionFile: ".sessions/ask-latest.jsonl", leafId: useLatest ? "latest" : undefined, contextPrompt: ctxArg, enableWriteTools: true, showCostReport: true }).catch((err) => { console.error("运行出错:", err instanceof Error ? err.message : err); process.exit(1); });
 }

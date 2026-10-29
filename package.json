@@ -5,7 +5,10 @@
   "type": "module",
   "main": "./src/index.ts",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./core": "./src/core/index.ts",
+    "./runtime": "./src/runtime.ts",
+    "./coding": "./src/coding.ts"
   },
   "bin": {
     "duo": "./bin/duo.mjs"
@@ -26,10 +29,19 @@
     "verify": "tsc --noEmit && vitest run"
   },
   "dependencies": {
+    "cli-highlight": "^2.1.11",
+    "diff": "^9.0.0",
+    "ignore": "^7.0.14",
+    "marked": "^18.1.2",
+    "shell-quote": "^1.12.0",
+    "slice-ansi": "^9.0.1",
+    "string-width": "^8.3.0",
+    "wrap-ansi": "^10.0.2",
     "zod": "^3.24.2"
   },
   "devDependencies": {
     "@types/node": "^22.13.4",
+    "@types/shell-quote": "^1.7.5",
     "tsx": "^4.19.3",
     "typescript": "^5.7.3",
     "vitest": "^3.0.6"

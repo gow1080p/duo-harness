@@ -148,7 +148,7 @@ describe("Stage 2: .jsonl 会话树与断网录像回放测试", () => {
     expect(turn2.finalAnswer).toContain("收到了4条消息");
 
     const completer = createReplCompleter(() => tmpBase, () => pathsA.sessionFile);
-    expect(completer("/p")[0]).toEqual(["/projects"]);
+    expect(completer("/p")[0]).toEqual(["/plan ", "/projects"]);
     expect(completer("/cd app-")[0]).toContain("/cd app-alpha/");
     expect(completer("/branch msg_")[0]).toContain("/branch msg_3");
 
@@ -220,6 +220,22 @@ describe("Stage 2: .jsonl 会话树与断网录像回放测试", () => {
       },
     });
     expect(res.finalAnswer).toBe("已自动修复中断记录并完成代码缺陷分析！");
+
+    // 验证断链孤儿节点 (msg_39 指向不存在的 msg_38) 自动从断点自愈截断，绝不崩溃抛错
+    const orphanFile = path.join(tmpDir, "orphan.jsonl");
+    const orphanEntries: SessionEntry[] = [
+      { id: "msg_39", parentId: "msg_38", timestamp: 10, message: { role: "assistant", content: "旧进程残余输出" } },
+      { id: "msg_40", parentId: "msg_39", timestamp: 11, message: { role: "user", content: "按最新计划执行" } },
+    ];
+    expect(projectToMessages(orphanEntries, "msg_40").map((m) => m.content)).toEqual(["按最新计划执行"]);
+    fs.writeFileSync(orphanFile, orphanEntries.map((e) => JSON.stringify(e)).join("\n") + "\n", "utf-8");
+    const healedRes = await runAgentSession("开始执行新任务", {
+      workspaceRoot: tmpDir,
+      sessionFile: orphanFile,
+      leafId: "msg_40",
+      provider: { async chat(msgs) { expect(msgs[0]?.role).toBe("system"); return { role: "assistant", content: "已从断链节点自愈恢复" }; } },
+    });
+    expect(healedRes.finalAnswer).toBe("已从断链节点自愈恢复");
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 });

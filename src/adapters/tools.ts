@@ -1,6 +1,7 @@
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import ignore from "ignore";
 import { z } from "zod";
 import type { ImageAttachment, ToolCall, ToolContract, ToolExecuteOutput, ToolResultMessage } from "../core/contracts.js";
 import { toPosixRelative } from "./platform.js";
@@ -35,12 +36,32 @@ const GrepArgsSchema = z.object({
 export const IGNORED_DIRS = new Set([".git", "node_modules", ".sessions", ".debug", "venv", ".venv", "__pycache__", "dist", "build", ".next"]);
 export const BINARY_EXT_RE = /\.(png|jpe?g|gif|webp|ico|pdf|zip|tar|gz|woff2?|ttf|eot|mp[34]|mov|pyc|so|dylib|dll|exe|db|sqlite3?|lock)$/i;
 
+function createWorkspaceIgnoreFilter(realRoot: string): (relPosixPath: string, isDir?: boolean) => boolean {
+  const ig = ignore();
+  for (const d of IGNORED_DIRS) ig.add(`${d}/`);
+  try {
+    const gitignorePath = path.join(realRoot, ".gitignore");
+    if (fsSync.existsSync(gitignorePath)) ig.add(fsSync.readFileSync(gitignorePath, "utf-8"));
+  } catch {}
+  return (relPosixPath: string, isDir = false) => {
+    const clean = relPosixPath.replace(/\\/g, "/").replace(/^(?:\.\/|\/)+|\/+$/g, "");
+    if (!clean || clean === "." || clean.startsWith("..")) return false;
+    try { return ig.ignores(isDir ? `${clean}/` : clean); } catch { return false; }
+  };
+}
+
 async function runGrepSearch(workspaceRoot: string, args: z.infer<typeof GrepArgsSchema>, grants?: SandboxGrants): Promise<string> {
   const realRoot = resolveSafePath(workspaceRoot, ".", "read", grants), fullPath = resolveSafePath(workspaceRoot, args.path, "read", grants);
+  const isIgnored = createWorkspaceIgnoreFilter(realRoot);
   const stat = await fs.stat(fullPath);
   const files = stat.isDirectory()
     ? (await fs.readdir(fullPath, { recursive: true, withFileTypes: true }))
-        .filter((e) => e.isFile() && !BINARY_EXT_RE.test(e.name) && !path.relative(fullPath, e.parentPath).split(path.sep).some((p) => IGNORED_DIRS.has(p)))
+        .filter((e) => {
+          if (!e.isFile() || BINARY_EXT_RE.test(e.name)) return false;
+          const entryFull = path.join(e.parentPath, e.name);
+          if (path.relative(fullPath, e.parentPath).split(path.sep).some((p) => IGNORED_DIRS.has(p))) return false;
+          return !isIgnored(toPosixRelative(realRoot, entryFull), false);
+        })
         .map((e) => path.join(e.parentPath, e.name))
     : [fullPath];
   let regex: RegExp;
@@ -124,6 +145,40 @@ async function runReadFile(
   return out.length > 80_000 ? `${out.slice(0, 80_000)}\n... [单次读取超出 80,000 字符已截断，请传 startLine/endLine 分片读取]` : `${out}${rangeNote}`;
 }
 
+async function runListDir(workspaceRoot: string, args: z.infer<typeof ListDirArgsSchema>, grants?: SandboxGrants): Promise<string> {
+  const realRoot = resolveSafePath(workspaceRoot, ".", "read", grants);
+  const fullPath = resolveSafePath(workspaceRoot, args.path, "read", grants);
+  const isIgnored = createWorkspaceIgnoreFilter(realRoot);
+  const entries = await fs.readdir(fullPath, { withFileTypes: true });
+  const lines: string[] = [], ignoredFound: string[] = [];
+  for (const e of entries) {
+    const entryFull = path.join(fullPath, e.name);
+    if (IGNORED_DIRS.has(e.name) || (e.isDirectory() && isIgnored(toPosixRelative(realRoot, entryFull), true))) {
+      if (e.isDirectory() && e.name !== ".git" && e.name !== ".sessions" && e.name !== ".debug") ignoredFound.push(`${e.name}/`);
+      continue;
+    }
+    if (e.isDirectory()) {
+      lines.push(`${e.name}/`);
+      const subPath = path.join(fullPath, e.name);
+      const subEntries = await fs.readdir(subPath, { withFileTypes: true }).catch(() => []);
+      for (const sub of subEntries.slice(0, 25)) {
+        const subFull = path.join(subPath, sub.name);
+        if (!IGNORED_DIRS.has(sub.name) && !(sub.isDirectory() && isIgnored(toPosixRelative(realRoot, subFull), true))) {
+          const relSub = `${e.name}/${sub.name}`;
+          lines.push(`  ${sub.isDirectory() ? `${relSub}/` : formatFileWithLineCount(subFull, relSub)}`);
+        } else if (sub.isDirectory() && sub.name !== ".git" && sub.name !== ".sessions" && sub.name !== ".debug") {
+          ignoredFound.push(`${e.name}/${sub.name}/`);
+        }
+      }
+      if (subEntries.length > 25) lines.push(`  ... (其余 ${subEntries.length - 25} 项已省略，可对该子目录单独调用 list_dir)`);
+    } else {
+      lines.push(formatFileWithLineCount(entryFull, e.name));
+    }
+  }
+  if (ignoredFound.length > 0) lines.push(`[已过滤忽略目录: ${ignoredFound.join(", ")}]`);
+  return lines.join("\n");
+}
+
 export function createBuiltinTools(workspaceRoot: string = process.cwd(), grants?: SandboxGrants): ToolContract<any>[] {
   const readFileTool: ToolContract<z.infer<typeof ReadFileArgsSchema>> = {
     name: "read_file",
@@ -139,36 +194,7 @@ export function createBuiltinTools(workspaceRoot: string = process.cwd(), grants
       "列出指定目录的项目结构树（自动展开 2 层子目录、附带每个代码文件的行数并提示已过滤目录，看项目结构或评估文件规模请直接调本工具）",
     parameters: ListDirArgsSchema,
     readonly: true,
-    async execute(args) {
-      const fullPath = resolveSafePath(workspaceRoot, args.path, "read", grants);
-      const entries = await fs.readdir(fullPath, { withFileTypes: true });
-      const lines: string[] = [];
-      const ignoredFound: string[] = [];
-      for (const e of entries) {
-        if (IGNORED_DIRS.has(e.name)) {
-          if (e.isDirectory() && e.name !== ".git" && e.name !== ".sessions" && e.name !== ".debug") ignoredFound.push(`${e.name}/`);
-          continue;
-        }
-        if (e.isDirectory()) {
-          lines.push(`${e.name}/`);
-          const subPath = path.join(fullPath, e.name);
-          const subEntries = await fs.readdir(subPath, { withFileTypes: true }).catch(() => []);
-          for (const sub of subEntries.slice(0, 25)) {
-            if (!IGNORED_DIRS.has(sub.name)) {
-              const relSub = `${e.name}/${sub.name}`;
-              lines.push(`  ${sub.isDirectory() ? `${relSub}/` : formatFileWithLineCount(path.join(subPath, sub.name), relSub)}`);
-            } else if (sub.isDirectory() && sub.name !== ".git" && sub.name !== ".sessions" && sub.name !== ".debug") {
-              ignoredFound.push(`${e.name}/${sub.name}/`);
-            }
-          }
-          if (subEntries.length > 25) lines.push(`  ... (其余 ${subEntries.length - 25} 项已省略，可对该子目录单独调用 list_dir)`);
-        } else {
-          lines.push(formatFileWithLineCount(path.join(fullPath, e.name), e.name));
-        }
-      }
-      if (ignoredFound.length > 0) lines.push(`[已过滤忽略目录: ${ignoredFound.join(", ")}]`);
-      return lines.join("\n");
-    },
+    execute: (args) => runListDir(workspaceRoot, args, grants),
   };
 
   const grepTool: ToolContract<z.infer<typeof GrepArgsSchema>> = {
@@ -191,7 +217,11 @@ async function executeSingleToolCall(
     return { role: "tool", toolCallId: call.id, name: call.name, content: `未知工具: ${call.name}`, isError: true };
   }
   try {
-    const output = (await tool.execute(tool.parameters.parse(call.arguments))) as AdapterToolOutput;
+    if (!call.arguments || typeof call.arguments !== "object" || Array.isArray(call.arguments) || "_invalidJson" in call.arguments) {
+      throw new Error(`工具参数 JSON 格式非法或流式输出被截断: ${String((call.arguments as any)?._invalidJson ?? JSON.stringify(call.arguments)).slice(0, 200)}`);
+    }
+    const parsedArgs = tool.parameters ? tool.parameters.parse(call.arguments) : call.arguments;
+    const output = (await tool.execute(parsedArgs)) as AdapterToolOutput;
     if (typeof output === "object" && output !== null && "content" in output) {
       return {
         role: "tool",

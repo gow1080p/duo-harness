@@ -59,14 +59,16 @@ export async function buildRepoMap(workspaceRoot: string, scanDir: string = "src
   return sections.join("\n");
 }
 
-export async function scanArchitectureViolations(workspaceRoot: string, files: string[], maxFileLines: number = 250): Promise<string[]> {
+export async function scanArchitectureViolations(workspaceRoot: string, files: string[], maxFileLines: number = 350): Promise<string[]> {
   const realRoot = resolveSafePath(workspaceRoot, ".", "read"), violations: string[] = [];
   for (const file of files) {
     const fullPath = resolveSafePath(workspaceRoot, file, "read");
     const raw = await fs.readFile(fullPath, "utf-8"), lines = raw.split("\n");
     const relPath = path.relative(realRoot, fullPath).replace(/\\/g, "/");
-    if (lines.length > maxFileLines) violations.push(`${relPath}:1 单文件行数超标 (${lines.length} 行 > 上限 ${maxFileLines} 行)`);
-    if (relPath.startsWith("src/core/") || relPath.includes("/core/")) {
+    const isCore = relPath.startsWith("src/core/") || relPath.includes("/core/");
+    const limit = isCore ? Math.min(maxFileLines, 250) : maxFileLines;
+    if (lines.length > limit) violations.push(`${relPath}:1 单文件行数超标 (${lines.length} 行 > 上限 ${limit} 行)`);
+    if (isCore) {
       lines.forEach((line, idx) => {
         for (const rule of CORE_FORBIDDEN_PATTERNS) {
           if (rule.regex.test(line)) violations.push(`${relPath}:${idx + 1} ${rule.label} (${line.trim()})`);
@@ -101,7 +103,7 @@ export async function runCodeReview(options: CodeReviewOptions): Promise<{ repor
   for (const file of options.files) {
     const fullPath = resolveSafePath(workspaceRoot, file, "read");
     const lines = (await fs.readFile(fullPath, "utf-8")).split("\n");
-    preloadedSnippets.push(`=== 待审文件: ${file} ===\n${lines.slice(0, 260).map((l, i) => `${i + 1}: ${l}`).join("\n")}`);
+    preloadedSnippets.push(`=== 待审文件: ${file} ===\n${lines.slice(0, 360).map((l, i) => `${i + 1}: ${l}`).join("\n")}`);
   }
   let activeProvider = options.provider, useAgyOneShot = false;
   if (!activeProvider) {

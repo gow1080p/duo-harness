@@ -84,10 +84,12 @@ export function buildAtMentionDropdown(
 }
 
 export function stripAttachedFiles(raw: string): string {
-  if (!raw || (!raw.includes("<attached_file") && !raw.includes("[已折叠历史引用文件 @") && !raw.includes("[已折叠历史图片 @"))) return raw;
+  if (!raw || (!raw.includes("<attached_file") && !raw.includes("<context_state") && !raw.includes("[已折叠历史引用文件 @") && !raw.includes("[已折叠历史图片 @") && !raw.includes("[已折叠历史上下文状态"))) return raw;
   const stripped = raw
     .replace(/\s*<attached_file\b[^>]*>[\s\S]*?<\/attached_file>/g, "")
+    .replace(/\s*<context_state\b[^>]*>[\s\S]*?<\/context_state>/g, "")
     .replace(/\s*\[已折叠历史(?:引用文件|图片) @[^\]]+\]/g, "")
+    .replace(/\s*\[已折叠历史上下文状态 [^\]]+\]/g, "")
     .trim();
   if (stripped) return stripped;
   const paths = [...raw.matchAll(/(?:<attached_file\s+path="([^"]+)"|\[已折叠历史(?:引用文件|图片) @([^\]]+?)(?:\s*\((?:原长|\d+\s*KB)[^\]]*\))?\])/g)].map((m) => `@${(m[1] ?? m[2] ?? "").trim()}`);

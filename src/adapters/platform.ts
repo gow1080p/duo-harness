@@ -3,7 +3,8 @@ import * as fs from "node:fs";
 import { createRequire } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
-import { stripVTControlCharacters } from "node:util";
+import sliceAnsi from "slice-ansi";
+import stringWidth from "string-width";
 
 export function toPosixPath(rawPath: string): string { return rawPath.replace(/\\/g, "/"); }
 export function toPosixRelative(fromDir: string, toTarget: string): string { return toPosixPath(path.relative(fromDir, toTarget)); }
@@ -33,29 +34,33 @@ export function shortenWorkspaceText(raw: string, workspaceRoot?: string): strin
   return res.replace(/^\s*cd\s+(?:"\."|'\.'|\.)\s*(?:&&|;)\s*/, "");
 }
 
+export function sanitizeTerminalText(str: string): string {
+  return Array.from(str)
+    .filter((ch) => {
+      const cp = ch.codePointAt(0);
+      if (cp === undefined) return false;
+      if (cp === 0x09 || cp === 0x0a || cp === 0x0d || cp === 0x1b) return true;
+      if (cp <= 0x1f || cp === 0x7f || (cp >= 0xfff9 && cp <= 0xfffb)) return false;
+      return true;
+    })
+    .join("");
+}
+
 export function getCharVisualWidth(cp: number): number {
-  if (cp <= 0x1f || (cp >= 0x7f && cp <= 0x9f) || (cp >= 0x0300 && cp <= 0x036f) || (cp >= 0x200b && cp <= 0x200f) || (cp >= 0xfe00 && cp <= 0xfe0f)) return 0;
-  if ((cp >= 0x1100 && cp <= 0x115f) || (cp >= 0x2e80 && cp <= 0x303e) || (cp >= 0x3040 && cp <= 0xa4cf) || (cp >= 0xac00 && cp <= 0xd7a3) || (cp >= 0xf900 && cp <= 0xfaff) || (cp >= 0xfe10 && cp <= 0xfe6f) || (cp >= 0xff01 && cp <= 0xff60) || (cp >= 0xffe0 && cp <= 0xffe6) || cp >= 0x1f300) return 2;
-  return 1;
+  if (cp <= 0x1f || (cp >= 0x7f && cp <= 0x9f)) return 0;
+  return stringWidth(String.fromCodePoint(cp));
 }
 
 export function getVisualCols(s: string): number {
-  let w = 0;
-  for (const ch of stripVTControlCharacters(s)) w += getCharVisualWidth(ch.codePointAt(0) ?? 0);
-  return w;
+  return stringWidth(s.replace(/\r/g, ""));
 }
 
 export function truncateCols(str: string, maxCols: number, suffix = ".."): string {
-  const clean = str.replace(/\r/g, "");
-  if (suffix === "..." && getVisualCols(clean) <= maxCols) return clean;
-  const budget = suffix === "..." ? Math.max(1, maxCols - 3) : maxCols;
-  let width = 0, out = "";
-  for (const ch of clean) {
-    const w = getCharVisualWidth(ch.codePointAt(0) ?? 0);
-    if (width + w > budget) return `${out}${suffix}`;
-    out += ch; width += w;
-  }
-  return out;
+  const clean = sanitizeTerminalText(str.replace(/\r/g, ""));
+  if (getVisualCols(clean) <= maxCols) return clean;
+  const sfxCols = getVisualCols(suffix);
+  const budget = Math.max(1, maxCols - sfxCols);
+  return `${sliceAnsi(clean, 0, budget)}${suffix}`;
 }
 
 export function padCols(str: string, targetCols: number, align: "left" | "right" = "left"): string {

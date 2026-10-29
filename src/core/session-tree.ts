@@ -12,9 +12,14 @@ export function buildSessionEntries(
     parentIdOverride !== undefined
       ? parentIdOverride
       : (existingEntries[existingEntries.length - 1]?.id ?? null);
+  let maxSeq = existingEntries.length;
+  for (const entry of existingEntries) {
+    const m = entry.id.match(/^msg_(\d+)$/);
+    if (m) maxSeq = Math.max(maxSeq, Number(m[1]));
+  }
 
   for (let i = 0; i < newMessages.length; i++) {
-    const id = `msg_${existingEntries.length + i + 1}`;
+    const id = `msg_${maxSeq + i + 1}`;
     result.push({ id, parentId: currentParentId, timestamp: baseTimestamp + i, message: newMessages[i]! });
     currentParentId = id;
   }
@@ -30,21 +35,31 @@ export function projectToMessages(entries: readonly SessionEntry[], leafId?: str
     byId.set(entry.id, entry);
   }
   const targetId = leafId ?? entries[entries.length - 1]!.id;
-  let current = byId.get(targetId);
-  if (!current) throw new Error(`找不到指定的会话终点节点: ${targetId}`);
+  let current = byId.get(targetId) ?? entries[entries.length - 1];
+  if (!current) return [];
 
   const chain: Message[] = [];
   const visited = new Set<string>();
+  const brokenChain = { orphan: false };
   while (current) {
     if (visited.has(current.id)) throw new Error(`会话树存在环路死循环，节点 ID: ${current.id}`);
     visited.add(current.id);
     chain.push(current.message);
     if (current.parentId === null) break;
     const parent = byId.get(current.parentId);
-    if (!parent) throw new Error(`节点 ${current.id} 指向了不存在的 parentId: ${current.parentId}`);
+    if (!parent) {
+      brokenChain.orphan = true;
+      break;
+    }
     current = parent;
   }
-  return chain.reverse();
+  const ordered = chain.reverse();
+  if (brokenChain.orphan) {
+    while (ordered.length > 0 && ordered[0]!.role !== "system" && ordered[0]!.role !== "user") ordered.shift();
+    const sysEntry = entries.find((e) => e.message.role === "system");
+    if (ordered[0]?.role !== "system" && sysEntry) ordered.unshift(sysEntry.message);
+  }
+  return ordered;
 }
 
 /** 3. 自动修复因终端中途关闭/Ctrl+C 遗留的未闭合 toolCalls（纯函数） */

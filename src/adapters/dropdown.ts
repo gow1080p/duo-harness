@@ -143,6 +143,12 @@ function handleInactiveRunKey(s: string, key: { name?: string; ctrl?: boolean; m
 
 function insertTextAtCursor(rl: any, text: string, refreshLine: () => void): void {
   const curLine: string = typeof rl.line === "string" ? rl.line : "", curCursor: number = typeof rl.cursor === "number" ? rl.cursor : curLine.length;
+  if (curCursor === curLine.length && /^\/[a-z]+\s*$/i.test(curLine) && text.trimStart().toLowerCase().startsWith(`${curLine.trim().toLowerCase()} `)) {
+    rl.line = text.trimStart();
+    rl.cursor = rl.line.length;
+    refreshLine();
+    return;
+  }
   rl.line = curLine.slice(0, curCursor) + text + curLine.slice(curCursor);
   rl.cursor = curCursor + text.length;
   refreshLine();
@@ -157,6 +163,24 @@ function checkAutoClipboardExpand(rl: any, wsRoot: string, lastFailed: string, r
     return beforeCursor;
   }
   return lastFailed;
+}
+
+function applyChosenDropdownItem(
+  rl: any, chosen: DropdownItem, line: string, keyName: string | undefined, isRightAtEnd: boolean,
+  wsRoot: string, homeBaseDir: string | undefined, activeLeafId: string | null | undefined,
+  refreshLine: () => void, renderMenu: () => void, clearMenu: (cols: number) => void, getPromptCols: () => number,
+): "expanded" | "submit" {
+  const isEnter = keyName === "return" || keyName === "enter";
+  const isExactEnterNoSub = isEnter && line.trim() === chosen.fillText.trim() && buildDropdownItems(chosen.fillText, wsRoot, homeBaseDir, activeLeafId, chosen.fillText.length).length === 0;
+  if ((keyName === "tab" || isRightAtEnd || chosen.expandOnly) && !isExactEnterNoSub) {
+    const exp = tryExpandClipboardInLine(chosen.fillText, chosen.cursorAfter ?? chosen.fillText.length, wsRoot, false);
+    rl.line = exp ? exp.line : chosen.fillText; rl.cursor = exp ? exp.cursor : (chosen.cursorAfter ?? rl.line.length);
+    refreshLine(); renderMenu();
+    return "expanded";
+  }
+  rl.line = chosen.fillText.trim(); rl.cursor = rl.line.length; refreshLine();
+  clearMenu(getPromptCols() + getPromptVisualCols(rl.line));
+  return "submit";
 }
 
 export function attachLiveSlashDropdown(
@@ -205,8 +229,14 @@ export function attachLiveSlashDropdown(
       if (inBracketedPaste) pasteResetTimer = setTimeout(() => { inBracketedPaste = false; }, 150);
       const clean = encodePastedNewlines(s.replace(/\x1b\[20[01]~/g, ""));
       if (!clean) return;
-      if (isActivePrompt() || hooks?.isApprovalActive?.()) { insertTextAtCursor(rl, clean, refreshLine); if (isActivePrompt()) renderMenu(); }
-      else steerBuf += clean;
+      if (isActivePrompt() || hooks?.isApprovalActive?.()) {
+        if (isActivePrompt() && menuShown) {
+          const prevLine = typeof rl.line === "string" ? rl.line : "", prevCursor = typeof rl.cursor === "number" ? rl.cursor : prevLine.length;
+          clearMenu(getPromptCols() + getPromptVisualCols(prevLine.slice(0, prevCursor)));
+        }
+        insertTextAtCursor(rl, clean, refreshLine);
+        if (isActivePrompt()) renderMenu();
+      } else steerBuf += clean;
       return;
     }
     if (!isActivePrompt()) {
@@ -230,13 +260,7 @@ export function attachLiveSlashDropdown(
     const isRightAtEnd = key?.name === "right" && cursor === line.length;
     if (items.length > 0 && (key?.name === "tab" || isRightAtEnd || key?.name === "return" || key?.name === "enter")) {
       const chosen = items[selectedIdx] ?? items[0]!;
-      if (key?.name === "tab" || isRightAtEnd || chosen.expandOnly) {
-        const exp = tryExpandClipboardInLine(chosen.fillText, chosen.cursorAfter ?? chosen.fillText.length, getWorkspaceRoot(), false);
-        rl.line = exp ? exp.line : chosen.fillText; rl.cursor = exp ? exp.cursor : (chosen.cursorAfter ?? rl.line.length);
-        refreshLine(); return renderMenu();
-      }
-      rl.line = chosen.fillText.trim(); rl.cursor = rl.line.length; refreshLine();
-      clearMenu(getPromptCols() + getPromptVisualCols(rl.line));
+      if (applyChosenDropdownItem(rl, chosen, line, key?.name, isRightAtEnd, getWorkspaceRoot(), homeBaseDir, getActiveLeafId?.(), refreshLine, renderMenu, clearMenu, getPromptCols) === "expanded") return;
       return origTtyWrite(s, key);
     }
     if (key?.name === "return" || key?.name === "enter") { clearMenu(getPromptCols() + getPromptVisualCols(line)); return origTtyWrite(s, key); }

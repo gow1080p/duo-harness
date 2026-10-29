@@ -40,6 +40,19 @@ function groupIntoAtomicUnits(messages: readonly Message[], startOffset = 0): In
 const foldCodeArg = (s: unknown, limit: number): unknown => (typeof s === "string" && s.length > limit && !s.startsWith("[已折叠历史") ? `[已折叠历史代码片段 (原长 ${s.length} 字符)]` : s);
 const normRelPath = (p: unknown): string => (typeof p === "string" ? p.replace(/\\/g, "/").replace(/^\.\//, "") : "");
 
+function foldGenericArg(val: unknown, limit: number): unknown {
+  if (typeof val === "string") return val.length > limit && !val.startsWith("[已折叠历史") ? `[已折叠历史文本参数 (原长 ${val.length} 字符)]` : val;
+  if (!val || typeof val !== "object") return val;
+  if (Array.isArray(val)) {
+    if (val.length === 0 || (val.length === 1 && typeof val[0] === "string" && val[0].startsWith("[已折叠历史"))) return val;
+    const len = JSON.stringify(val).length;
+    return len > limit ? [`[已折叠历史数组参数 (原长 ${len} 字符)]`] : val;
+  }
+  if (typeof (val as Record<string, unknown>)._folded === "string" || Object.keys(val).length === 0) return val;
+  const len = JSON.stringify(val).length;
+  return len > limit ? { _folded: `[已折叠历史对象参数 (原长 ${len} 字符)]` } : val;
+}
+
 export function foldSingleMessage(msg: Message, maxToolChars = 200, keepImages = false): Message {
   if (msg.role === "tool") {
     let next = msg.content;
@@ -54,8 +67,10 @@ export function foldSingleMessage(msg: Message, maxToolChars = 200, keepImages =
     }
     return next !== msg.content ? { ...msg, content: next } : msg;
   }
-  if (msg.role === "user" && (msg.content.includes("<attached_file ") || (!keepImages && msg.images && msg.images.length > 0))) {
-    let next = msg.content.replace(/<attached_file path="([^"]+)"[^>]*>[\s\S]*?<\/attached_file>/g, (full, p) => `[已折叠历史引用文件 @${p} (原长 ${full.length} 字符)]`);
+  if (msg.role === "user" && (msg.content.includes("<attached_file ") || msg.content.includes("<context_state") || (!keepImages && msg.images && msg.images.length > 0))) {
+    let next = msg.content
+      .replace(/<attached_file path="([^"]+)"[^>]*>[\s\S]*?<\/attached_file>/g, (full, p) => `[已折叠历史引用文件 @${p} (原长 ${full.length} 字符)]`)
+      .replace(/<context_state\b[^>]*>[\s\S]*?<\/context_state>/g, (full) => `[已折叠历史上下文状态 (原长 ${full.length} 字符)]`);
     if (!keepImages && msg.images?.length) {
       next = `${next}\n${msg.images.map((img) => `[已折叠历史图片 @${img.path} (${Math.max(1, Math.round(img.byteSize / 1024))} KB)]`).join(" ")}`.trim();
       const { images: _imgs, ...rest } = msg;
@@ -67,9 +82,17 @@ export function foldSingleMessage(msg: Message, maxToolChars = 200, keepImages =
     const limit = Math.max(maxToolChars * 4, 800);
     let anyChanged = false;
     const toolCalls = msg.toolCalls.map((tc) => {
-      if (tc.name !== "edit_file" || !tc.arguments) return tc;
+      if (!tc.arguments) return tc;
       let tcChanged = false;
       const args: Record<string, unknown> = { ...tc.arguments };
+      if (tc.name !== "edit_file") {
+        for (const [k, v] of Object.entries(args)) {
+          const f = foldGenericArg(v, limit);
+          if (f !== v) { args[k] = f; tcChanged = true; }
+        }
+        if (tcChanged) anyChanged = true;
+        return tcChanged ? { ...tc, arguments: args } : tc;
+      }
       for (const k of ["oldText", "newText"] as const) {
         const f = foldCodeArg(args[k], limit);
         if (f !== args[k]) { args[k] = f; tcChanged = true; }
@@ -128,24 +151,59 @@ function foldUnitToolsUpTo(head: Message[], units: IndexedUnit[], limitIdx: numb
   return chars;
 }
 
+function recordEvictedUnit(unit: IndexedUnit, readFiles: Set<string>, modFiles: Set<string>, notes: string[]): void {
+  for (const m of unit.msgs) {
+    if (m.role === "user" && m.content.trim() && notes.length < 4) {
+      notes.push(m.content.replace(/<[^>]+>[\s\S]*?<\/[^>]+>/g, "").replace(/\s+/g, " ").trim().slice(0, 60));
+    } else if (m.role === "assistant" && m.toolCalls) {
+      for (const tc of m.toolCalls) {
+        const p = normRelPath(tc.arguments?.path);
+        if (!p) continue;
+        if (tc.name === "read_file") readFiles.add(p);
+        else if (tc.name === "edit_file") modFiles.add(p);
+      }
+    }
+  }
+}
+
 /** KV 缓存友好型裁剪纯函数：纯前缀因果扫描 0..i（含跨轮峰值），超水位时优先折叠历史 edit_file 参数与无关输出，100% 锁死前序缓存 */
 export function compactMessages(messages: readonly Message[], options: CompactorOptions = {}): Message[] {
   const maxTotalChars = options.maxTotalChars ?? 128_000, keepRecentMessages = options.keepRecentMessages ?? 16, maxToolOutputChars = options.maxToolOutputChars ?? 200;
   const headCount = messages[0]?.role === "system" && messages[1]?.role === "user" ? 2 : 1, lastUserIdx = messages.map((m) => m.role).lastIndexOf("user");
   if (messages.length <= headCount + 1) return [...messages];
   const lowWaterMark = Math.floor(maxTotalChars * 0.65), headPrefix = messages.slice(0, headCount), activeUnits: IndexedUnit[] = [];
-  let runningChars = estimateBaseChars(headPrefix);
+  const evictedReads = new Set<string>(), evictedMods = new Set<string>(), evictedNotes: string[] = [];
+  let runningChars = estimateBaseChars(headPrefix), evictedUnits = 0;
   for (const unit of groupIntoAtomicUnits(messages.slice(headCount), headCount)) {
     if (unit.msgs[0]?.role === "user") for (const u of activeUnits) { runningChars -= u.reasonChars ?? 0; u.reasonChars = 0; }
     const reasonChars = unit.msgs.reduce((s, m) => s + (m.role === "assistant" && m.reasoningContent ? m.reasoningContent.length : 0), 0);
     activeUnits.push({ ...unit, msgs: [...unit.msgs], reasonChars });
     runningChars += estimateBaseChars(unit.msgs) + reasonChars;
     if (runningChars <= maxTotalChars) continue;
-    const recentIdx = Math.max(headCount, unit.endIdx + 1 - keepRecentMessages), nearIdx = Math.max(headCount, unit.startIdx), protectedPaths = collectProtectedReadPaths(activeUnits, recentIdx);
-    for (const [lim, prot] of [[recentIdx, protectedPaths], [nearIdx, protectedPaths], [unit.endIdx + 1, undefined]] as const) {
+    const recentIdx = Math.max(headCount, unit.endIdx + 1 - keepRecentMessages), nearIdx = Math.max(headCount, unit.startIdx), lim3 = unit.msgs[0]?.role === "user" ? unit.startIdx : unit.endIdx + 1, protectedPaths = collectProtectedReadPaths(activeUnits, recentIdx);
+    for (const [lim, prot] of [[recentIdx, protectedPaths], [nearIdx, protectedPaths], [lim3, undefined]] as const) {
       if (runningChars > maxTotalChars) runningChars = foldUnitToolsUpTo(headPrefix, activeUnits, lim, maxToolOutputChars, runningChars, lowWaterMark, prot, lastUserIdx);
     }
-    if (runningChars > maxTotalChars) while (activeUnits.length > 1 && runningChars > lowWaterMark && activeUnits[0]!.startIdx < lastUserIdx) { const ev = activeUnits.shift()!; runningChars -= estimateBaseChars(ev.msgs) + (ev.reasonChars ?? 0); }
+    if (runningChars > maxTotalChars) while (activeUnits.length > 1 && runningChars > lowWaterMark && activeUnits[0]!.startIdx < lastUserIdx) {
+      const ev = activeUnits.shift()!;
+      runningChars -= estimateBaseChars(ev.msgs) + (ev.reasonChars ?? 0);
+      evictedUnits++;
+      recordEvictedUnit(ev, evictedReads, evictedMods, evictedNotes);
+    }
   }
-  return [...headPrefix, ...activeUnits.flatMap((u) => u.msgs)];
+  const tailMsgs = activeUnits.flatMap((u) => u.msgs);
+  if (evictedUnits > 0 && (evictedReads.size > 0 || evictedMods.size > 0 || evictedNotes.length > 0)) {
+    const archiveText = `<context_archive evicted_units="${evictedUnits}" read_files="${[...evictedReads].slice(0, 12).join(",")}" modified_files="${[...evictedMods].slice(0, 12).join(",")}">${evictedNotes.length ? ` 早期摘要: ${evictedNotes.join(" | ")}` : ""}</context_archive>`;
+    if (runningChars + archiveText.length <= maxTotalChars) {
+      const headEndsWithUser = headPrefix[headPrefix.length - 1]?.role === "user";
+      const tailStartsWithUser = tailMsgs[0]?.role === "user";
+      if (headEndsWithUser && tailStartsWithUser) {
+        return [...headPrefix, { role: "assistant", content: archiveText }, ...tailMsgs];
+      }
+      if (headEndsWithUser) {
+        return [...headPrefix, { role: "assistant", content: "已归档早期工具步骤上下文。" }, { role: "user", content: archiveText }, ...tailMsgs];
+      }
+    }
+  }
+  return [...headPrefix, ...tailMsgs];
 }
