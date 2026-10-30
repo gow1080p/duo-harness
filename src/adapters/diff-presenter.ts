@@ -35,9 +35,33 @@ export function highlightCodeLine(raw: string): string {
   const expanded = raw.replace(/\t/g, "  ");
   if (/^(?:\/\/|#|--)/.test(expanded.trim())) return `\x1b[90m\x1b[3m${expanded}\x1b[0m`;
   return expanded.replace(
-    /("[^"\\]*(?:\\.[^"\\]*)*"|'[^'\\]*(?:\\.[^'\\]*)*'|`[^`]*`)|\b(package|import|func|type|struct|interface|return|if|else|for|range|switch|case|default|defer|go|var|const|let|export|from|async|await|class|CREATE|TABLE|IF|NOT|EXISTS|INSERT|INTO|VALUES|SELECT|FROM|WHERE|JOIN|ON|UPDATE|SET|ORDER|BY|PRIMARY|KEY)\b/g,
-    (_m, strLit: string | undefined, kw: string | undefined) => (strLit ? `\x1b[32m${strLit}\x1b[0m` : `\x1b[1;35m${kw}\x1b[0m`)
+    /("[^"\\]*(?:\\.[^"\\]*)*"|'[^'\\]*(?:\\.[^'\\]*)*'|`[^`]*`)|(?<![./\w])(package|import|func|type|struct|interface|return|if|else|for|range|switch|case|default|defer|go|var|const|let|export|from|async|await|class|function|def|fn|pub|impl|match|use|mod|trait|enum|CREATE|TABLE|IF|NOT|EXISTS|INSERT|INTO|VALUES|SELECT|FROM|WHERE|JOIN|ON|UPDATE|SET|ORDER|BY|PRIMARY|KEY)(?![./\w])|(?<![./\w])(true|false|null|undefined|nil|None|True|False|\d+(?:\.\d+)?)(?![./\w])/g,
+    (_m, strLit: string | undefined, kw: string | undefined) => (strLit ? `\x1b[32m${strLit}\x1b[0m` : kw ? `\x1b[1;35m${kw}\x1b[0m` : `\x1b[33m${_m}\x1b[0m`)
   );
+}
+
+export function parseFileLineTarget(rawInput: string): { filePath: string; startLine?: number; endLine?: number } {
+  const trimmed = rawInput.trim();
+  const m = trimmed.match(/^(.+?):(\d+)(?:-(\d+))?$/);
+  if (!m) return { filePath: trimmed };
+  const startLine = Math.max(1, Number(m[2]));
+  const endLine = m[3] ? Math.max(startLine, Number(m[3])) : undefined;
+  return { filePath: m[1]!, startLine, ...(endLine !== undefined ? { endLine } : {}) };
+}
+
+export function renderSourceCodeBox(content: string, filePath: string, opts: { startLine?: number; endLine?: number; maxCols?: number } = {}): string {
+  const lines = content.replace(/\r\n/g, "\n").split("\n"), total = lines.length;
+  const maxCols = Math.min(Math.max(64, opts.maxCols ?? (process.stdout.columns ?? 96) - 4), 120);
+  const focus = opts.startLine && !opts.endLine ? opts.startLine : undefined;
+  const sLine = opts.startLine ? (opts.endLine ? Math.min(opts.startLine, total) : Math.max(1, opts.startLine - 15)) : 1;
+  const eLine = opts.endLine ? Math.min(opts.endLine, total) : (opts.startLine ? Math.min(total, opts.startLine + 25) : total);
+  const out = [`\x1b[90m  ╭── 📄 ${shortenWorkspaceText(filePath)} (第 ${sLine}~${eLine} / 共 ${total} 行)${"─".repeat(Math.max(6, maxCols - 32 - filePath.length))}\x1b[0m`];
+  for (let i = sLine; i <= eLine; i++) {
+    const isFocus = focus === i, numStr = String(i).padStart(4), clean = truncateCols((lines[i - 1] ?? "").replace(/\t/g, "  "), maxCols - 12, "...");
+    out.push(isFocus ? `\x1b[1;36m❯ │${numStr} │ \x1b[0m${highlightCodeLine(clean)} \x1b[1;36m◀\x1b[0m` : `\x1b[90m  │${numStr} │ \x1b[0m${highlightCodeLine(clean)}`);
+  }
+  out.push(`\x1b[90m  ╰${"─".repeat(Math.max(24, maxCols - 6))}\x1b[0m`);
+  return out.join("\n");
 }
 
 export function extractCodeOutline(lines: readonly string[]): string[] {

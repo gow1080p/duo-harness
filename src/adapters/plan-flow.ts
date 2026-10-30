@@ -1,7 +1,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { padCols } from "./cost-tracker.js";
-import { openInDefaultApp } from "./platform.js";
+import { runMdpCli } from "./md-preview.js";
+import { editFileInExternalEditor, openInDefaultApp, runTerminalPager } from "./platform.js";
 import { computePlanHash, listManagedProjects, loadProjectMeta, saveProjectMeta } from "./project-store.js";
 import type { SessionController } from "./session-controller.js";
 import { writeFileAtomicSync } from "./store.js";
@@ -14,19 +15,28 @@ export const PLAN_DENY_REASON =
 export const PLAN_MODE_CONTEXT_PROMPT = [
   "当前处于 /plan 只读架构规划模式（严禁修改任何文件或执行有副作用的命令）：",
   "1. 先查证再规划：必须先调用 read_file、grep、list_dir 或只读 run_bash 查清真实目录结构、关联源码与精确行号，严禁凭想象盲猜文件名或接口；",
-  "2. 结构化输出方案：探索完毕后，请输出清晰的 Markdown 实施计划，必须包含：",
+  "2. 直接以 `# <计划标题>` 开头输出纯规划文档（严禁在开头输出“查证完毕”等寒暄导语，严禁在计划中默写整份文件的完整实现源码，全文严格 <= 120 行）：",
   "   - **改动文件清单**：列出每个待新建/修改的文件路径、函数/行号区间及职责；",
-  "   - **关键数据结构与接口**：涉及新状态或核心接口时给出简明类型/JSON 示例；",
-  "   - **分步实施步骤（Plan:）**：按顺序列出带编号的具体落地步骤（1. ... 2. ...）；",
-  "   - **验证方式与待确认项**：给出可一行执行的验证命令；若需求存在关键歧义，在末尾列出 1~2 个简短确认问题。",
+  "   - **关键数据结构与接口**：仅给出核心类型定义、函数签名或 3~15 行 JSON 示例（单个代码块严格 <= 15 行）；",
+  "   - **分步实施步骤（Plan:）**：按顺序列出带编号的具体落地步骤（1. ... 2. ...），遇边界分支直接在步骤中定好合理默认行为，不要在文末附加“待确认项”章节；",
+  "   - **验证方式**：给出可一行执行的构建与端到端验证命令。",
 ].join("\n");
 
+function cleanPlanArtifactText(raw: string): string {
+  const headingMatch = raw.match(/(?:^|\n)(#{1,2}\s+[^\n]+[\s\S]*)$/);
+  const fromHeading = headingMatch && headingMatch[1]!.length >= raw.length * 0.5 ? headingMatch[1]!.trim() : raw.trim();
+  const withoutConfirm = fromHeading
+    .replace(/\n+##+\s*(?:[0-9一二三四五六七八九十]+[.)、:：\s]*)*(?:待确认[^\n]*|确认问题[^\n]*|Open Questions[^\n]*)[\s\S]*$/i, "")
+    .trim();
+  return withoutConfirm.length >= fromHeading.length * 0.5 ? withoutConfirm : fromHeading;
+}
+
 export function savePlanArtifact(ctrl: SessionController, finalAnswer: string, leafId: string | null): { saved: boolean; planPath: string } {
-  const ws = ctrl.getPaths().workspaceRoot, planPath = path.join(ws, ".debug", "plan.md"), trimmed = finalAnswer.trim();
-  if (!trimmed || trimmed.startsWith("[ABORT]")) return { saved: false, planPath };
-  writeFileAtomicSync(planPath, `${trimmed}\n`);
+  const ws = ctrl.getPaths().workspaceRoot, planPath = path.join(ws, ".debug", "plan.md"), cleaned = cleanPlanArtifactText(finalAnswer);
+  if (!cleaned || cleaned.startsWith("[ABORT]")) return { saved: false, planPath };
+  writeFileAtomicSync(planPath, `${cleaned}\n`);
   saveProjectMeta(ctrl.getPaths().metaFile, { lastPlanLeafId: leafId, lastExecutedPlanHash: null });
-  console.log(`📋 [规划方案已保存] .debug/plan.md · 直接输入 /goal 即可按计划执行 (或输入 /open .debug/plan.md 编辑微调)`);
+  console.log(`📋 [规划方案已保存] .debug/plan.md · 直接输入 /goal 即可按计划执行 (或输入 mdp 预览 / 按 Ctrl+G 编辑)`);
   return { saved: true, planPath };
 }
 
@@ -47,11 +57,16 @@ export interface PlanStepItem {
 
 export function extractPlanSteps(planMarkdown: string, touchedFiles: readonly string[] = []): PlanStepItem[] {
   const touchedSet = new Set(touchedFiles.map((f) => f.replace(/^\.\//, "")));
+  const noCode = planMarkdown.replace(/```[\s\S]*?```/g, "");
+  const beforeVerify =
+    noCode.split(/\n+##+\s*(?:[0-9一二三四五六七八九十]+[.)、:：\s]*)*(?:验证方式|测试验证|待确认|确认问题|Open Questions)/i)[0] ?? noCode;
+  const planSecMatch = beforeVerify.match(/(?:^|\n)##+\s*(?:[^\n]*(?:Plan|实施步骤|分步实施|执行步骤|修改步骤)[^\n]*)\n([\s\S]*)$/i);
+  const targetBody = planSecMatch ? planSecMatch[1]! : beforeVerify;
   const items: PlanStepItem[] = [];
-  for (const m of planMarkdown.matchAll(/^(?:\s*(?:###?\s*)?(?:步骤|Step)\s*(\d+)\s*[:：.-]\s*|\s*(\d+)[.)]\s+)(.+)$/gim)) {
+  for (const m of targetBody.matchAll(/^(?:\s*(?:###?\s*)?(?:步骤|Step)\s*(\d+)\s*[:：.-]\s*|\s*(\d+)[.)]\s+)(.+)$/gim)) {
     const rawTitle = (m[3] ?? "").replace(/\*{1,2}|`/g, "").trim();
     if (rawTitle.length < 4 || /^(?:先查证|结构化|改动文件|关键数据|分步实施|验证方式)/.test(rawTitle)) continue;
-    const files = [...(m[3] ?? "").matchAll(/`?([A-Za-z0-9_./-]+\.(?:ts|tsx|js|mjs|go|py|rs|sql|json|html|css|md))`?/g)].map((x) => x[1]!.replace(/^\.\//, ""));
+    const files = [...(m[3] ?? "").matchAll(/`?([A-Za-z0-9_./-]+\.(?:tsx|ts|jsx|mjs|cjs|js|go|py|rs|sql|json|html|css|md))`?/g)].map((x) => x[1]!.replace(/^\.\//, ""));
     const completed = files.length > 0 && files.every((f) => touchedSet.has(f) || [...touchedSet].some((t) => t.endsWith(`/${f}`)));
     items.push({ step: items.length + 1, title: rawTitle.slice(0, 48), targetFiles: [...new Set(files)], completed });
   }
@@ -128,19 +143,39 @@ export function resolveGoalTaskAndContext(rawGoalArg: string, ctrl: SessionContr
 export function handlePlanAndSessionCmd(cmd: string, ctrl: SessionController): boolean {
   const norm = cmd.trim().replace(/\s+/g, " ").toLowerCase();
   const paths = ctrl.getPaths(), ws = paths.workspaceRoot, planPath = path.join(ws, ".debug", "plan.md");
+  if (/^\/?mdp(?:\s|$)/i.test(cmd.trim())) {
+    const restArg = cmd.trim().replace(/^\/?mdp\b/i, "").trim();
+    const res = runMdpCli(restArg ? [restArg] : [], ws);
+    if (!res.ok) console.log(`⚠️ ${res.error}`);
+    else if (res.mode === "md-preview") console.log(`📝 已拉起 Markdown 浏览器预览窗: ${res.resolved} (按 E 编辑 · Ctrl+S/自动保存 · Esc 关闭)`);
+    else if (res.mode === "editor") console.log(`📝 [${res.edited ? "已保存修改" : "未做修改"} (${res.editor ?? "editor"})]: ${res.resolved}`);
+    else console.log(`\n💡 终端预览: ${res.resolved} (加 -f 展开全部代码 | 加 -e 用编辑器修改 | 加 --web 用浏览器预览)`);
+    return true;
+  }
   if (norm === "/export") {
     const outPath = exportSessionToHtml(ctrl);
     console.log(`📄 [会话已导出为独立 HTML]: ${outPath} (可输入 /open .debug/session-export.html 在浏览器打开)`);
     return true;
   }
   if (norm === "/plan" || norm === "/plan view" || norm === "/plan full") {
+    if (!fs.existsSync(planPath)) {
+      console.log("💡 用法: /plan <任务需求> (只读探路并生成 .debug/plan.md 实施计划，确认后输入 /goal 一键执行)");
+      return true;
+    }
     const isFull = norm === "/plan full";
-    console.log(fs.existsSync(planPath) ? `\n📋 [当前规划方案 (.debug/plan.md)${isFull ? " · 已展开完整源码" : ""}]:\n${renderMarkdownDocument(fs.readFileSync(planPath, "utf-8").trim(), { expandCodeBlocks: isFull })}\n\n💡 直接输入 /goal (或 /goal plan) 即可执行 | 输入 /plan full 展开全部代码 | 输入 /plan open 在编辑器修改` : "💡 用法: /plan <任务需求> (只读探路并生成 .debug/plan.md 实施计划，确认后输入 /goal 一键执行)");
+    const rendered = `\n📋 [当前规划方案 (.debug/plan.md)${isFull ? " · 已展开完整源码" : ""}]:\n${renderMarkdownDocument(fs.readFileSync(planPath, "utf-8").trim(), { expandCodeBlocks: isFull })}\n\n💡 直接输入 /goal 即可执行 | 按 Ctrl+G (或输入 /plan edit) 在编辑器修改 | 输入 /plan full 全屏浏览 | 输入 /plan open --web 浏览器预览`;
+    if (isFull && runTerminalPager(rendered, { forcePager: true })) return true;
+    console.log(rendered);
     return true;
   }
-  if (norm === "/plan open") {
-    const res = openInDefaultApp(".debug/plan.md", ws);
-    console.log(res.ok ? `🌐 已打开规划文件: ${res.resolved}` : `⚠️ ${res.error}`);
+  if (norm === "/plan open" || norm === "/plan edit" || norm.startsWith("/plan open ") || norm.startsWith("/plan edit ")) {
+    if (/(?:^|\s)(?:--web|-w)(?=\s|$)/.test(norm)) {
+      const res = openInDefaultApp(".debug/plan.md --web", ws);
+      console.log(res.ok ? `📝 已拉起规划方案浏览器预览窗: ${res.resolved} (按 E 编辑 · Esc 关闭)` : `⚠️ ${res.error}`);
+      return true;
+    }
+    const ed = editFileInExternalEditor(planPath);
+    console.log(ed.ok ? `📝 [${ed.edited ? "已更新规划方案 (检测到手工修订)" : "已查看规划方案 (未做修改)"} (${ed.editor ?? "editor"})]: ${planPath} · 直接输入 /goal 即可按计划执行` : `⚠️ ${ed.error}`);
     return true;
   }
   if (cmd === "/compact") {

@@ -24,7 +24,7 @@ export function formatMarkdownLine(rawLine: string, inCodeBlock: boolean): { tex
       ? { text: "\x1b[90m  ╰────────────────────────\x1b[0m", nextInCodeBlock: false }
       : { text: `\x1b[90m  ╭── ${fenceMatch[1] || "code"} ────────────────\x1b[0m`, nextInCodeBlock: true };
   }
-  if (inCodeBlock) return { text: `\x1b[90m  │ \x1b[0m\x1b[32m${rawLine}\x1b[0m`, nextInCodeBlock: true };
+  if (inCodeBlock) return { text: `\x1b[90m  │ \x1b[0m${highlightCodeLine(rawLine)}\x1b[0m`, nextInCodeBlock: true };
   if (/^\s*(?:---+|\*\*\*+)\s*$/.test(rawLine)) return { text: "\x1b[90m  ────────────────────────────────────────\x1b[0m", nextInCodeBlock: false };
   if (/^\s*\|[\s:|-]+\|\s*$/.test(rawLine)) return { text: "\x1b[90m  ├────────────────────────────────────────┤\x1b[0m", nextInCodeBlock: false };
   if (/^\s*\|.*\|\s*$/.test(rawLine)) {
@@ -155,7 +155,7 @@ export function renderMarkdownDocument(raw: string, opts: { expandCodeBlocks?: b
           out.push(`\x1b[90m  │  ⋮  │ \x1b[36m🔎 核心符号骨架 (共 ${syms.length} 项):\x1b[0m`);
           for (const sl of wrapVisualTokens(syms.join(" · "), maxCols - 14).slice(0, 3)) out.push(`\x1b[90m  │  ⋮  │   \x1b[36m${sl}\x1b[0m`);
         }
-        out.push(`\x1b[90m  │  ⋮  │ ... (已折叠中间 ${total - 8} 行代码 · 输入 /plan full 展开完整代码 | /plan open 编辑器打开)\x1b[0m`);
+        out.push(`\x1b[90m  │  ⋮  │ ... (已折叠中间 ${total - 8} 行代码 · 输入 /plan full 或 mdp -f 展开 | 按 Ctrl+G 编辑器打开)\x1b[0m`);
         for (let k = total - 2; k < total; k++) pushCodeLine(k);
       }
       out.push(`\x1b[90m  ╰${"─".repeat(Math.max(24, maxCols - 6))}\x1b[0m`);

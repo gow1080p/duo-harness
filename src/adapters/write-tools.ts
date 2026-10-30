@@ -33,10 +33,10 @@ const RollbackVersionArgsSchema = z.object({
 });
 
 export interface FileVersionSnapshot {
-  version: number; path: string; beforeContent: string | null; afterContent: string; timestamp: number; turnId?: string; hunkCount?: number;
+  version: number; path: string; beforeContent: string | null; afterContent: string; timestamp: number; turnId?: string; leafId?: string; hunkCount?: number;
 }
 
-export async function rollbackFileSnapshots(workspaceRoot: string, snapshots: FileVersionSnapshot[], stepsBack = 1, onSnapshotChange?: () => void, redoBatches?: FileVersionSnapshot[][]): Promise<{ rolledBackCount: number; currentVersion: number; touchedPaths: string[] }> {
+export function rollbackFileSnapshotsSync(workspaceRoot: string, snapshots: FileVersionSnapshot[], stepsBack = 1, onSnapshotChange?: () => void, redoBatches?: FileVersionSnapshot[][]): { rolledBackCount: number; currentVersion: number; touchedPaths: string[] } {
   const count = Math.min(Math.max(0, stepsBack), snapshots.length), touchedPaths: string[] = [], batch: FileVersionSnapshot[] = [];
   if (count > 0 && redoBatches) redoBatches.push(batch);
   const realRoot = resolveExistingRealPath(workspaceRoot);
@@ -44,7 +44,7 @@ export async function rollbackFileSnapshots(workspaceRoot: string, snapshots: Fi
     const snap = snapshots[snapshots.length - 1]!;
     const fullPath = resolveExistingRealPath(path.resolve(workspaceRoot, expandHomePath(snap.path)));
     if (checkHardDeniedPath(fullPath, realRoot, "write")) throw new Error(`禁止回滚敏感路径: ${snap.path}`);
-    if (snap.beforeContent === null) await fs.rm(fullPath, { force: true });
+    if (snap.beforeContent === null) fsSync.rmSync(fullPath, { force: true });
     else writeFileAtomicSync(fullPath, snap.beforeContent);
     snapshots.pop();
     batch.unshift(snap);
@@ -52,6 +52,10 @@ export async function rollbackFileSnapshots(workspaceRoot: string, snapshots: Fi
     touchedPaths.push(snap.path);
   }
   return { rolledBackCount: count, currentVersion: snapshots.length, touchedPaths };
+}
+
+export async function rollbackFileSnapshots(workspaceRoot: string, snapshots: FileVersionSnapshot[], stepsBack = 1, onSnapshotChange?: () => void, redoBatches?: FileVersionSnapshot[][]): Promise<{ rolledBackCount: number; currentVersion: number; touchedPaths: string[] }> {
+  return rollbackFileSnapshotsSync(workspaceRoot, snapshots, stepsBack, onSnapshotChange, redoBatches);
 }
 
 export function redoFileSnapshots(workspaceRoot: string, snapshots: FileVersionSnapshot[], redoBatches: FileVersionSnapshot[][], batchesToRedo = 1, onSnapshotChange?: () => void) {

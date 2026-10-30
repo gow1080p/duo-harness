@@ -6,16 +6,16 @@ import type { LlmProvider, ToolCall } from "../core/contracts.js";
 import { probeAgyQuota } from "./agy-bridge.js";
 import { runLocalBangCommand } from "./context-mention.js";
 import { padCols } from "./cost-tracker.js";
-import { attachLiveSlashDropdown, getPromptVisualCols, restorePastedNewlines } from "./dropdown.js";
+import { attachLiveSlashDropdown, encodePastedNewlines, getPromptVisualCols, restorePastedNewlines } from "./dropdown.js";
 import { buildPlanContextPrompt, handlePlanAndSessionCmd, PLAN_DENY_REASON, PLAN_MODE_CONTEXT_PROMPT, resolveGoalTaskAndContext, savePlanArtifact, verifyGoalCompletion } from "./plan-flow.js";
-import { openInDefaultApp, resolveDefaultOpenTarget } from "./platform.js";
+import { editBufferInExternalEditor, editFileInExternalEditor, openInDefaultApp, resolveDefaultOpenTarget } from "./platform.js";
 import { createReplCompleter, formatRecentHistoryRecap, listManagedProjects, loadProjectMeta, type ManagedProjectSummary, type ProjectSessionPaths, resolveProjectSessionPaths, saveProjectMeta, SLASH_COMMANDS } from "./project-store.js";
 import { executeReplReviewCommand } from "./reviewer.js";
 import { ensureDefaultModelsConfigFile, listAvailableModelModes, resolveRouteTier } from "./router.js";
 import { createSessionController, type SessionController } from "./session-controller.js";
 import { discoverAvailableSkills, expandSkillSlashCommand } from "./skill-loader.js";
 import { formatApprovalBox } from "./ui-logger.js";
-import { executeVisionSlashCommand, getPasteShortcutLabel } from "./vision-capture.js";
+import { executeVisionSlashCommand, getPasteShortcutLabel, setMacClipboardPromptActive } from "./vision-capture.js";
 import { killTrackedChildren } from "./write-tools.js";
 
 export { buildPlanContextPrompt, createReplCompleter, listManagedProjects, type ManagedProjectSummary, PLAN_MODE_CONTEXT_PROMPT, type ProjectSessionPaths, resolveGoalTaskAndContext, resolveProjectSessionPaths, savePlanArtifact, verifyGoalCompletion };
@@ -85,8 +85,13 @@ export async function handleSlashCommand(rawCmd: string, ctrl: SessionController
     return `请先调用 run_bash 查看 git status 与 git diff，结合改动生成规范中文提交信息（格式：<类型>(<模块>): <中文概述>${note ? `，备注：${note}` : ""}），执行 git add、git commit 并 git push 推送。`;
   }
   if (cmd === "/open" || cmd.startsWith("/open ")) {
-    const ws = ctrl.getPaths().workspaceRoot, res = openInDefaultApp(cmd.slice("/open".length).trim() || resolveDefaultOpenTarget(ws, ctrl.getDiff("all").files.map((f) => f.file)), ws);
-    console.log(res.ok ? `🌐 已调用系统默认应用打开: ${res.resolved}` : `⚠️ ${res.error}`);
+    const ws = ctrl.getPaths().workspaceRoot, rawArg = cmd.slice("/open".length).trim();
+    const res = openInDefaultApp(rawArg || resolveDefaultOpenTarget(ws, ctrl.getDiff("all").files.map((f) => f.file)), ws);
+    if (!res.ok) console.log(`⚠️ ${res.error}`);
+    else if (res.mode === "md-preview") console.log(`📝 已拉起 Markdown 浏览器预览窗: ${res.resolved} (按 E 编辑 · Esc 关闭)`);
+    else if (res.mode === "editor") console.log(`📝 [${res.edited ? "已保存修改" : "未做修改"} (${res.editor ?? "editor"})]: ${res.resolved}`);
+    else if (res.mode === "terminal-preview") console.log(`💡 终端预览: ${res.resolved} (加 -e 用编辑器打开 | 加 --web 用浏览器预览 | 加 --raw 用系统默认应用打开)`);
+    else console.log(`🌐 已调用系统默认应用打开: ${res.resolved}`);
     return true;
   }
   const visionRes = await executeVisionSlashCommand(cmd, ctrl.getPaths().workspaceRoot, ctrl.getDiff("all").files.map((f) => f.file));
@@ -198,12 +203,24 @@ export async function startInteractiveRepl(options: { workspaceRoot?: string; ho
   const detachDropdown = attachLiveSlashDropdown(rl, () => replState.inMainPrompt, () => getPromptVisualCols(formatPrompt(ctrl)), () => ctrl.getPaths().workspaceRoot, options.homeBaseDir, () => ctrl.getLeafId(), {
     isApprovalActive: () => replState.inApprovalPrompt, onAbortRun: () => replState.turnAbort?.abort(),
     onSteerLine: (text) => { replState.steerQueue.push(text); console.log(`\n  💬 [已加入插话队列] 当前工具执行完毕后立即注入：「${text.slice(0, 60)}」`); },
+    onExternalEditor: () => {
+      const ws = ctrl.getPaths().workspaceRoot, planPath = path.join(ws, ".debug", "plan.md"), curLine = restorePastedNewlines(String((rl as any).line ?? ""));
+      if (!curLine.trim() && fs.existsSync(planPath)) {
+        const res = editFileInExternalEditor(planPath);
+        console.log(res.ok ? `\n📝 [已在 ${res.editor ?? "编辑器"} 打开 .debug/plan.md${res.edited ? " (已保存修改)" : ""}] · 修改保存后直接输入 /goal 即可按最新计划执行` : `\n⚠️ ${res.error}`);
+        (rl as any)._refreshLine?.();
+        return;
+      }
+      const res = editBufferInExternalEditor(curLine);
+      if (res.ok) { (rl as any).line = encodePastedNewlines(res.content.trimEnd()); (rl as any).cursor = (rl as any).line.length; }
+      (rl as any)._refreshLine?.();
+    },
   });
   const onTerminateSignal = () => { terminated = true; replState.turnAbort?.abort(); killTrackedChildren(); rl.close(); };
   process.on("SIGHUP", onTerminateSignal); process.on("SIGTERM", onTerminateSignal);
   try {
     while (!terminated) {
-      replState.inMainPrompt = true;
+      replState.inMainPrompt = true; setMacClipboardPromptActive(true);
       let line = "";
       try { process.stdout.write("\n"); line = restorePastedNewlines(await rl.question(formatPrompt(ctrl))).trim(); if (process.stdout.isTTY) process.stdout.write("\x1b]133;C\x07"); } catch (err) {
         if (terminated || (err instanceof Error && (err.name === "AbortError" || err.message.includes("Ctrl+C") || (err as any).code === "ERR_USE_AFTER_CLOSE"))) {
@@ -212,7 +229,7 @@ export async function startInteractiveRepl(options: { workspaceRoot?: string; ho
         }
         throw err;
       }
-      replState.inMainPrompt = false;
+      replState.inMainPrompt = false; setMacClipboardPromptActive(false);
       if (terminated || !line) continue;
       if (line === "exit" || line === "quit" || line === "/exit" || line === "/quit" || line === "/e") { process.stdout.write("👋 已退出 Duo-Harness。\n"); break; }
       saveProjectMeta(ctrl.getPaths().metaFile, { inputHistory: (((rl as any).history as string[]) ?? []).slice(0, 60) });

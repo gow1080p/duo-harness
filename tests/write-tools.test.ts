@@ -964,19 +964,124 @@ describe("Stage 3: 写工具 (edit_file/run_bash/rollback_version)、暂停审�
     expect(secondErrMsg?.content).toContain("[系统防卡死提示：该操作已连续 2 次出现相同报错");
     expect(cSeen[3]?.some((m) => m.role === "user" && m.content.includes("再补充一句总结"))).toBe(true);
 
-    // 7. Markdown 预览与实时编辑服务 (md-preview.ts) 渲染、原子写盘与默认目标解析测试
-    const { createMdPreviewServer, launchMarkdownPreview, openInDefaultApp, resolveDefaultMdTarget, resolveDefaultOpenTarget } = await import("../src/adapters/md-preview.js");
+    // 7. Markdown/代码终端预览、外部编辑器 (Ctrl+G / -e) 与可选浏览器预览 (--web) 测试
+    const { createMdPreviewServer, launchMarkdownPreview, openInDefaultApp, renderMdHtmlFragment, resolveDefaultMdTarget, resolveDefaultOpenTarget, runMdpCli } = await import("../src/adapters/md-preview.js");
+    const { editBufferInExternalEditor } = await import("../src/adapters/platform.js");
+    const { extractPlanSteps, savePlanArtifact } = await import("../src/adapters/plan-flow.js");
+    const { normalizeBashCommandForCwd } = await import("../src/adapters/bash-policy.js");
+    const { buildDropdownItems } = await import("../src/adapters/dropdown.js");
+    const { createSessionController } = await import("../src/adapters/session-controller.js");
+    const { handleSlashCommand } = await import("../src/adapters/repl.js");
     const mdWs = path.join(tmpBase, "md-ws");
     fs.mkdirSync(path.join(mdWs, ".debug"), { recursive: true });
     fs.writeFileSync(path.join(mdWs, "README.md"), "# 初始标题\n\n> [!NOTE]\n> 提示内容\n", "utf-8");
     fs.writeFileSync(path.join(mdWs, "index.html"), "<h1>Home</h1>\n", "utf-8");
+    fs.writeFileSync(path.join(mdWs, "main.go"), "package main\nfunc main() {\n  return\n}\n", "utf-8");
     expect(resolveDefaultMdTarget(mdWs)).toBe(path.join(mdWs, "README.md"));
+    expect(resolveDefaultOpenTarget(mdWs)).toBe(path.join(mdWs, "README.md"));
     fs.writeFileSync(path.join(mdWs, ".debug", "plan.md"), "# 规划草案\n", "utf-8");
     expect(resolveDefaultMdTarget(mdWs)).toBe(path.join(mdWs, ".debug", "plan.md"));
+    expect(resolveDefaultOpenTarget(mdWs)).toBe(path.join(mdWs, ".debug", "plan.md"));
     expect(resolveDefaultOpenTarget(mdWs, ["index.html"])).toBe(path.join(mdWs, "index.html"));
-    expect(openInDefaultApp(".debug/plan.md", mdWs).ok).toBe(true);
+    expect(openInDefaultApp(".debug/plan.md", mdWs)).toMatchObject({ ok: true, mode: "terminal-preview" });
+    expect(openInDefaultApp(".debug/plan.md --web", mdWs)).toMatchObject({ ok: true, mode: "md-preview" });
+    const goPreview = openInDefaultApp("main.go:2", mdWs);
+    expect(goPreview).toMatchObject({ ok: true, resolved: path.join(mdWs, "main.go"), mode: "terminal-preview" });
+    expect(goPreview.rendered).toContain("❯ │   2 │");
     expect(launchMarkdownPreview("non-existent.md", mdWs).ok).toBe(false);
     expect(launchMarkdownPreview("new-note.md", mdWs, { allowCreate: true }).ok).toBe(true);
+    expect(runMdpCli([], mdWs)).toMatchObject({ ok: true, resolved: path.join(mdWs, ".debug", "plan.md"), mode: "terminal-preview" });
+    expect(runMdpCli(["--web"], mdWs)).toMatchObject({ ok: true, resolved: path.join(mdWs, ".debug", "plan.md"), mode: "md-preview" });
+    process.env.DUO_TEST_EDITOR_CONTENT = "# 修订后的规划方案\n";
+    try {
+      const edRes = runMdpCli(["-e"], mdWs);
+      expect(edRes).toMatchObject({ ok: true, mode: "editor", edited: true });
+      expect(fs.readFileSync(path.join(mdWs, ".debug", "plan.md"), "utf-8")).toBe("# 修订后的规划方案\n");
+      const bufRes = editBufferInExternalEditor("原始输入");
+      expect(bufRes).toMatchObject({ ok: true, edited: true, content: "# 修订后的规划方案" });
+    } finally {
+      delete process.env.DUO_TEST_EDITOR_CONTENT;
+    }
+    expect(runMdpCli(["missing.md"], mdWs).ok).toBe(false);
+    expect(runMdpCli(["created-via-cli.md", "--new"], mdWs)).toMatchObject({ ok: true, mode: "md-preview" });
+
+    // 验证 CLI 命令五件套闭环：SLASH_COMMANDS + /m 一级下拉 + /mdp 二级下拉（过滤非 .md 文件） + REPL handleSlashCommand("mdp") 含空格路径
+    const mDropdown = buildDropdownItems("/m", mdWs);
+    expect(mDropdown.map((d) => d.label)).toEqual(expect.arrayContaining(["/model", "/mdp [文件]"]));
+    const mdpSubDropdown = buildDropdownItems("/mdp ", mdWs);
+    expect(mdpSubDropdown.map((d) => d.fillText)).toEqual(expect.arrayContaining(["/mdp -f", "/mdp -e", "/mdp --web", "/mdp README.md"]));
+    expect(mdpSubDropdown.some((d) => d.fillText.includes("main.go") || d.fillText.includes("index.html"))).toBe(false);
+    expect(mdpSubDropdown.find((d) => d.fillText === "/mdp README.md")?.desc).toContain("📝 终端高亮预览 Markdown");
+    const spaceDir = path.join(mdWs, "dir with space");
+    fs.mkdirSync(spaceDir, { recursive: true });
+    fs.writeFileSync(path.join(spaceDir, "guide.md"), "# 空格目录文档\n", "utf-8");
+    const mdpCtrl = createSessionController({ workspaceRoot: mdWs, homeBaseDir: path.join(tmpBase, "mdp-home") });
+    expect(await handleSlashCommand("mdp", mdpCtrl)).toBe(true);
+    expect(await handleSlashCommand(`/mdp "${path.join(spaceDir, "guide.md")}" -f`, mdpCtrl)).toBe(true);
+
+    // 验证 savePlanArtifact 自动剥除带序号的待确认项 + extractPlanSteps 仅提取 Plan 章节与 .tsx 完整后缀
+    savePlanArtifact(
+      mdpCtrl,
+      "查证完毕，以下是计划：\n\n---\n\n# 实施计划\n\n## 1. 关键数据结构\n1. 干扰列表项 A\n\n## 2. Plan:\n1. 修改 `frontend/src/App.tsx` 与 `backend/main.go`\n\n## 3. 验证方式\n1. 运行测试\n\n## 四、待确认事项\n1. 是否需要支持游客上传？",
+      null,
+    );
+    const savedPlan = fs.readFileSync(path.join(mdWs, ".debug", "plan.md"), "utf-8");
+    expect(savedPlan.startsWith("# 实施计划")).toBe(true);
+    expect(savedPlan).not.toContain("查证完毕");
+    expect(savedPlan).not.toContain("待确认事项");
+    const steps = extractPlanSteps(savedPlan, ["frontend/src/App.tsx", "backend/main.go"]);
+    expect(steps).toHaveLength(1);
+    expect(steps[0]?.targetFiles).toEqual(["frontend/src/App.tsx", "backend/main.go"]);
+    expect(steps[0]?.completed).toBe(true);
+
+    // 验证 lsof + kill 各变体统一补齐 -sTCP:LISTEN，且不重复追加、不误改非 kill 管道段的纯查询 lsof
+    expect(normalizeBashCommandForCwd("lsof -ti:8088,5173 | xargs kill -9")).toContain("lsof -nP -ti:8088,5173 -sTCP:LISTEN | xargs kill -9");
+    expect(normalizeBashCommandForCwd("lsof -t -i :8088 | xargs kill")).toContain("lsof -nP -t -i :8088 -sTCP:LISTEN | xargs kill");
+    expect(normalizeBashCommandForCwd("lsof -ti4:8088 | xargs kill")).toContain("lsof -nP -ti4:8088 -sTCP:LISTEN | xargs kill");
+    expect(normalizeBashCommandForCwd("lsof -nP -sTCP:LISTEN -i :8088 | xargs kill")).toBe("lsof -nP -sTCP:LISTEN -i :8088 | xargs kill");
+    expect(normalizeBashCommandForCwd("kill -9 $(lsof -ti:5173)")).toContain("kill -9 $(lsof -nP -ti:5173 -sTCP:LISTEN)");
+    expect(normalizeBashCommandForCwd("kill 41446 && sleep 1 && lsof -nP -i :8088 | wc -l")).toBe("kill 41446 && sleep 1 && lsof -nP -i :8088 | wc -l");
+
+    // 验证复制/粘贴图片防误退会话：Mac Cmd+V 空括号粘贴 (\x1b[200~\x1b[201~) 自动转粘图、输入框非空按 Ctrl+C 仅清空行、空行单次 Ctrl+C 不退出且双击才退出
+    const { PassThrough } = await import("node:stream");
+    const rlPromises = await import("node:readline/promises");
+    const { attachLiveSlashDropdown } = await import("../src/adapters/dropdown.js");
+    const mockPngFile = path.join(mdWs, "mock-clip.png");
+    fs.writeFileSync(mockPngFile, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d]));
+    process.env.DUO_MOCK_CLIPBOARD_IMAGE = mockPngFile;
+    const ttyIn = new PassThrough() as any, ttyOut = new PassThrough() as any;
+    ttyIn.isTTY = true; ttyOut.isTTY = true;
+    let outBuf = "";
+    ttyOut.on("data", (chunk: Buffer) => { outBuf += chunk.toString("utf-8"); });
+    const rl = rlPromises.createInterface({ input: ttyIn, output: ttyOut });
+    const detach = attachLiveSlashDropdown(rl, () => true, () => 4, () => mdWs);
+    try {
+      const qPromise = rl.question("> ");
+      ttyIn.write("\x1b[O");
+      expect((rl as any).line).toBe("");
+      ttyIn.write("\x1b[I\x1b[200~@clipboard \x1b[201~");
+      expect((rl as any).line).toMatch(/^@\.debug\/clipboard-[0-9a-f]{6}\.png $/);
+      const pastedLine = (rl as any).line;
+      ttyIn.write("\x1b[200~\x1b[201~");
+      expect((rl as any).line).toBe(pastedLine);
+      ttyIn.write("\x03");
+      expect((rl as any).line).toBe("");
+      expect((rl as any).closed).toBeFalsy();
+      ttyIn.write("\x03");
+      expect((rl as any).closed).toBeFalsy();
+      expect(outBuf).toContain("再按一次 Ctrl+C 退出");
+      ttyIn.write("\x03");
+      await expect(qPromise).rejects.toThrow(/Aborted with Ctrl\+C|AbortError/);
+    } finally {
+      delete process.env.DUO_MOCK_CLIPBOARD_IMAGE;
+      detach();
+      rl.close();
+    }
+
+    const multiParaAlert = renderMdHtmlFragment("> [!WARNING]\n>\n> 第二段告警\n\n<script>alert(1)</script>");
+    expect(multiParaAlert).toContain("md-alert alert-warning");
+    expect(multiParaAlert).not.toContain("<p></p>");
+    expect(multiParaAlert).not.toContain("<script>");
 
     const previewSrv = await createMdPreviewServer(path.join(mdWs, "README.md"));
     try {
@@ -984,6 +1089,13 @@ describe("Stage 3: 写工具 (edit_file/run_bash/rollback_version)、暂停审�
       expect(docRes.ok).toBe(true);
       expect(docRes.content).toContain("# 初始标题");
       expect(docRes.html).toContain("md-alert alert-note");
+
+      const csrfRes = await fetch(`${previewSrv.url}/api/save`, {
+        method: "POST",
+        headers: { "Content-Type": "text/plain", Origin: "https://evil.example.com" },
+        body: JSON.stringify({ content: "# Hacked" }),
+      });
+      expect(csrfRes.status).toBe(403);
 
       const saveRes = await fetch(`${previewSrv.url}/api/save`, {
         method: "POST",
@@ -993,6 +1105,13 @@ describe("Stage 3: 写工具 (edit_file/run_bash/rollback_version)、暂停审�
       expect(saveRes.ok).toBe(true);
       expect(saveRes.html).toContain("修改后标题");
       expect(fs.readFileSync(path.join(mdWs, "README.md"), "utf-8")).toBe("# 修改后标题\n\n- 条目 1\n");
+
+      const closeRes = await fetch(`${previewSrv.url}/api/close`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      expect(closeRes.status).toBe(200);
     } finally {
       await previewSrv.close();
     }

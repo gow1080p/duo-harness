@@ -24,8 +24,21 @@ function resolveRealOrParent(targetPath: string): string {
   return parent === abs ? abs : path.join(resolveRealOrParent(parent), path.basename(abs));
 }
 
+function normalizeLsofClause(clause: string): string {
+  if (/-sTCP:/i.test(clause)) return clause;
+  const withNp = /(?:^|\s)-[a-zA-Z0-9]*n/.test(clause) ? clause : clause.replace(/^lsof\b/, "lsof -nP");
+  return `${withNp} -sTCP:LISTEN`;
+}
+
 export function normalizeBashCommandForCwd(rawCmd: string, workspaceRoot?: string, execCwd?: string): string {
-  const trimmed = rawCmd.trim().replace(/^\s*cd\s+(?:"\."|'\.'|\.)\s*(?:&&|;)\s*/, "");
+  const lsofPat = "\\blsof\\b(?:\\s+-[a-zA-Z0-9]+)*(?:\\s+-sTCP:[A-Za-z]+)?\\s+-[a-zA-Z0-9]*i(?:[46])?(?:TCP)?(?:\\s*:[0-9,]+|\\s+[0-9,:]+)(?:\\s+-[a-zA-Z0-9:]+)*";
+  const safeLsof = /\bkill\b/.test(rawCmd)
+    ? rawCmd
+        .replace(new RegExp(`(${lsofPat})(?=\\s*\\|[^;&\\n]*\\bkill\\b)`, "g"), (m) => normalizeLsofClause(m))
+        .replace(new RegExp(`\\bkill\\b([^;&|\\n]*?\\$\\(\\s*)(${lsofPat})(\\s*\\))`, "g"), (_m, pre, cmd, post) => `kill${pre}${normalizeLsofClause(cmd)}${post}`)
+        .replace(new RegExp(`\\bkill\\b([^;&|\\n]*?\`\\s*)(${lsofPat})(\\s*\`)`, "g"), (_m, pre, cmd, post) => `kill${pre}${normalizeLsofClause(cmd)}${post}`)
+    : rawCmd;
+  const trimmed = safeLsof.trim().replace(/^\s*cd\s+(?:"\."|'\.'|\.)\s*(?:&&|;)\s*/, "");
   if (!workspaceRoot || !execCwd) return trimmed;
   const m = trimmed.match(/^cd\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))\s*(?:&&|;)\s*([\s\S]+)$/);
   if (!m) return trimmed;
@@ -81,7 +94,7 @@ export function buildDefaultSystemPrompt(workspaceRoot: string): string {
     `- 工具使用纪律（必须严格遵守）：`,
     `  1. 查看目录与文件行数必须直接调用 list_dir（已自带 2 层目录树、代码文件行数及顶层/二级 [已过滤忽略目录] 如 venv/、web-ui/node_modules/），读文件调 read_file（1000 行内直接一次读完，多个文件同轮并发读取），搜索代码调 grep；严禁调用未注册的 glob、find_by_name 或 write_file 工具（找文件只用 list_dir/grep，新建与修改文件统一用 edit_file）；严禁调用 run_bash 执行 node -e、node -p、python -c、cat、find、grep、ls、wc 读取或检查文件内容（run_bash 的 readonly 参数仅对纯查询 shell 命令生效，node -e / python -c 属于脚本执行会触发高危权限弹窗打断用户）；纯问答请直接回答。`,
     `  2. 调用工具时 path 参数请直接传相对于工作区根目录的简短相对路径（如 "."、"README.md"、"src/index.ts"），不要重复拼接长绝对路径。`,
-    `  3. run_bash 默认已在工作区根目录 (${workspaceRoot}) 下启动，严禁在命令开头拼接 cd "${workspaceRoot}" &&；前端/TS 类型检查请统一用只读命令 npx tsc --noEmit（自动免确认放行，勿用会写缓存的 tsc -b）；只读环境检查严禁与写操作或 python -c 混写在同一条 run_bash 中；启动常驻服务（如 uvicorn/vite/npm run dev）必须用后台方式（nohup ... > /tmp/xxx.log 2>&1 </dev/null &）并在同条命令内 sleep 1~2 后检查端口或日志，严禁前台裸跑常驻进程。`,
+    `  3. run_bash 默认已在工作区根目录 (${workspaceRoot}) 下启动，严禁在命令开头拼接 cd "${workspaceRoot}" &&；前端/TS 类型检查请统一用只读命令 npx tsc --noEmit（自动免确认放行，勿用会写缓存的 tsc -b）；只读环境检查严禁与写操作或 python -c 混写在同一条 run_bash 中；清理端口占用必带 -sTCP:LISTEN（如 lsof -nP -tiTCP:8080 -sTCP:LISTEN | xargs kill）；启动常驻服务（如 uvicorn/vite/npm run dev）请直接传 background: true 参数（自动转后台运行并返回 PID 与实时日志路径），严禁前台裸跑常驻进程。`,
     `  4. 修改同一个文件的多处内容时，请使用 edit_file 的 edits 批量数组在单次调用中完成（或同一步并发调用多个 edit_file）；从 0 到 1 初始化或搭建多文件项目（Vibe Coding）时，必须采用「分批小步落盘」：每一步最多新建或修改 1~3 个文件（先写 package.json/基础配置 -> 安装依赖或写核心逻辑 -> 写页面/入口并验证），严禁在单步 tool_calls 中一口气塞入超过 3 个大文件的完整代码；严禁通过 run_bash 调用 sed -i 或脚本改写源码文件。`,
     `  5. 思考过程（reasoning）必须全程使用简明中文，调工具取证阶段思考控制在 100 字以内，聚焦下一步动作；当用户要求“拉起/启动项目”时，第 1~2 步用 list_dir 与 read_file 读齐入口配置（如 README.md、main.py、package.json、vite.config.ts）后立即在下一步直接启动服务，禁止超过 2 步纯探索；宿主终端已内置 /open（一键用系统默认应用/浏览器打开文件）、/shot、/diff、/undo、/redo 命令，严禁调用 run_bash 执行 start、cmd.exe /c start、open 或 xdg-open 打开浏览器/文件，输出本地文件路径时请附上正斜杠完整路径并提示用户输入 /open 打开。`,
     `  6. 安全与隐私沙箱铁律：严禁调用 run_bash 执行 printenv/env 或读取/遍历用户主目录敏感凭据与隐藏配置 (~、~/.config、~/.claude*、~/.codex*、~/.gemini*、~/.ssh；注：已登记在下方 <skills> 索引中的技能目录允许通过 read_file / grep 只读访问) 探测外部配置与密钥；当工作区内未找到所需配置或 API Key 时，必须立即停下直接向用户询问。若用户告知了外部密钥文件路径（如 ~/.gemini/antigravity/.mimo_key 等 .*_key / .env 文件）供当前项目接入，严禁调用 read_file 或 run_bash 读取密钥明文（防密钥暴露于上下文或硬编码进源码），必须直接在项目服务端代码中编写 fs.readFileSync 等运行时读取逻辑；若用户明确要求读取或修改工作区外的普通业务代码目录，请直接调用 read_file / edit_file 由系统弹出跨界提权确认框。`,

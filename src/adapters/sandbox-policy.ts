@@ -260,7 +260,7 @@ export function classifyToolCallRisk(call: ToolCall, workspaceRoot: string, read
     const normalizedCmd = normalizeBashCommandForCwd(String(args.command ?? ""), workspaceRoot, execCwd);
     const res = analyzeBashSandbox(normalizedCmd, workspaceRoot, grants, initialCwdRel);
     if (res.tier === "deny" || res.tier === "ask_escalated") return res;
-    return res.tier === "allow" && args.readonly === false ? { tier: "ask_workspace", externalDirs: [] } : res;
+    return res.tier === "allow" && (args.readonly === false || args.background === true) ? { tier: "ask_workspace", externalDirs: [] } : res;
   }
   if (call.name === "read_file" || call.name === "list_dir" || call.name === "grep" || call.name === "edit_file") {
     const mode = call.name === "edit_file" ? "write" : "read", rawPath = String(args.path ?? "."), home = os.homedir();

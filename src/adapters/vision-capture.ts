@@ -103,12 +103,55 @@ export async function captureHeadlessScreenshot(
   }
 }
 
+let macClipCacheFile = "";
+let macClipFocusFile = "";
+let macTermFocused = true;
+let macPromptActive = true;
+let macFocusWritten: boolean | null = null;
+
+function syncMacClipFocusFile(): void {
+  if (!macClipFocusFile) return;
+  const next = macTermFocused && macPromptActive;
+  if (macFocusWritten === next) return;
+  macFocusWritten = next;
+  try {
+    if (next) fs.writeFileSync(macClipFocusFile, "1");
+    else if (fs.existsSync(macClipFocusFile)) fs.unlinkSync(macClipFocusFile);
+  } catch {}
+}
+
+export function setMacClipboardBridgeFocus(focused: boolean): void {
+  macTermFocused = focused;
+  syncMacClipFocusFile();
+}
+
+export function setMacClipboardPromptActive(active: boolean): void {
+  macPromptActive = active;
+  syncMacClipFocusFile();
+}
+
+export function consumeTerminalFocusSeq(rawSeq: string, code: string | undefined, isActive: boolean): boolean {
+  macPromptActive = isActive;
+  if (rawSeq === "\x1b[I" || rawSeq === "\x1b[O" || code === "[I" || code === "[O") {
+    setMacClipboardBridgeFocus(rawSeq === "\x1b[I" || code === "[I");
+    return true;
+  }
+  if (rawSeq.includes("\x1b[O")) setMacClipboardBridgeFocus(false);
+  else if (rawSeq.includes("\x1b[I") || isActive) setMacClipboardBridgeFocus(true);
+  else syncMacClipFocusFile();
+  return false;
+}
+
+export function isPasteShortcutKey(s: string, key?: { name?: string; ctrl?: boolean; meta?: boolean }): boolean {
+  return Boolean((key?.ctrl && key?.name === "v") || s === "\x16" || (key?.meta && key?.name === "v") || s === "√" || s === "\x1bv");
+}
+
 export function captureClipboardImage(
   workspaceRoot: string,
 ): { ok: boolean; relPath: string; immutableRelPath: string; absPath: string; byteSize: number; error?: string } {
-  const mockPath = process.env.DUO_MOCK_CLIPBOARD_IMAGE?.trim();
-  if (mockPath && fs.existsSync(mockPath)) {
-    const buf = fs.readFileSync(mockPath);
+  const fastPath = process.env.DUO_MOCK_CLIPBOARD_IMAGE?.trim() || (macClipCacheFile && fs.existsSync(macClipCacheFile) ? macClipCacheFile : "");
+  if (fastPath && fs.existsSync(fastPath)) {
+    const buf = fs.readFileSync(fastPath);
     if (!hasPngMagicBytes(buf)) return { ok: false, relPath: "", immutableRelPath: "", absPath: "", byteSize: 0, error: "剪贴板中没有检测到有效的 PNG 图片数据" };
     const saved = persistHashedDebugPng(workspaceRoot, "clipboard", buf);
     return { ok: true, relPath: saved.latestRelPath, immutableRelPath: saved.immutableRelPath, absPath: saved.absPath, byteSize: saved.byteSize };
@@ -168,6 +211,9 @@ export function tryExpandClipboardInLine(
   if (isPasteShortcut) {
     const safeCur = Math.max(0, Math.min(cursor, line.length));
     const before = line.slice(0, safeCur), after = line.slice(safeCur);
+    if (before.trimEnd().endsWith(`@${clip.immutableRelPath}`)) {
+      return { line, cursor: safeCur, pastedRelPath: clip.immutableRelPath, byteSize: clip.byteSize };
+    }
     const prefix = before.length > 0 && !/\s$/.test(before) ? `${before} ` : before;
     const nextLine = `${prefix}${token}${after.startsWith(" ") ? after.slice(1) : after}`;
     return { line: nextLine, cursor: prefix.length + token.length, pastedRelPath: clip.immutableRelPath, byteSize: clip.byteSize };
@@ -177,8 +223,78 @@ export function tryExpandClipboardInLine(
   return { line: nextLine, cursor: prefixLen + token.length, pastedRelPath: clip.immutableRelPath, byteSize: clip.byteSize };
 }
 
+export function tryPasteClipboardToRl(
+  rl: any, wsRoot: string, refreshLine: () => void, renderMenu: () => void, beforeRefresh?: () => void,
+): boolean {
+  const line = typeof rl.line === "string" ? rl.line : "";
+  const cursor = typeof rl.cursor === "number" ? rl.cursor : line.length;
+  const pasted = tryExpandClipboardInLine(line, cursor, wsRoot, true);
+  if (!pasted) return false;
+  beforeRefresh?.();
+  rl.line = pasted.line;
+  rl.cursor = pasted.cursor;
+  refreshLine();
+  renderMenu();
+  return true;
+}
+
+export function checkAutoClipboardExpand(
+  rl: any, wsRoot: string, lastFailed: string, refreshLine: () => void, beforeRefresh?: () => void,
+): string {
+  const curLine = typeof rl.line === "string" ? rl.line : "";
+  const curCursor = typeof rl.cursor === "number" ? rl.cursor : curLine.length;
+  const beforeCursor = curLine.slice(0, curCursor);
+  if (/(?:^|\s)@clipboard\s$/.test(beforeCursor) && beforeCursor !== lastFailed) {
+    const exp = tryExpandClipboardInLine(curLine, curCursor, wsRoot, false);
+    if (exp) {
+      beforeRefresh?.();
+      rl.line = exp.line;
+      rl.cursor = exp.cursor;
+      refreshLine();
+      return "";
+    }
+    return beforeCursor;
+  }
+  return lastFailed;
+}
+
 export function getPasteShortcutLabel(platform: NodeJS.Platform = process.platform): string {
-  return platform === "darwin" ? "Control+V (⌃V) / Option+V (⌥V)" : platform === "win32" ? "Alt+V / Ctrl+V" : "Ctrl+V / Alt+V";
+  return platform === "darwin" ? "Command+V (⌘V) / Control+V (⌃V) / Option+V (⌥V)" : platform === "win32" ? "Alt+V / Ctrl+V" : "Ctrl+V / Alt+V";
+}
+
+export function startMacClipboardImageBridge(): () => void {
+  if (process.platform !== "darwin" || !process.stdin.isTTY || !process.stdout.isTTY || process.env.VITEST) return () => {};
+  const cacheFile = path.join(os.tmpdir(), `duo-clip-cache-${process.pid}.png`);
+  const focusFile = path.join(os.tmpdir(), `duo-clip-focus-${process.pid}.lock`);
+  const aliveFile = path.join(os.tmpdir(), `duo-clip-alive-${process.pid}.lock`);
+  macClipCacheFile = cacheFile;
+  macClipFocusFile = focusFile;
+  macTermFocused = true;
+  macPromptActive = true;
+  macFocusWritten = true;
+  try {
+    fs.writeFileSync(aliveFile, "1");
+    fs.writeFileSync(focusFile, "1");
+  } catch {}
+  const jxa = `ObjC.import("AppKit");ObjC.import("Foundation");ObjC.bindFunction("kill",["int",["int","int"]]);const pb=$.NSPasteboard.generalPasteboard,fm=$.NSFileManager.defaultManager,ws=$.NSWorkspace.sharedWorkspace,ppid=${process.pid},cf=${JSON.stringify(cacheFile)},ff=${JSON.stringify(focusFile)},af=${JSON.stringify(aliveFile)},re=/terminal|iterm|ghostty|warp|kitty|wezterm|alacritty|hyper/i,imgT=$(["public.png","public.tiff"]),richT=$(["public.file-url","public.rtf","public.html","com.adobe.pdf","com.apple.rtfd","com.apple.flat-rtfd"]);let last=-1,hasImg=false,injected=false,cachedPng=null,hasCf=false;while($.kill(ppid,0)===0&&fm.fileExistsAtPath($(af))){try{const cur=pb.changeCount;if(cur!==last){const hasPic=!pb.availableTypeFromArray(imgT).isNil(),hasRich=!pb.availableTypeFromArray(richT).isNil(),td=hasPic&&!hasRich?pb.dataForType($("public.utf8-plain-text")):null,isOur=td&&!td.isNil()&&Number(td.length)===11&&pb.stringForType($("public.utf8-plain-text")).js==="@clipboard ",hasTxt=td&&!td.isNil()&&!isOur;if(!hasPic||hasRich||hasTxt){hasImg=false;injected=false;cachedPng=null;if(hasCf){fm.removeItemAtPathError($(cf),null);hasCf=false;}}else{let png=pb.dataForType($("public.png"));if(png.isNil()){const tiff=pb.dataForType($("public.tiff"));if(!tiff.isNil()){const rep=$.NSBitmapImageRep.imageRepWithData(tiff);if(!rep.isNil())png=rep.representationUsingTypeProperties($.NSBitmapImageFileTypePNG,$({}));}}if(!png.isNil()){png.writeToFileAtomically($(cf),true);hasCf=true;hasImg=true;cachedPng=png;injected=Boolean(isOur);}else{hasImg=false;injected=false;cachedPng=null;if(hasCf){fm.removeItemAtPathError($(cf),null);hasCf=false;}}}last=pb.changeCount;}if(hasImg&&cachedPng){let active=false;if(fm.fileExistsAtPath($(ff))){const app=ws.frontmostApplication,bid=app&&!app.isNil()&&!app.bundleIdentifier.isNil()?app.bundleIdentifier.js:"";active=re.test(bid);}if(active&&!injected){pb.declareTypesOwner($(["public.png","public.utf8-plain-text"]),null);pb.setDataForType(cachedPng,$("public.png"));pb.setStringForType($("@clipboard "),$("public.utf8-plain-text"));injected=true;last=pb.changeCount;}else if(!active&&injected){pb.declareTypesOwner($(["public.png"]),null);pb.setDataForType(cachedPng,$("public.png"));injected=false;last=pb.changeCount;}}}catch(e){}$.NSThread.sleepForTimeInterval(0.06);}if(injected&&cachedPng){try{pb.declareTypesOwner($(["public.png"]),null);pb.setDataForType(cachedPng,$("public.png"));}catch(e){}}if(hasCf)fm.removeItemAtPathError($(cf),null);`;
+  try {
+    const child = spawn("osascript", ["-l", "JavaScript", "-e", jxa], { stdio: "ignore" });
+    child.unref();
+    return () => {
+      macClipCacheFile = "";
+      macClipFocusFile = "";
+      macFocusWritten = null;
+      for (const f of [focusFile, aliveFile, cacheFile]) {
+        try { if (fs.existsSync(f)) fs.unlinkSync(f); } catch {}
+      }
+      setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, 120).unref();
+    };
+  } catch {
+    macClipCacheFile = "";
+    macClipFocusFile = "";
+    macFocusWritten = null;
+    return () => {};
+  }
 }
 
 export async function executeVisionSlashCommand(

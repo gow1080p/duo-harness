@@ -221,4 +221,114 @@ export function discoverOsLsProcess(): { pid: string; token: string; ports: numb
   return { pid, token, ports };
 }
 
+export function runTerminalPager(ansiText: string, opts: { forcePager?: boolean } = {}): boolean {
+  if (!process.stdout.isTTY || process.env.VITEST) return false;
+  const rows = process.stdout.rows || 28;
+  if (!opts.forcePager && ansiText.split("\n").length <= rows - 4) {
+    console.log(ansiText);
+    return true;
+  }
+  const wasRaw = Boolean(process.stdin.isTTY && (process.stdin as any).isRaw);
+  try {
+    process.stdout.write("\x1b[?2004l");
+    if (wasRaw) process.stdin.setRawMode(false);
+    const res = spawnSync("less", ["-FR", "-P?e[已到底部 · 按 q 退出预览]:[按 q 退出预览 · ↑/↓/空格 翻页 · / 搜索]. "], { input: ansiText, encoding: "utf-8", stdio: ["pipe", "inherit", "inherit"] });
+    if (res.error) console.log(ansiText);
+  } finally {
+    if (wasRaw) process.stdin.setRawMode(true);
+    process.stdout.write("\x1b[?2004h");
+  }
+  return true;
+}
+
+function findExecutableInPath(binName: string): string | null {
+  if (path.isAbsolute(binName) && fs.existsSync(binName)) return binName;
+  const dirs = (process.env.PATH ?? "").split(path.delimiter).filter(Boolean);
+  const exts = process.platform === "win32" && !/\.(?:exe|cmd|bat)$/i.test(binName) ? [".cmd", ".exe", ""] : [""];
+  for (const d of dirs) {
+    for (const ext of exts) {
+      const full = path.join(d, `${binName}${ext}`);
+      if (fs.existsSync(full)) return full;
+    }
+  }
+  return null;
+}
+
+export function resolveExternalEditor(): { bin: string; args: string[]; isGui: boolean; label: string } | null {
+  const envRaw = process.env.VISUAL?.trim() || process.env.EDITOR?.trim() || "";
+  if (envRaw) {
+    const tokens = (envRaw.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? [envRaw]).map((t) => t.replace(/^["']|["']$/g, ""));
+    const rawBin = tokens[0] ?? envRaw;
+    const bin = findExecutableInPath(rawBin) ?? rawBin;
+    const label = path.basename(bin).replace(/\.(?:exe|cmd|bat)$/i, "");
+    const isGui = /^(?:code|cursor|windsurf|subl|sublime_text|zed|atom|gedit|notepad\+?)$/i.test(label);
+    return { bin, args: tokens.slice(1), isGui, label };
+  }
+  const candidates = process.platform === "win32" ? ["code", "cursor", "windsurf", "notepad"] : ["code", "cursor", "windsurf", "vim", "vi", "nano"];
+  for (const c of candidates) {
+    const found = findExecutableInPath(c);
+    if (found) {
+      const isGui = /^(?:code|cursor|windsurf|notepad)$/i.test(c);
+      return { bin: found, args: [], isGui, label: c };
+    }
+  }
+  return null;
+}
+
+export function editFileInExternalEditor(filePath: string, opts: { line?: number; wait?: boolean } = {}): { ok: boolean; editor?: string; edited: boolean; content: string; error?: string } {
+  const resolved = path.resolve(expandHomePath(filePath));
+  if (!fs.existsSync(resolved)) return { ok: false, edited: false, content: "", error: `未找到待编辑文件: ${resolved}` };
+  const before = fs.readFileSync(resolved, "utf-8");
+  const ed = resolveExternalEditor();
+  if (process.env.VITEST && !process.env.DUO_TEST_EDITOR_REAL) {
+    if (process.env.DUO_TEST_EDITOR_CONTENT !== undefined) fs.writeFileSync(resolved, process.env.DUO_TEST_EDITOR_CONTENT, "utf-8");
+    const after = fs.readFileSync(resolved, "utf-8");
+    return { ok: true, editor: ed?.label ?? "vim", edited: after !== before, content: after };
+  }
+  if (!ed) return { ok: false, edited: false, content: before, error: "未检测到可用编辑器（请设置 $VISUAL 或 $EDITOR 环境变量）" };
+  const runArgs = [...ed.args];
+  if (ed.isGui) {
+    if (opts.wait && !runArgs.includes("-w") && !runArgs.includes("--wait") && !/notepad/i.test(ed.label)) runArgs.push("--wait");
+    if (opts.line && /^(?:code|cursor|windsurf|subl|zed)$/i.test(ed.label) && !runArgs.includes("-g") && !runArgs.includes("--goto")) runArgs.push("-g", `${resolved}:${opts.line}`);
+    else runArgs.push(resolved);
+  } else {
+    if (opts.line && /^(?:vim|nvim|vi|nano|hx)$/i.test(ed.label)) runArgs.push(`+${opts.line}`, resolved);
+    else runArgs.push(resolved);
+  }
+  const isTty = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+  const wasRaw = Boolean(isTty && (process.stdin as any).isRaw);
+  try {
+    if (isTty) {
+      process.stdout.write("\x1b[?2004l");
+      if (wasRaw) process.stdin.setRawMode(false);
+      if (!ed.isGui) process.stdout.write("\x1b[?1049h\x1b[0m\x1b[?25h\x1b[2J\x1b[H");
+    }
+    const isWinCmd = process.platform === "win32" && /\.(?:cmd|bat)$/i.test(ed.bin);
+    const child = isWinCmd
+      ? spawnSync(process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", `"${ed.bin}" ${runArgs.map((a) => `"${a.replace(/"/g, '""')}"`).join(" ")}`], { stdio: "inherit", windowsVerbatimArguments: true, windowsHide: false })
+      : spawnSync(ed.bin, runArgs, { stdio: "inherit", windowsHide: false });
+    if (child.error) return { ok: false, editor: ed.label, edited: false, content: before, error: child.error.message };
+    const after = fs.existsSync(resolved) ? fs.readFileSync(resolved, "utf-8") : before;
+    return { ok: true, editor: ed.label, edited: after !== before, content: after };
+  } finally {
+    if (isTty) {
+      if (!ed.isGui) process.stdout.write("\x1b[?1049l");
+      if (wasRaw) process.stdin.setRawMode(true);
+      process.stdout.write("\x1b[?2004h");
+    }
+  }
+}
+
+export function editBufferInExternalEditor(initialText: string): { ok: boolean; editor?: string; edited: boolean; content: string; error?: string } {
+  const tmpFile = path.join(os.tmpdir(), `duo-prompt-${Date.now()}-${process.pid}.md`);
+  fs.writeFileSync(tmpFile, initialText, "utf-8");
+  try {
+    const res = editFileInExternalEditor(tmpFile, { wait: true });
+    const clean = !initialText.endsWith("\n") && res.content.endsWith("\n") && !res.content.endsWith("\n\n") ? res.content.slice(0, -1) : res.content;
+    return { ...res, edited: clean !== initialText, content: clean };
+  } finally {
+    try { if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile); } catch {}
+  }
+}
+
 export { type MdPreviewLaunchResult, launchMarkdownPreview, openInDefaultApp, resolveDefaultMdTarget, resolveDefaultOpenTarget } from "./md-preview.js";

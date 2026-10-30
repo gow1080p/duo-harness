@@ -16,6 +16,7 @@ export { buildDefaultSystemPrompt, isReadonlyBashCommand };
 export interface ApprovalRequestMeta { hasEscalated: boolean; hasWrite?: boolean; escalatedReasons: string[]; externalDirs: string[]; }
 export interface AfterToolCallDecision { terminate?: boolean; finalAnswer?: string; details?: unknown; }
 
+export interface ApprovalDecision { approved: boolean; reason?: string; trustDirectory?: boolean; updatedCalls?: ToolCall[]; }
 export interface RunSessionOptions {
   provider?: LlmProvider; model?: ModelMode; modelsConfigPath?: string;
   tools?: (ToolContract<any> | AdapterToolContract<any>)[]; extraTools?: (ToolContract<any> | AdapterToolContract<any>)[];
@@ -23,7 +24,7 @@ export interface RunSessionOptions {
   workspaceRoot?: string; snapshots?: FileVersionSnapshot[]; redoBatches?: FileVersionSnapshot[][]; sandboxGrants?: SandboxGrants; compactor?: CompactorOptions;
   maxSteps?: number; systemPrompt?: string; contextPrompt?: string; sessionFile?: string; replayFromFile?: string; wireLogFile?: string;
   showCostReport?: boolean; suppressFinalEcho?: boolean; leafId?: string; userImages?: ImageAttachment[];
-  onApprovalRequest?: (toolCalls: ToolCall[], meta?: ApprovalRequestMeta) => Promise<{ approved: boolean; reason?: string; trustDirectory?: boolean }> | { approved: boolean; reason?: string; trustDirectory?: boolean };
+  onApprovalRequest?: (toolCalls: ToolCall[], meta?: ApprovalRequestMeta) => Promise<ApprovalDecision> | ApprovalDecision;
   onAfterToolCall?: (call: ToolCall, result: AdapterToolResultMessage) => Promise<AfterToolCallDecision | void> | AfterToolCallDecision | void;
   verifyCompletion?: (finalAnswer: string) => Promise<{ ok: boolean; errorOutput?: string }> | { ok: boolean; errorOutput?: string };
   onStepEvent?: (event: { phase: string; step: number; detail?: string; toolCalls?: ToolCall[]; toolResults?: AdapterToolResultMessage[] }) => void;
@@ -120,12 +121,26 @@ async function runSingleEffectStep(
       return stepAgentLoop(state, { type: "APPROVAL_RESOLVED", approved: false, reason: denyText });
     }
     const targetCalls = risk.callsNeedingApproval.length > 0 ? risk.callsNeedingApproval : effect.toolCalls;
-    const decision = options.onApprovalRequest
+    const decision: ApprovalDecision = options.onApprovalRequest
       ? await options.onApprovalRequest(targetCalls, { hasEscalated: risk.hasEscalated, hasWrite: risk.hasWrite, escalatedReasons: risk.escalatedReasons, externalDirs: risk.externalDirs })
       : { approved: false, reason: "未配置审批回调，默认拒绝写或跨界操作" };
-    const trustedDirs = decision.approved ? grantApprovedCalls(effect.toolCalls, wsRoot, readonlyMap, grants, Boolean(decision.trustDirectory)) : [];
+    let effectiveCalls = effect.toolCalls;
+    if (decision.approved && decision.updatedCalls?.length) {
+      const patchById = new Map(decision.updatedCalls.map((c) => [c.id, c]));
+      effectiveCalls = effect.toolCalls.map((c) => patchById.get(c.id) ?? c);
+      const recheck = evaluateBatchCallsRisk(effectiveCalls, wsRoot, readonlyMap, grants);
+      if (recheck.hasDenied) {
+        return stepAgentLoop(state, { type: "APPROVAL_RESOLVED", approved: false, reason: `[沙箱安全拦截] 审批改参触发安全红线: ${recheck.deniedReasons.join("；")}` });
+      }
+    }
+    const trustedDirs = decision.approved ? grantApprovedCalls(effectiveCalls, wsRoot, readonlyMap, grants, Boolean(decision.trustDirectory)) : [];
     log(decision.approved ? (trustedDirs.length > 0 ? `  🟢 已授权并信任外部目录: ${trustedDirs.join(", ")}` : `  🟢 已确认允许执行`) : `  🔴 已拒绝执行: ${decision.reason}`);
-    const resolved = stepAgentLoop(state, { type: "APPROVAL_RESOLVED", approved: decision.approved, reason: decision.reason });
+    let resolved = stepAgentLoop(state, { type: "APPROVAL_RESOLVED", approved: decision.approved, reason: decision.reason });
+    if (decision.approved && effectiveCalls !== effect.toolCalls && resolved.effect.type === "EXECUTE_TOOLS") {
+      const msgs = [...resolved.state.messages], lastIdx = msgs.length - 1, last = msgs[lastIdx];
+      if (last?.role === "assistant") msgs[lastIdx] = { ...last, toolCalls: effectiveCalls };
+      resolved = { state: { ...resolved.state, messages: msgs }, effect: { ...resolved.effect, toolCalls: effectiveCalls } };
+    }
     if (options.signal?.aborted) {
       const abortReason = decision.reason ?? "用户按 Ctrl+C 中断了本轮操作";
       return { state: { ...resolved.state, phase: "error", error: abortReason }, effect: { type: "ABORT", reason: abortReason } };
