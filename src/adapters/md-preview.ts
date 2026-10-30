@@ -26,7 +26,7 @@ export function resolveDefaultOpenTarget(workspaceRoot: string, recentPaths: rea
   const planFile = path.join(workspaceRoot, ".debug", "plan.md");
   if (fs.existsSync(planFile)) return planFile;
   try {
-    const entries = fs.readdirSync(workspaceRoot, { withFileTypes: true }).filter((e) => e.isFile() && !e.name.startsWith("."));
+    const entries = fs.readdirSync(workspaceRoot, { withFileTypes: true }).filter((e) => e.isFile() && !e.name.startsWith(".")).sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
     const preferred = entries.find((e) => /\.(?:html?|svg|pdf|md)$/i.test(e.name)) ?? entries[0];
     if (preferred) return path.join(workspaceRoot, preferred.name);
   } catch {}
