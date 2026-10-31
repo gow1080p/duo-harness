@@ -34,3 +34,48 @@ bash scripts/setup-mac-gemini-proxy.sh </dev/null
 2. 从 `ubuntu@111.231.65.25:~/.gemini-mac-sync/` 拉取已授权的 `antigravity-gow1080p@gmail.com.json` 并下载对应 Mac 芯片架构的 `CLIProxyAPI`；
 3. 自动检测 Mac 本机 Clash 监听端口（`7897` / `7890` 等），清理腾讯云上 Windows 残留的 `:8317` 端口占用，并注册为 macOS `LaunchAgent`（`~/Library/LaunchAgents/cn.gow1080p.gemini-proxy.plist`）实现开机自启与断线 3 秒自愈；
 4. 自动执行 `curl https://gemini.gow1080p.cn/v1/models` 验证端到端连通性。
+
+
+---
+
+## 3. Key 分类、过期刷新规则与运维命令速查表（供 Mac 端 AI 随时调用）
+
+### 3.1 Key 分类与权限矩阵
+
+| Key 名称 | Key 字符串 | 适用对象 | 有效期规则 | 单次请求体积上限 | 腾讯云 Nginx 路由分支 |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **主人永久 Key** | `sk-gow-master-999` | 本人自用（`duo-harness` / VS Code `Kilo Code`） | **永久有效** | **`20 MB`** | 识别后通过内部 `418 -> @master_proxy` 放行大体积多图请求 |
+| **朋友临时 Key** | `sk-gow-friends-888` | 分享给朋友免梯子直连使用 | **默认 4 天自动过期**（当前到期时间：`2026-11-04 14:18:22 CST`） | **`4 MB`**（超出直接由腾讯云边缘返回 `413` 拦截，不消耗本机 Clash 流量） | 默认 `location /` 分支，受 `/etc/nginx/conf.d/gemini-keys.conf` 中 `# AUTO-EXPIRE-TARGET` 控制 |
+
+### 3.2 常用 Key 管理命令（在 Mac 上直接通过 `ssh ubuntu@111.231.65.25` 执行）
+
+1. **查询朋友 Key (`sk-gow-friends-888`) 当前状态与到期时间**：
+   ```bash
+   ssh ubuntu@111.231.65.25 "cat /etc/nginx/conf.d/gemini-keys.conf; echo '--- 到期时间戳 ---'; TZ=Asia/Shanghai date -d @\$(cat /etc/nginx/gemini-key-expire.ts) '+%Y-%m-%d %H:%M:%S CST'"
+   ```
+2. **重新激活朋友 Key 或刷新/延长有效期为 `N` 天（例如续期 4 天或 7 天）**：
+   ```bash
+   # 将 4 替换为任意天数（如 7 代表从现在起往后顺延 7 天自动过期）
+   ssh ubuntu@111.231.65.25 "sudo /usr/local/bin/gemini-key-ttl 4"
+   ```
+3. **立即手动停用朋友 Key（不影响主人 `sk-gow-master-999`）**：
+   ```bash
+   ssh ubuntu@111.231.65.25 "sudo sed -i 's|.*# AUTO-EXPIRE-TARGET|    # EXPIRED \"sk-gow-friends-888\" 0; # AUTO-EXPIRE-TARGET|' /etc/nginx/conf.d/gemini-keys.conf && sudo rm -f /etc/cron.d/gemini-key-expiry && sudo nginx -t && sudo systemctl reload nginx"
+   ```
+4. **更换朋友 Key 的字符串（例如改成新的 `sk-gow-friends-666`）**：
+   - 修改腾讯云 `/etc/nginx/conf.d/gemini-keys.conf` 与 `/usr/local/bin/gemini-key-ttl` 中的 `sk-gow-friends-888`，然后执行 `sudo /usr/local/bin/gemini-key-ttl 4` 即可（无需重启 Mac 端隧道，因为腾讯云 Nginx 会自动将通过验签的请求统一转为后端 `CLIProxyAPI` 内部识别的凭证头）。
+
+### 3.3 Mac 本机常驻守护服务运维命令
+
+- **安装目录**：`~/.gemini/antigravity/scratch/gemini-proxy`
+- **Google 车位 OAuth 自动刷新机制**：`cli-proxy-api` 内置每 **15 分钟**自动刷新一次 `auth-data/antigravity-gow1080p@gmail.com.json` Token，每 **3 小时**自动同步最新 Antigravity 客户端版本号，全程无需人工干预。
+- **查看 Mac 本机反代与隧道运行状态/日志**：
+  ```bash
+  ps aux | grep -E "cli-proxy-api|8317" | grep -v grep
+  tail -n 20 ~/.gemini/antigravity/scratch/gemini-proxy/cpa.out.log
+  ```
+- **重启 Mac 本机常驻守护服务**：
+  ```bash
+  launchctl unload ~/Library/LaunchAgents/cn.gow1080p.gemini-proxy.plist
+  launchctl load -w ~/Library/LaunchAgents/cn.gow1080p.gemini-proxy.plist
+  ```
