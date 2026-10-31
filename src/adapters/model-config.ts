@@ -64,6 +64,7 @@ export function loadModelRegistryConfig(workspaceRoot = process.cwd(), customCon
   const openaiKey = loadApiKey("OPENAI_API_KEY", ".openai_key");
   const mimoKey = loadApiKey("MIMO_API_KEY", ".mimo_key");
   const deepseekKey = loadApiKey("DEEPSEEK_API_KEY", ".deepseek_key");
+  const agyKey = loadApiKey("AGY_API_KEY", ".agy_key");
   const isTokenPlan = mimoKey.startsWith("tp-") || mimoKey.startsWith("ttp-");
   const builtinModels: Record<string, ModelEndpointConfig> = {
     deepseek: {
@@ -94,10 +95,11 @@ export function loadModelRegistryConfig(workspaceRoot = process.cwd(), customCon
       supportsVision: true,
     },
     agy: {
-      protocol: "agy",
-      baseUrl: "agy://local-language-server",
-      model: "gemini-4-argon-agy",
-      apiKey: "local-agy",
+      protocol: "openai",
+      baseUrl: (process.env.AGY_BASE_URL?.trim() || "https://gemini.gow1080p.cn/v1").replace(/\/$/, ""),
+      model: process.env.AGY_MODEL?.trim() || "gemini-4-argon-high",
+      apiKey: agyKey,
+      apiKeyEnv: "AGY_API_KEY",
       label: "Argon·反重力",
       supportsVision: true,
     },
@@ -110,7 +112,7 @@ export function loadModelRegistryConfig(workspaceRoot = process.cwd(), customCon
   for (const src of [globalCfg.models, wsCfg.models]) {
     if (!src || typeof src !== "object") continue;
     for (const [k, v] of Object.entries(src)) {
-      if (!v || typeof v !== "object") continue;
+      if (!v || typeof v !== "object" || (k === "agy" && v.baseUrl === "agy://local-language-server")) continue;
       const next = { ...mergedModels[k], ...v };
       if (typeof next.baseUrl === "string" && typeof next.model === "string") mergedModels[k] = next;
     }

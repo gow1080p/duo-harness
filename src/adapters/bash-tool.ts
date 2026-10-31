@@ -7,28 +7,13 @@ import { z } from "zod";
 import type { ToolContract } from "../core/contracts.js";
 import { isPathInside, killProcessGroup, resolvePosixShell, toPosixPath } from "./platform.js";
 import { normalizeBashCommandForCwd } from "./bash-policy.js";
+import { createBackgroundDetachController, killTrackedChildren, recordBackgroundTaskExit, registerBackgroundTask, replacePreviousBgTask, trackChildPid, untrackChildPid } from "./bg-process.js";
 import { analyzeBashSandbox, isSystemEscalatedCommand, resolveExistingRealPath, resolveSafePath } from "./sandbox-policy.js";
 import type { SandboxGrants } from "./tools.js";
 import { isReadonlyBashCommand } from "./ui-logger.js";
 
-export { killProcessGroup };
+export { killProcessGroup, killTrackedChildren };
 export type SandboxMode = "readonly" | "workspace_write" | "unrestricted";
-
-const trackedChildPids = new Set<number>();
-const activeBgPids = new Map<string, number>();
-let exitHookRegistered = false;
-
-export function killTrackedChildren(): void {
-  for (const pid of trackedChildPids) killProcessGroup(pid);
-  trackedChildPids.clear(); activeBgPids.clear();
-}
-
-function trackChildPid(pid: number | undefined, bgKey?: string): void {
-  if (!pid) return;
-  if (bgKey) activeBgPids.set(bgKey, pid);
-  trackedChildPids.add(pid);
-  if (!exitHookRegistered) { exitHookRegistered = true; process.once("exit", killTrackedChildren); }
-}
 
 const SEATBELT_DENY_READ_CLAUSE = '(deny file-read* (regex #"^/Users/[^/]+/\\.(ssh|aws|gnupg|claude|codex|gemini|continue|config|kube|docker|netrc|git-credentials|npmrc|pypirc|env)"))';
 const SEATBELT_WORKSPACE_DENY_READ_CLAUSE = '(deny file-read* (regex #"^/Users/[^/]+/\\.(ssh|aws|gnupg|claude|codex|gemini|continue|kube|netrc|git-credentials|env)"))';
@@ -68,9 +53,7 @@ function formatBashOutputWithSpill(rawText: string): string {
 }
 
 function resolveSandboxSpawn(command: string, mode: boolean | SandboxMode, workspaceRoot: string, grants?: SandboxGrants, bgCwd?: string) {
-  const bgKey = bgCwd ? `${resolveExistingRealPath(bgCwd).toLowerCase()}::${command.trim()}` : undefined;
-  const prevBg = bgKey ? activeBgPids.get(bgKey) : undefined;
-  if (bgKey && prevBg) { killProcessGroup(prevBg); trackedChildPids.delete(prevBg); activeBgPids.delete(bgKey); }
+  const bgKey = bgCwd ? replacePreviousBgTask(bgCwd, command) : undefined;
   const { bin: shellBin, env: shellEnv } = resolvePosixShell();
   const sandboxMode: SandboxMode = typeof mode === "boolean" ? (mode ? "readonly" : "workspace_write") : mode;
   const canSeatbelt = process.platform === "darwin" && fsSync.existsSync("/usr/bin/sandbox-exec") && sandboxMode !== "unrestricted";
@@ -93,37 +76,6 @@ function finalizeBashOutput(rawText: string, canSeatbelt: boolean, exitCode: num
   return text || "(无输出)";
 }
 
-const BG_READY_RE = /(?:https?:\/\/\S+|localhost:\d+|127\.0\.0\.1:\d+|0\.0\.0\.0:\d+|port[=:\s]+\d+|\blistening\b|\bready\b|\bstarted\b|已启动|监听)/i;
-
-function createBackgroundDetachController(
-  isBg: boolean, explicitWaitMs: number | undefined, getCombined: () => string, onDetach: () => void,
-): { onChunk: () => void; clear: () => void } {
-  if (!isBg) return { onChunk: () => {}, clear: () => {} };
-  let mainTimer: ReturnType<typeof setTimeout> | undefined, quietTimer: ReturnType<typeof setTimeout> | undefined, extended = false;
-  const clear = () => { if (mainTimer) clearTimeout(mainTimer); if (quietTimer) clearTimeout(quietTimer); };
-  const trigger = () => { clear(); onDetach(); };
-  mainTimer = setTimeout(() => {
-    const cur = getCombined().trim();
-    if (explicitWaitMs === undefined && !BG_READY_RE.test(cur) && /^(?:> [^\n]*\n?|\s)*$/.test(cur)) {
-      extended = true;
-      mainTimer = setTimeout(trigger, 2_000);
-      return;
-    }
-    trigger();
-  }, explicitWaitMs ?? 1_500);
-  return {
-    onChunk() {
-      if (explicitWaitMs !== undefined) return;
-      const cur = getCombined().trim();
-      if (BG_READY_RE.test(cur) || (extended && cur && !/^(?:> [^\n]*\n?|\s)*$/.test(cur))) {
-        if (quietTimer) clearTimeout(quietTimer);
-        quietTimer = setTimeout(trigger, 150);
-      }
-    },
-    clear,
-  };
-}
-
 export function runCommandInSandbox(
   command: string, cwd: string, timeoutMs = 10_000, signal?: AbortSignal, mode: boolean | SandboxMode = false,
   workspaceRoot = cwd, grants?: SandboxGrants, options?: { background?: boolean; startupWaitMs?: number },
@@ -134,9 +86,10 @@ export function runCommandInSandbox(
     const child = spawn(spawnBin, spawnArgs, {
       cwd, env: shellEnv, detached: process.platform !== "win32", windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
     });
-    trackChildPid(child.pid, bgKey);
     const bgLogPath = isBg ? toPosixPath(path.join(resolveExistingRealPath(os.tmpdir()), `duo-bash-bg-${child.pid ?? 0}-${randomBytes(4).toString("hex")}.log`)) : "";
     if (bgLogPath) { try { fsSync.writeFileSync(bgLogPath, "", "utf-8"); } catch {} }
+    if (isBg && bgKey) registerBackgroundTask(child.pid, { bgKey, command: command.trim(), cwd, workspaceRoot, logPath: bgLogPath });
+    else trackChildPid(child.pid);
 
     const decoder = new TextDecoder("utf-8");
     let combined = "", bgBytes = 0, settled = false, cleaned = false, detachedBg = false;
@@ -147,7 +100,7 @@ export function runCommandInSandbox(
       if (timer) clearTimeout(timer);
       child.unref(); (child.stdout as any)?.unref?.(); (child.stderr as any)?.unref?.();
       const initText = combined.trim() || "(服务已在后台启动，尚无首屏输出)";
-      resolve({ exitCode: 0, output: `[后台服务已启动: PID=${child.pid} | 实时日志: ${bgLogPath} (可用 read_file 查看)]\n${initText}` });
+      resolve({ exitCode: 0, output: `[后台服务已启动: PID=${child.pid} | 实时日志: ${bgLogPath} (可用 read_file 或 /ps 查看)]\n${initText}` });
     });
     const appendChunk = (chunk: Buffer) => {
       const text = decoder.decode(chunk, { stream: true });
@@ -163,10 +116,11 @@ export function runCommandInSandbox(
     child.stdout.on("data", appendChunk);
     child.stderr.on("data", appendChunk);
 
-    const cleanupProcess = () => {
+    const cleanupProcess = (exitCode = 0) => {
       if (cleaned) return;
       cleaned = true;
-      if (child.pid) { trackedChildPids.delete(child.pid); if (bgKey && activeBgPids.get(bgKey) === child.pid) activeBgPids.delete(bgKey); }
+      if (isBg) recordBackgroundTaskExit(child.pid, exitCode);
+      else untrackChildPid(child.pid);
       bgCtrl.clear();
       for (const t of [timer, exitTimer]) if (t) clearTimeout(t);
       signal?.removeEventListener("abort", onAbort);
@@ -174,10 +128,10 @@ export function runCommandInSandbox(
     };
     const onAbort = () => { killProcessGroup(child.pid); finish(130, "[收到取消信号已终止进程组]\n"); };
     const finish = (exitCode: number, prefix = "") => {
-      if (settled) { cleanupProcess(); return; }
+      if (settled) { cleanupProcess(exitCode); return; }
       settled = true;
       combined += decoder.decode();
-      cleanupProcess();
+      cleanupProcess(exitCode);
       resolve({ exitCode, output: finalizeBashOutput(prefix + combined, canSeatbelt, exitCode, sandboxMode) });
     };
 

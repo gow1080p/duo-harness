@@ -15,6 +15,10 @@ export interface SkillMeta {
 
 const skillsCache = new Map<string, { ts: number; items: SkillMeta[] }>();
 
+export function invalidateSkillsCache(): void {
+  skillsCache.clear();
+}
+
 function parseSkillFrontmatter(raw: string, fallbackName: string, isCommand = false): { name: string; description: string; argumentHint?: string } {
   const match = raw.match(/^---\r?\n([\s\S]*?)\r?\n---/);
   const body = match ? raw.slice(match[0].length).trim() : raw.trim();
@@ -100,7 +104,7 @@ function collectCommandMdFiles(rootDir: string, maxDepth = 2): Array<{ file: str
 
 export function discoverAvailableSkills(workspaceRoot: string, homeDir = os.homedir()): SkillMeta[] {
   const cacheKey = `${path.resolve(workspaceRoot)}::${path.resolve(homeDir)}`, now = Date.now(), cached = skillsCache.get(cacheKey);
-  if (cached && now - cached.ts < 3_000) return cached.items;
+  if (cached && now - cached.ts < 30_000) return cached.items;
   const wsSkillRoots = [path.join(workspaceRoot, "skills"), path.join(workspaceRoot, ".agents", "skills"), path.join(workspaceRoot, ".duo-harness", "skills")];
   const globalSkillRoots = getBuiltinReadonlySkillRoots(homeDir);
   const wsCmdRoots = [path.join(workspaceRoot, ".claude", "commands"), path.join(workspaceRoot, ".duo-harness", "commands"), path.join(workspaceRoot, ".pi", "prompts")];

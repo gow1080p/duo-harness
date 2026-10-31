@@ -6,8 +6,10 @@ import { z } from "zod";
 import type { ImageAttachment, ToolCall, ToolContract, ToolExecuteOutput, ToolResultMessage } from "../core/contracts.js";
 import { toPosixRelative } from "./platform.js";
 import { resolveSafePath, type SandboxGrants } from "./sandbox-policy.js";
+import { createSubagentTool, type SubagentRuntimeContext } from "./subagent-tool.js";
+import { createWebFetchTool } from "./web-fetch-tool.js";
 
-export { resolveSafePath, type SandboxGrants };
+export { resolveSafePath, type SandboxGrants, type SubagentRuntimeContext };
 
 export interface AdapterToolOutputObject { content: string; images?: ImageAttachment[]; details?: unknown; terminate?: boolean; }
 export type AdapterToolOutput = string | AdapterToolOutputObject;
@@ -35,6 +37,7 @@ const GrepArgsSchema = z.object({
 
 export const IGNORED_DIRS = new Set([".git", "node_modules", ".sessions", ".debug", "venv", ".venv", "__pycache__", "dist", "build", ".next"]);
 export const BINARY_EXT_RE = /\.(png|jpe?g|gif|webp|ico|pdf|zip|tar|gz|woff2?|ttf|eot|mp[34]|mov|pyc|so|dylib|dll|exe|db|sqlite3?|lock)$/i;
+const BITMAP_IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp|ico)$/i;
 
 function createWorkspaceIgnoreFilter(realRoot: string): (relPosixPath: string, isDir?: boolean) => boolean {
   const ig = ignore();
@@ -52,15 +55,13 @@ function createWorkspaceIgnoreFilter(realRoot: string): (relPosixPath: string, i
 
 async function runGrepSearch(workspaceRoot: string, args: z.infer<typeof GrepArgsSchema>, grants?: SandboxGrants): Promise<string> {
   const realRoot = resolveSafePath(workspaceRoot, ".", "read", grants), fullPath = resolveSafePath(workspaceRoot, args.path, "read", grants);
-  const isIgnored = createWorkspaceIgnoreFilter(realRoot);
-  const stat = await fs.stat(fullPath);
+  const isIgnored = createWorkspaceIgnoreFilter(realRoot), stat = await fs.stat(fullPath);
   const files = stat.isDirectory()
     ? (await fs.readdir(fullPath, { recursive: true, withFileTypes: true }))
         .filter((e) => {
           if (!e.isFile() || BINARY_EXT_RE.test(e.name)) return false;
-          const entryFull = path.join(e.parentPath, e.name);
           if (path.relative(fullPath, e.parentPath).split(path.sep).some((p) => IGNORED_DIRS.has(p))) return false;
-          return !isIgnored(toPosixRelative(realRoot, entryFull), false);
+          return !isIgnored(toPosixRelative(realRoot, path.join(e.parentPath, e.name)), false);
         })
         .map((e) => path.join(e.parentPath, e.name))
     : [fullPath];
@@ -91,54 +92,31 @@ function formatFileWithLineCount(fullFilePath: string, displayName: string): str
     const stat = fsSync.statSync(fullFilePath);
     if (!stat.isFile() || stat.size > 512_000) return displayName;
     const raw = fsSync.readFileSync(fullFilePath, "utf-8");
-    if (raw.includes("\u0000")) return displayName;
-    return `${displayName} (${raw.split("\n").length} lines)`;
-  } catch {
-    return displayName;
-  }
+    return raw.includes("\u0000") ? displayName : `${displayName} (${raw.split("\n").length} lines)`;
+  } catch { return displayName; }
 }
-
-const BITMAP_IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp|ico)$/i;
 
 function detectBitmapMimeType(filePath: string): string {
   const ext = path.extname(filePath).toLowerCase();
   if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
   if (ext === ".gif") return "image/gif";
   if (ext === ".webp") return "image/webp";
-  if (ext === ".ico") return "image/x-icon";
-  return "image/png";
+  return ext === ".ico" ? "image/x-icon" : "image/png";
 }
 
-async function runReadFile(
-  workspaceRoot: string,
-  args: z.infer<typeof ReadFileArgsSchema>,
-  grants?: SandboxGrants,
-): Promise<ToolExecuteOutput> {
-  const realRoot = resolveSafePath(workspaceRoot, ".", "read", grants);
-  const fullPath = resolveSafePath(workspaceRoot, args.path, "read", grants);
+async function runReadFile(workspaceRoot: string, args: z.infer<typeof ReadFileArgsSchema>, grants?: SandboxGrants): Promise<ToolExecuteOutput> {
+  const realRoot = resolveSafePath(workspaceRoot, ".", "read", grants), fullPath = resolveSafePath(workspaceRoot, args.path, "read", grants);
   const stat = await fs.stat(fullPath);
   if (BITMAP_IMAGE_EXT_RE.test(fullPath)) {
     const mimeType = detectBitmapMimeType(fullPath);
-    if (stat.size > 5 * 1024 * 1024) {
-      return `Read image file [${mimeType}] failed: file size (${stat.size} bytes) exceeds 5MB limit.`;
-    }
+    if (stat.size > 5 * 1024 * 1024) return `Read image file [${mimeType}] failed: file size (${stat.size} bytes) exceeds 5MB limit.`;
     const rel = toPosixRelative(realRoot, fullPath) || path.basename(fullPath);
-    const imgPath = rel.startsWith("..") ? fullPath : rel;
-    const kb = Math.max(1, Math.round(stat.size / 1024));
-    return {
-      content: `Read image file [${mimeType}] (${kb} KB)`,
-      images: [{ path: imgPath, mimeType, byteSize: stat.size }],
-    };
+    return { content: `Read image file [${mimeType}] (${Math.max(1, Math.round(stat.size / 1024))} KB)`, images: [{ path: rel.startsWith("..") ? fullPath : rel, mimeType, byteSize: stat.size }] };
   }
-  if (BINARY_EXT_RE.test(fullPath) || stat.size > 2_000_000) {
-    return `[二进制或超大文件 (${stat.size} bytes)，无法通过 read_file 作为 UTF-8 文本读取]`;
-  }
+  if (BINARY_EXT_RE.test(fullPath) || stat.size > 2_000_000) return `[二进制或超大文件 (${stat.size} bytes)，无法通过 read_file 作为 UTF-8 文本读取]`;
   const raw = await fs.readFile(fullPath, "utf-8");
-  if (raw.includes("\u0000")) {
-    return `[二进制文件 (含 NUL 字节)，无法作为 UTF-8 文本读取]`;
-  }
-  const lines = raw.split("\n");
-  const startIdx = Math.max(0, (args.startLine ?? 1) - 1);
+  if (raw.includes("\u0000")) return `[二进制文件 (含 NUL 字节)，无法作为 UTF-8 文本读取]`;
+  const lines = raw.split("\n"), startIdx = Math.max(0, (args.startLine ?? 1) - 1);
   const endIdx = Math.min(lines.length, args.endLine ? args.endLine : startIdx + (args.maxLines ?? lines.length));
   const out = lines.slice(startIdx, endIdx).map((line, i) => `${startIdx + i + 1}: ${line}`).join("\n");
   const rangeNote = startIdx > 0 || endIdx < lines.length ? `\n... [文件共 ${lines.length} 行，当前显示第 ${startIdx + 1}-${Math.max(startIdx + 1, endIdx)} 行]` : "";
@@ -146,10 +124,8 @@ async function runReadFile(
 }
 
 async function runListDir(workspaceRoot: string, args: z.infer<typeof ListDirArgsSchema>, grants?: SandboxGrants): Promise<string> {
-  const realRoot = resolveSafePath(workspaceRoot, ".", "read", grants);
-  const fullPath = resolveSafePath(workspaceRoot, args.path, "read", grants);
-  const isIgnored = createWorkspaceIgnoreFilter(realRoot);
-  const entries = await fs.readdir(fullPath, { withFileTypes: true });
+  const realRoot = resolveSafePath(workspaceRoot, ".", "read", grants), fullPath = resolveSafePath(workspaceRoot, args.path, "read", grants);
+  const isIgnored = createWorkspaceIgnoreFilter(realRoot), entries = await fs.readdir(fullPath, { withFileTypes: true });
   const lines: string[] = [], ignoredFound: string[] = [];
   for (const e of entries) {
     const entryFull = path.join(fullPath, e.name);
@@ -159,63 +135,46 @@ async function runListDir(workspaceRoot: string, args: z.infer<typeof ListDirArg
     }
     if (e.isDirectory()) {
       lines.push(`${e.name}/`);
-      const subPath = path.join(fullPath, e.name);
-      const subEntries = await fs.readdir(subPath, { withFileTypes: true }).catch(() => []);
+      const subPath = path.join(fullPath, e.name), subEntries = await fs.readdir(subPath, { withFileTypes: true }).catch(() => []);
       for (const sub of subEntries.slice(0, 25)) {
         const subFull = path.join(subPath, sub.name);
         if (!IGNORED_DIRS.has(sub.name) && !(sub.isDirectory() && isIgnored(toPosixRelative(realRoot, subFull), true))) {
           const relSub = `${e.name}/${sub.name}`;
           lines.push(`  ${sub.isDirectory() ? `${relSub}/` : formatFileWithLineCount(subFull, relSub)}`);
-        } else if (sub.isDirectory() && sub.name !== ".git" && sub.name !== ".sessions" && sub.name !== ".debug") {
-          ignoredFound.push(`${e.name}/${sub.name}/`);
-        }
+        } else if (sub.isDirectory() && sub.name !== ".git" && sub.name !== ".sessions" && sub.name !== ".debug") ignoredFound.push(`${e.name}/${sub.name}/`);
       }
       if (subEntries.length > 25) lines.push(`  ... (其余 ${subEntries.length - 25} 项已省略，可对该子目录单独调用 list_dir)`);
-    } else {
-      lines.push(formatFileWithLineCount(entryFull, e.name));
-    }
+    } else lines.push(formatFileWithLineCount(entryFull, e.name));
   }
   if (ignoredFound.length > 0) lines.push(`[已过滤忽略目录: ${ignoredFound.join(", ")}]`);
   return lines.join("\n");
 }
 
-export function createBuiltinTools(workspaceRoot: string = process.cwd(), grants?: SandboxGrants): ToolContract<any>[] {
+export function createBuiltinTools(workspaceRoot: string = process.cwd(), grants?: SandboxGrants, runtimeCtx?: SubagentRuntimeContext): ToolContract<any>[] {
   const readFileTool: ToolContract<z.infer<typeof ReadFileArgsSchema>> = {
     name: "read_file",
     description: "读取指定文件的内容（支持文本代码 startLine/endLine 行区间切片，以及读取 png/jpg/gif/webp 图片并作为多模态附件返回）",
-    parameters: ReadFileArgsSchema,
-    readonly: true,
-    execute: (args) => runReadFile(workspaceRoot, args, grants),
+    parameters: ReadFileArgsSchema, readonly: true, execute: (args) => runReadFile(workspaceRoot, args, grants),
   };
-
   const listDirTool: ToolContract<z.infer<typeof ListDirArgsSchema>> = {
     name: "list_dir",
-    description:
-      "列出指定目录的项目结构树（自动展开 2 层子目录、附带每个代码文件的行数并提示已过滤目录，看项目结构或评估文件规模请直接调本工具）",
-    parameters: ListDirArgsSchema,
-    readonly: true,
-    execute: (args) => runListDir(workspaceRoot, args, grants),
+    description: "列出指定目录的项目结构树（自动展开 2 层子目录、附带每个代码文件的行数并提示已过滤目录，看项目结构或评估文件规模请直接调本工具）",
+    parameters: ListDirArgsSchema, readonly: true, execute: (args) => runListDir(workspaceRoot, args, grants),
   };
-
   const grepTool: ToolContract<z.infer<typeof GrepArgsSchema>> = {
     name: "grep",
     description: "在指定文件或目录中递归搜索包含关键词的行（支持 contextLines 附带上下文行）",
-    parameters: GrepArgsSchema,
-    readonly: true,
-    execute: (args) => runGrepSearch(workspaceRoot, args, grants),
+    parameters: GrepArgsSchema, readonly: true, execute: (args) => runGrepSearch(workspaceRoot, args, grants),
   };
-
-  return [readFileTool, listDirTool, grepTool];
+  const webFetchTool = createWebFetchTool(runtimeCtx?.signal);
+  const baseReadonly = [readFileTool, listDirTool, grepTool, webFetchTool];
+  const subagentTool = createSubagentTool(workspaceRoot, baseReadonly, grants, runtimeCtx);
+  return [...baseReadonly, subagentTool];
 }
 
-async function executeSingleToolCall(
-  call: ToolCall,
-  toolMap: Map<string, ToolContract<any>>,
-): Promise<AdapterToolResultMessage> {
+async function executeSingleToolCall(call: ToolCall, toolMap: Map<string, ToolContract<any>>): Promise<AdapterToolResultMessage> {
   const tool = toolMap.get(call.name);
-  if (!tool) {
-    return { role: "tool", toolCallId: call.id, name: call.name, content: `未知工具: ${call.name}`, isError: true };
-  }
+  if (!tool) return { role: "tool", toolCallId: call.id, name: call.name, content: `未知工具: ${call.name}`, isError: true };
   try {
     if (!call.arguments || typeof call.arguments !== "object" || Array.isArray(call.arguments) || "_invalidJson" in call.arguments) {
       throw new Error(`工具参数 JSON 格式非法或流式输出被截断: ${String((call.arguments as any)?._invalidJson ?? JSON.stringify(call.arguments)).slice(0, 200)}`);
@@ -224,10 +183,7 @@ async function executeSingleToolCall(
     const output = (await tool.execute(parsedArgs)) as AdapterToolOutput;
     if (typeof output === "object" && output !== null && "content" in output) {
       return {
-        role: "tool",
-        toolCallId: call.id,
-        name: call.name,
-        content: String(output.content),
+        role: "tool", toolCallId: call.id, name: call.name, content: String(output.content),
         ...(output.images && output.images.length > 0 ? { images: output.images } : {}),
         ...(output.details !== undefined ? { details: output.details } : {}),
         ...(output.terminate !== undefined ? { terminate: Boolean(output.terminate) } : {}),
@@ -236,25 +192,16 @@ async function executeSingleToolCall(
     }
     return { role: "tool", toolCallId: call.id, name: call.name, content: String(output), isError: false };
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    return { role: "tool", toolCallId: call.id, name: call.name, content: `执行异常：${msg}`, isError: true };
+    return { role: "tool", toolCallId: call.id, name: call.name, content: `执行异常：${err instanceof Error ? err.message : String(err)}`, isError: true };
   }
 }
 
-export async function executeToolCalls(
-  toolCalls: readonly ToolCall[],
-  tools: readonly ToolContract<any>[],
-): Promise<AdapterToolResultMessage[]> {
+export async function executeToolCalls(toolCalls: readonly ToolCall[], tools: readonly ToolContract<any>[]): Promise<AdapterToolResultMessage[]> {
   const toolMap = new Map(tools.map((t) => [t.name, t]));
-  const hasWriteOrSequentialTool = toolCalls.some((c) => toolMap.get(c.name)?.readonly === false);
-
-  if (hasWriteOrSequentialTool) {
-    const results: ToolResultMessage[] = [];
-    for (const call of toolCalls) {
-      results.push(await executeSingleToolCall(call, toolMap));
-    }
+  if (toolCalls.some((c) => toolMap.get(c.name)?.readonly === false)) {
+    const results: AdapterToolResultMessage[] = [];
+    for (const call of toolCalls) results.push(await executeSingleToolCall(call, toolMap));
     return results;
   }
-
   return Promise.all(toolCalls.map((call) => executeSingleToolCall(call, toolMap)));
 }

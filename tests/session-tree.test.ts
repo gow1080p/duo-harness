@@ -148,7 +148,7 @@ describe("Stage 2: .jsonl 会话树与断网录像回放测试", () => {
     expect(turn2.finalAnswer).toContain("收到了4条消息");
 
     const completer = createReplCompleter(() => tmpBase, () => pathsA.sessionFile);
-    expect(completer("/p")[0]).toEqual(["/plan ", "/projects"]);
+    expect(completer("/p")[0]).toEqual(["/plan ", "/ps", "/projects"]);
     expect(completer("/cd app-")[0]).toContain("/cd app-alpha/");
     expect(completer("/branch msg_")[0]).toContain("/branch msg_3");
 

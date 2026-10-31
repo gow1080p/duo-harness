@@ -5,6 +5,7 @@ import { z } from "zod";
 import type { ToolContract } from "../core/contracts.js";
 import { checkFileSyntax } from "./bash-policy.js";
 import { createRunBashTool, killProcessGroup, killTrackedChildren, runCommandInSandbox } from "./bash-tool.js";
+import { invalidateWorkspaceFilesCache } from "./context-mention.js";
 import { extractChangedHunk } from "./diff-presenter.js";
 import { expandHomePath, toPosixRelative } from "./platform.js";
 import { writeFileAtomicSync } from "./store.js";
@@ -22,9 +23,7 @@ const EditFileArgsSchema = z.object({
   oldText: z.string().optional().describe("待替换的原文本（新建或全量覆盖时传空字符串）"),
   newText: z.string().optional().describe("替换后的新文本"),
   edits: z.preprocess((val) => {
-    if (typeof val === "string") {
-      try { return JSON.parse(val); } catch { return val; }
-    }
+    if (typeof val === "string") { try { return JSON.parse(val); } catch { return val; } }
     return val;
   }, z.array(SingleEditItemSchema).optional()).describe("同文件多处顺序修改列表"),
 });
@@ -46,11 +45,9 @@ export function rollbackFileSnapshotsSync(workspaceRoot: string, snapshots: File
     if (checkHardDeniedPath(fullPath, realRoot, "write")) throw new Error(`禁止回滚敏感路径: ${snap.path}`);
     if (snap.beforeContent === null) fsSync.rmSync(fullPath, { force: true });
     else writeFileAtomicSync(fullPath, snap.beforeContent);
-    snapshots.pop();
-    batch.unshift(snap);
-    onSnapshotChange?.();
-    touchedPaths.push(snap.path);
+    snapshots.pop(); batch.unshift(snap); onSnapshotChange?.(); touchedPaths.push(snap.path);
   }
+  if (count > 0) invalidateWorkspaceFilesCache();
   return { rolledBackCount: count, currentVersion: snapshots.length, touchedPaths };
 }
 
@@ -69,14 +66,11 @@ export function redoFileSnapshots(workspaceRoot: string, snapshots: FileVersionS
       const fullPath = resolveExistingRealPath(path.resolve(workspaceRoot, expandHomePath(snap.path)));
       if (checkHardDeniedPath(fullPath, realRoot, "write")) throw new Error(`禁止重做敏感路径: ${snap.path}`);
       writeFileAtomicSync(fullPath, snap.afterContent);
-      batch.shift();
-      snapshots.push({ ...snap, version: snapshots.length + 1 });
-      redoneCount++;
-      touchedPaths.push(snap.path);
+      batch.shift(); snapshots.push({ ...snap, version: snapshots.length + 1 }); redoneCount++; touchedPaths.push(snap.path);
     }
-    redoBatches.pop();
-    onSnapshotChange?.();
+    redoBatches.pop(); onSnapshotChange?.();
   }
+  if (redoneCount > 0) invalidateWorkspaceFilesCache();
   return { redoneCount, totalVersions: snapshots.length, remainingRedoBatches: redoBatches.length, touchedPaths: [...new Set(touchedPaths)] };
 }
 
@@ -101,13 +95,7 @@ function minLeadingIndent(lines: readonly string[]): number {
 }
 
 function normalizeFuzzyLine(line: string): string {
-  return line
-    .normalize("NFKC")
-    .trimEnd()
-    .replace(/[\u2018\u2019\u201A\u201B]/g, "'")
-    .replace(/[\u201C\u201D\u201E\u201F]/g, '"')
-    .replace(/[\u2010\u2011\u2012\u2013\u2014\u2015\u2212]/g, "-")
-    .replace(/[\u00A0\u2002-\u200A\u202F\u205F\u3000]/g, " ");
+  return line.normalize("NFKC").trimEnd().replace(/[\u2018\u2019\u201A\u201B]/g, "'").replace(/[\u201C\u201D\u201E\u201F]/g, '"').replace(/[\u2010\u2011\u2012\u2013\u2014\u2015\u2212]/g, "-").replace(/[\u00A0\u2002-\u200A\u202F\u205F\u3000]/g, " ");
 }
 
 function tryIndentOrFuzzyReplace(wLines: readonly string[], oLines: readonly string[], nLines: readonly string[], eol: string, filePath: string, fuzzy: boolean): string | null {
@@ -220,6 +208,7 @@ async function applyFileEdit(workspaceRoot: string, snapshots: FileVersionSnapsh
 
     const finalContent = bom + workingContent;
     writeFileAtomicSync(fullPath, finalContent);
+    invalidateWorkspaceFilesCache();
     const relPath = toPosixRelative(resolveSafePath(workspaceRoot, ".", "read", grants), fullPath) || args.path;
     const version = snapshots.length + 1;
     snapshots.push({ version, path: relPath, beforeContent: rawBefore, afterContent: finalContent, timestamp: Date.now(), hunkCount: editList.length });

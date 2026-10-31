@@ -13,7 +13,7 @@ export { formatSnapshotsDiff };
 export interface ProjectMetaState {
   projectKey: string; workspaceRoot: string; updatedAt: string; activeLeafId?: string | null;
   modelMode?: string; lastUndoNotice?: string | null; lastPlanLeafId?: string | null;
-  lastExecutedPlanHash?: string | null; inputHistory?: string[];
+  lastExecutedPlanHash?: string | null; inputHistory?: string[]; verifyCommand?: string | null;
 }
 export function computePlanHash(text: string): string {
   return crypto.createHash("sha256").update(text.trim(), "utf-8").digest("hex").slice(0, 16);
@@ -30,8 +30,7 @@ export function loadProjectMeta(metaFile: string): Partial<ProjectMetaState> {
 }
 export function saveProjectMeta(metaFile: string, patch: Partial<ProjectMetaState>): void {
   try {
-    const prev = loadProjectMeta(metaFile);
-    writeFileAtomicSync(metaFile, JSON.stringify({ ...prev, ...patch, updatedAt: new Date().toISOString() }, null, 2));
+    writeFileAtomicSync(metaFile, JSON.stringify({ ...loadProjectMeta(metaFile), ...patch, updatedAt: new Date().toISOString() }, null, 2));
     managedProjectsCache.clear();
   } catch {}
 }
@@ -55,6 +54,8 @@ export const SLASH_COMMANDS = [
   { cmd: "/open", label: "/open [文件]", desc: "预览或打开最新修改文件与指定路径 (/open 空格可选文件)" },
   { cmd: "/shot", label: "/shot [目标]", desc: "用无头 Chrome/Edge 截图 (.debug/shot.png · 支持 /shot [URL] [提问] 或 --open)" },
   { cmd: "/clip", label: "/clip [提问]", desc: "读取系统剪贴板中的最新截图 (.debug/clipboard.png · 亦支持 /paste 或 @clipboard)" },
+  { cmd: "/ps", label: "/ps [kill]", desc: "查看或终止后台常驻服务进程 (/ps 列表与增量日志 | /ps kill <PID|all>)" },
+  { cmd: "/verify ", label: "/verify [策略]", desc: "配置完成前编译验证策略 (/verify auto | /verify off | /verify <命令>)" },
   { cmd: "/undo", label: "/undo", desc: "撤回修改 (/undo 撤上一轮 | /undo N 撤N步 | /undo all 全部撤回)" },
   { cmd: "/redo", label: "/redo", desc: "重做恢复 (/redo 恢复上次撤回 | /redo all 恢复全部撤回)" },
   { cmd: "/cd ", label: "/cd <项目>", desc: "切换项目工作区 (按回车直接展开项目列表)" },
@@ -131,8 +132,7 @@ export function listManagedProjects(homeBaseDir = defaultProjectsBaseDir()): Man
 }
 
 export function resolveTargetWorkspace(targetArg: string, currentWorkspaceRoot: string, homeBaseDir?: string): string | null {
-  const projects = listManagedProjects(homeBaseDir);
-  const idx = Number(targetArg);
+  const projects = listManagedProjects(homeBaseDir), idx = Number(targetArg);
   if (Number.isInteger(idx) && idx >= 1 && idx <= projects.length) return projects[idx - 1]!.workspaceRoot;
   const byManaged = projects.find((p) => p.projectKey === targetArg || path.basename(p.workspaceRoot) === targetArg || p.projectKey.startsWith(`${targetArg}-`));
   if (byManaged && fs.existsSync(byManaged.workspaceRoot)) return byManaged.workspaceRoot;
@@ -146,18 +146,14 @@ export function resolveTargetWorkspace(targetArg: string, currentWorkspaceRoot: 
 export function createReplCompleter(getWorkspaceRoot: () => string, getSessionFile: () => string) {
   return (line: string): [string[], string] => {
     if (line.startsWith("/cd ")) {
-      const rawArg = line.slice(4);
-      const managed = listManagedProjects().map((p) => path.basename(p.workspaceRoot)).filter((n) => n.startsWith(rawArg)).map((n) => `/cd ${n}`);
-      const expanded = expandHomePath(rawArg);
-      const fullTarget = path.resolve(getWorkspaceRoot(), expanded || ".");
+      const rawArg = line.slice(4), managed = listManagedProjects().map((p) => path.basename(p.workspaceRoot)).filter((n) => n.startsWith(rawArg)).map((n) => `/cd ${n}`);
+      const expanded = expandHomePath(rawArg), fullTarget = path.resolve(getWorkspaceRoot(), expanded || ".");
       const searchDir = rawArg.endsWith("/") && fs.existsSync(fullTarget) ? fullTarget : path.dirname(fullTarget);
       const prefix = rawArg.endsWith("/") ? "" : path.basename(expanded);
       try {
         const dirs = fs.readdirSync(searchDir, { withFileTypes: true }).filter((d) => d.isDirectory() && !d.name.startsWith(".") && d.name.startsWith(prefix)).map((d) => `/cd ${rawArg.slice(0, rawArg.length - prefix.length)}${d.name}/`);
         return [[...new Set([...managed, ...dirs])], line];
-      } catch {
-        return [managed, line];
-      }
+      } catch { return [managed, line]; }
     }
     if (line.startsWith("/branch ") || line.startsWith("/resume ")) {
       const cmdPrefix = line.startsWith("/resume ") ? "/resume " : "/branch ";
@@ -171,6 +167,8 @@ export function createReplCompleter(getWorkspaceRoot: () => string, getSessionFi
       const opts = /^\/goal(?:\s|$)/i.test(line) ? ["/goal", "/goal plan"] : ["/plan view", "/plan full", "/plan edit", "/plan open --web"];
       return [opts.filter((c) => c.startsWith(line.trim())), line];
     }
+    if (/^\/ps(?:\s|$)/i.test(line)) return [["/ps", "/ps kill all"].filter((c) => c.startsWith(line.trim())), line];
+    if (/^\/verify(?:\s|$)/i.test(line)) return [["/verify auto", "/verify off", "/verify pnpm test"].filter((c) => c.startsWith(line.trim())), line];
     if (line.startsWith("/")) {
       const all = SLASH_COMMANDS.map((c) => c.cmd), hits = all.filter((c) => c.startsWith(line));
       return [hits.length > 0 ? hits : all, line];
@@ -208,13 +206,12 @@ function cleanPreviewText(raw: string): string {
 export function extractConversationTurns(entries: readonly SessionEntry[], activeLeafId?: string | null): ConversationTurnSummary[] {
   const rawTurns: Omit<ConversationTurnSummary, "turnIndex" | "isCurrentLeaf">[] = [];
   for (const e of entries) {
-    if (e.message.role === "user") {
-      rawTurns.push({ userEntryId: e.id, leafEntryId: e.id, userText: cleanPreviewText(e.message.content), replyText: "", toolSteps: 0 });
-    } else if (rawTurns.length > 0) {
+    if (e.message.role === "user") rawTurns.push({ userEntryId: e.id, leafEntryId: e.id, userText: cleanPreviewText(e.message.content), replyText: "", toolSteps: 0 });
+    else if (rawTurns.length > 0) {
       const cur = rawTurns[rawTurns.length - 1]!;
       cur.leafEntryId = e.id;
       if (e.message.role === "assistant") {
-        if (e.message.toolCalls && e.message.toolCalls.length > 0) cur.toolSteps += 1;
+        if (e.message.toolCalls?.length) cur.toolSteps += 1;
         if (e.message.content.trim()) cur.replyText = cleanPreviewText(e.message.content);
       }
     }

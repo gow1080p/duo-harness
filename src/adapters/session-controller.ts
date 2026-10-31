@@ -19,24 +19,17 @@ export interface SessionStatusSummary {
   activeTurnIndex: number | null; totalTurns: number; leafId: string | null;
   modelMode: ModelMode; activeModel: string; modelLabel: string;
 }
-
 export interface TurnExecutionSummary {
   finalAnswer: string; stepsUsed: number; leafId: string | null; activeModel: string;
   turnCostCny: number; totalCostCny: number; cacheHitRatePct: number; modifiedFiles: FileDiffSummaryItem[];
 }
-
-export interface SessionControllerOptions {
-  workspaceRoot?: string; homeBaseDir?: string; provider?: LlmProvider;
-}
-
+export interface SessionControllerOptions { workspaceRoot?: string; homeBaseDir?: string; provider?: LlmProvider; }
 interface ControllerMutableState {
   paths: ProjectSessionPaths; snapshots: FileVersionSnapshot[]; redoBatches: FileVersionSnapshot[][]; leafId: string | null;
   modelMode: ModelMode; provider: LlmProvider; customProvider?: LlmProvider; homeBaseDir?: string; sandboxGrants: SandboxGrants;
 }
 
-function loadDiskEntries(sessionFile: string): SessionEntry[] {
-  return fs.existsSync(sessionFile) ? loadJsonlEntries(sessionFile) : [];
-}
+function loadDiskEntries(sessionFile: string): SessionEntry[] { return fs.existsSync(sessionFile) ? loadJsonlEntries(sessionFile) : []; }
 
 function syncStateFromDisk(st: ControllerMutableState): SessionEntry[] {
   const entries = loadDiskEntries(st.paths.sessionFile), meta = loadProjectMeta(st.paths.metaFile), validModes = listAvailableModelModes(st.paths.workspaceRoot);
@@ -45,21 +38,18 @@ function syncStateFromDisk(st: ControllerMutableState): SessionEntry[] {
   if (meta.activeLeafId === "__root__") st.leafId = rootId;
   else if (meta.activeLeafId && entries.some((e) => e.id === meta.activeLeafId)) st.leafId = meta.activeLeafId;
   else st.leafId = entries.length > 0 ? entries[entries.length - 1]!.id : null;
-  st.snapshots = loadProjectSnapshots(st.paths.snapshotsFile);
-  st.redoBatches = loadProjectRedoBatches(st.paths.snapshotsFile);
+  st.snapshots = loadProjectSnapshots(st.paths.snapshotsFile); st.redoBatches = loadProjectRedoBatches(st.paths.snapshotsFile);
   return entries;
 }
 
 function buildStatusSummary(st: ControllerMutableState, preloadedEntries?: SessionEntry[]): SessionStatusSummary {
   const entries = preloadedEntries ?? syncStateFromDisk(st);
   const rootId = entries[0]?.id ?? null, isNew = !st.leafId || st.leafId === rootId || entries.length <= 1;
-  const turns = extractConversationTurns(entries, st.leafId);
-  const cur = isNew ? undefined : (turns.find((t) => t.isCurrentLeaf) ?? turns[turns.length - 1]);
+  const turns = extractConversationTurns(entries, st.leafId), cur = isNew ? undefined : (turns.find((t) => t.isCurrentLeaf) ?? turns[turns.length - 1]);
   const target = resolveActiveModelTarget(st.paths.wireLogFile, !isNew, st.modelMode, Date.now(), false, st.paths.workspaceRoot);
   return {
-    projectKey: st.paths.projectKey, projectName: path.basename(st.paths.workspaceRoot) || "root",
-    workspaceRoot: st.paths.workspaceRoot, isNew, activeTurnIndex: cur?.turnIndex ?? null,
-    totalTurns: turns.length, leafId: st.leafId, modelMode: st.modelMode, activeModel: target.model, modelLabel: target.shortLabel,
+    projectKey: st.paths.projectKey, projectName: path.basename(st.paths.workspaceRoot) || "root", workspaceRoot: st.paths.workspaceRoot,
+    isNew, activeTurnIndex: cur?.turnIndex ?? null, totalTurns: turns.length, leafId: st.leafId, modelMode: st.modelMode, activeModel: target.model, modelLabel: target.shortLabel,
   };
 }
 
@@ -67,9 +57,7 @@ export function squashTurnSnapshots(snapshots: FileVersionSnapshot[], startIndex
   if (snapshots.length <= startIndex) return;
   const byPath = new Map<string, FileVersionSnapshot>();
   for (let i = startIndex; i < snapshots.length; i++) {
-    const s = snapshots[i]!;
-    const prev = byPath.get(s.path);
-    const resolvedLeaf = leafId ?? s.leafId ?? prev?.leafId;
+    const s = snapshots[i]!, prev = byPath.get(s.path), resolvedLeaf = leafId ?? s.leafId ?? prev?.leafId;
     byPath.set(s.path, { version: 0, path: s.path, beforeContent: prev ? prev.beforeContent : s.beforeContent, afterContent: s.afterContent, timestamp: s.timestamp, turnId, ...(resolvedLeaf ? { leafId: resolvedLeaf } : {}), hunkCount: (prev?.hunkCount ?? 0) + (s.hunkCount ?? 1) });
   }
   const merged = [...byPath.values()].filter((s) => s.beforeContent !== s.afterContent).map((s, idx) => ({ ...s, version: startIndex + idx + 1 }));
@@ -77,19 +65,14 @@ export function squashTurnSnapshots(snapshots: FileVersionSnapshot[], startIndex
 }
 
 function countSnapshotsAfterTarget(entries: readonly SessionEntry[], snapshots: readonly FileVersionSnapshot[], rawTarget: string): number {
-  const turns = extractConversationTurns(entries);
-  const byTurn = turns.find((t) => `#${t.turnIndex}` === rawTarget || t.userEntryId === rawTarget || t.leafEntryId === rawTarget);
-  const targetId = byTurn ? byTurn.leafEntryId : rawTarget;
-  const idxMap = new Map(entries.map((e, i) => [e.id, i]));
-  const targetIdx = idxMap.get(targetId) ?? -1;
+  const turns = extractConversationTurns(entries), byTurn = turns.find((t) => `#${t.turnIndex}` === rawTarget || t.userEntryId === rawTarget || t.leafEntryId === rawTarget);
+  const targetId = byTurn ? byTurn.leafEntryId : rawTarget, idxMap = new Map(entries.map((e, i) => [e.id, i])), targetIdx = idxMap.get(targetId) ?? -1;
   if (targetIdx < 0) return -1;
   const targetTs = entries[targetIdx]!.timestamp;
   let steps = 0;
   for (let i = snapshots.length - 1; i >= 0; i--) {
-    const s = snapshots[i]!;
-    const sIdx = s.leafId ? idxMap.get(s.leafId) : undefined;
-    const isAfter = sIdx !== undefined ? sIdx > targetIdx : s.timestamp > targetTs;
-    if (isAfter) steps++;
+    const s = snapshots[i]!, sIdx = s.leafId ? idxMap.get(s.leafId) : undefined;
+    if (sIdx !== undefined ? sIdx > targetIdx : s.timestamp > targetTs) steps++;
     else break;
   }
   return steps;
@@ -98,18 +81,13 @@ function countSnapshotsAfterTarget(entries: readonly SessionEntry[], snapshots: 
 async function executeControllerAsk(st: ControllerMutableState, prompt: string, runOpts: Partial<RunSessionOptions> = {}): Promise<TurnExecutionSummary> {
   return withSessionLock(st.paths.sessionFile, async () => {
     syncStateFromDisk(st);
-    const meta = loadProjectMeta(st.paths.metaFile);
-    const { expandedPrompt, attachedPaths, attachedImages } = expandAtMentions(prompt, st.paths.workspaceRoot, 300, st.sandboxGrants);
+    const meta = loadProjectMeta(st.paths.metaFile), { expandedPrompt, attachedPaths, attachedImages } = expandAtMentions(prompt, st.paths.workspaceRoot, 300, st.sandboxGrants);
     if (attachedPaths.length > 0) console.log(`📎 [已自动附加 ${attachedPaths.length} 个文件/图片上下文]: ${attachedPaths.join(", ")}`);
-    const effectivePrompt = meta.lastUndoNotice
-      ? `${expandedPrompt}\n\n[系统提示：${meta.lastUndoNotice}。若本轮仅为普通问答请直接作答，严禁调用 run_bash；若后续需查看或修改该文件，请用免确认的 read_file / list_dir 读取最新状态]`
-      : expandedPrompt;
+    const effectivePrompt = meta.lastUndoNotice ? `${expandedPrompt}\n\n[系统提示：${meta.lastUndoNotice}。若本轮仅为普通问答请直接作答，严禁调用 run_bash；若后续需查看或修改该文件，请用免确认的 read_file / list_dir 读取最新状态]` : expandedPrompt;
     saveProjectMeta(st.paths.metaFile, { activeLeafId: null, ...(meta.lastUndoNotice ? { lastUndoNotice: null } : {}) });
     const snapStart = st.snapshots.length, turnId = `turn_${Date.now()}`;
     const persistTurnSnapshots = () => {
-      for (let i = snapStart; i < st.snapshots.length; i++) {
-        if (!st.snapshots[i]!.turnId) { st.snapshots[i]!.turnId = turnId; st.redoBatches.length = 0; }
-      }
+      for (let i = snapStart; i < st.snapshots.length; i++) if (!st.snapshots[i]!.turnId) { st.snapshots[i]!.turnId = turnId; st.redoBatches.length = 0; }
       saveProjectSnapshots(st.paths.snapshotsFile, st.snapshots, st.redoBatches);
     };
     let finalLeafId = st.leafId;
@@ -119,8 +97,7 @@ async function executeControllerAsk(st: ControllerMutableState, prompt: string, 
         leafId: st.leafId ?? undefined, provider: runOpts.provider ?? st.provider, snapshots: st.snapshots, redoBatches: st.redoBatches, sandboxGrants: st.sandboxGrants,
         userImages: runOpts.userImages ?? attachedImages, onSnapshotChange: persistTurnSnapshots, enableWriteTools: runOpts.enableWriteTools ?? true, showCostReport: runOpts.showCostReport ?? false,
       });
-      finalLeafId = res.leafId;
-      squashTurnSnapshots(st.snapshots, snapStart, turnId, finalLeafId);
+      finalLeafId = res.leafId; squashTurnSnapshots(st.snapshots, snapStart, turnId, finalLeafId);
       const turnSnaps = st.snapshots.slice(snapStart), m = computeTurnMetrics(st.paths.wireLogFile, res.stepsUsed), status = buildStatusSummary(st);
       return {
         finalAnswer: res.finalAnswer, stepsUsed: res.stepsUsed, leafId: res.leafId, activeModel: m?.activeModel ?? status.activeModel,
@@ -190,12 +167,30 @@ function executeControllerCompact(st: ControllerMutableState) {
     if (!onBranch.has(e.id)) return e;
     const folded = foldSingleMessage(e.message, 200);
     if (folded === e.message) return e;
-    compactedCount += 1;
-    return { ...e, message: folded };
+    compactedCount += 1; return { ...e, message: folded };
   });
   if (compactedCount > 0) appendJsonlEntries(st.paths.sessionFile, nextEntries, true);
-  const afterChars = compactedCount > 0 ? estimateMessagesChars(projectToMessages(nextEntries, st.leafId)) : beforeChars;
-  return { compactedCount, beforeChars, afterChars };
+  return { compactedCount, beforeChars, afterChars: compactedCount > 0 ? estimateMessagesChars(projectToMessages(nextEntries, st.leafId)) : beforeChars };
+}
+
+function executeControllerResume(st: ControllerMutableState, rawTarget: string) {
+  const entries = syncStateFromDisk(st), rewindCode = /(?:^|\s)(?:--code|-c)(?:\s|$)/i.test(rawTarget);
+  const cleanTarget = rawTarget.replace(/(?:^|\s)(?:--code|-c)(?=\s|$)/gi, "").trim(), turns = extractConversationTurns(entries, st.leafId);
+  const byTurn = turns.find((t) => `#${t.turnIndex}` === cleanTarget || String(t.turnIndex) === cleanTarget), resolvedId = byTurn ? byTurn.leafEntryId : cleanTarget;
+  if (!entries.some((e) => e.id === resolvedId)) return { ok: false, error: `未找到轮次或节点 ${cleanTarget}，可输入 /resume 用 ↑/↓ 方向键选择。`, status: buildStatusSummary(st), recapText: "" };
+  st.leafId = resolvedId;
+  let codeNote = "";
+  if (rewindCode && st.snapshots.length > 0 && countSnapshotsAfterTarget(entries, st.snapshots, resolvedId) > 0) {
+    const flush = () => saveProjectSnapshots(st.paths.snapshotsFile, st.snapshots, st.redoBatches);
+    const rb = rollbackFileSnapshotsSync(st.paths.workspaceRoot, st.snapshots, countSnapshotsAfterTarget(entries, st.snapshots, resolvedId), flush, st.redoBatches);
+    const touched = [...new Set(rb.touchedPaths)];
+    flush();
+    saveProjectMeta(st.paths.metaFile, { activeLeafId: resolvedId, lastUndoNotice: `用户已将对话与代码同步回滚至 ${cleanTarget}，撤回了 ${rb.rolledBackCount} 处后续文件修改 (${touched.join(", ")})` });
+    codeNote = `\n🔄 已同步将工作区代码回滚至该轮结束状态 (撤回 ${rb.rolledBackCount} 处修改: ${touched.join(", ")})`;
+  } else saveProjectMeta(st.paths.metaFile, { activeLeafId: resolvedId });
+  const targetHint = byTurn ? `#${byTurn.turnIndex}` : resolvedId;
+  const snapHint = !codeNote && st.snapshots.length > 0 ? `\n💡 提示：工作区当前有 ${st.snapshots.length} 处未撤回的文件修改（可输入 /diff 查看、/undo ${targetHint} 还原至该轮代码，或 /resume ${targetHint} --code 同步回滚）。` : codeNote;
+  return { ok: true, status: buildStatusSummary(st, entries), recapText: `${formatRecentHistoryRecap(entries, 1, st.leafId)}${snapHint}` };
 }
 
 export function createSessionController(options: SessionControllerOptions = {}) {
@@ -206,13 +201,9 @@ export function createSessionController(options: SessionControllerOptions = {}) 
     customProvider: options.provider, homeBaseDir: options.homeBaseDir, sandboxGrants: createSandboxGrants(),
   };
   syncStateFromDisk(st);
-
   return {
-    getPaths: () => st.paths,
-    getLeafId: () => st.leafId,
-    getSandboxGrants: () => st.sandboxGrants,
-    loadEntries: () => loadDiskEntries(st.paths.sessionFile),
-    getStatus: () => buildStatusSummary(st),
+    getPaths: () => st.paths, getLeafId: () => st.leafId, getSandboxGrants: () => st.sandboxGrants,
+    loadEntries: () => loadDiskEntries(st.paths.sessionFile), getStatus: () => buildStatusSummary(st),
     listTurns: (): ConversationTurnSummary[] => extractConversationTurns(syncStateFromDisk(st), st.leafId),
     newSession: (): SessionStatusSummary => {
       st.sandboxGrants.reset();
@@ -221,47 +212,13 @@ export function createSessionController(options: SessionControllerOptions = {}) 
       saveProjectMeta(st.paths.metaFile, { activeLeafId: "__root__" });
       return buildStatusSummary(st);
     },
-    resumeTurn: (rawTarget: string) => {
-      const entries = syncStateFromDisk(st);
-      const rewindCode = /(?:^|\s)(?:--code|-c)(?:\s|$)/i.test(rawTarget);
-      const cleanTarget = rawTarget.replace(/(?:^|\s)(?:--code|-c)(?=\s|$)/gi, "").trim();
-      const turns = extractConversationTurns(entries, st.leafId);
-      const byTurn = turns.find((t) => `#${t.turnIndex}` === cleanTarget || String(t.turnIndex) === cleanTarget);
-      const resolvedId = byTurn ? byTurn.leafEntryId : cleanTarget;
-      if (!entries.some((e) => e.id === resolvedId)) {
-        return { ok: false, error: `未找到轮次或节点 ${cleanTarget}，可输入 /resume 用 ↑/↓ 方向键选择。`, status: buildStatusSummary(st), recapText: "" };
-      }
-      st.leafId = resolvedId;
-      let codeNote = "";
-      if (rewindCode && st.snapshots.length > 0) {
-        const afterSteps = countSnapshotsAfterTarget(entries, st.snapshots, resolvedId);
-        if (afterSteps > 0) {
-          const flush = () => saveProjectSnapshots(st.paths.snapshotsFile, st.snapshots, st.redoBatches);
-          const rb = rollbackFileSnapshotsSync(st.paths.workspaceRoot, st.snapshots, afterSteps, flush, st.redoBatches);
-          const touched = [...new Set(rb.touchedPaths)];
-          flush();
-          saveProjectMeta(st.paths.metaFile, { activeLeafId: resolvedId, lastUndoNotice: `用户已将对话与代码同步回滚至 ${cleanTarget}，撤回了 ${rb.rolledBackCount} 处后续文件修改 (${touched.join(", ")})` });
-          codeNote = `\n🔄 已同步将工作区代码回滚至该轮结束状态 (撤回 ${rb.rolledBackCount} 处修改: ${touched.join(", ")})`;
-        } else saveProjectMeta(st.paths.metaFile, { activeLeafId: resolvedId });
-      } else {
-        saveProjectMeta(st.paths.metaFile, { activeLeafId: resolvedId });
-      }
-      const targetHint = byTurn ? `#${byTurn.turnIndex}` : resolvedId;
-      const snapHint = !codeNote && st.snapshots.length > 0 ? `\n💡 提示：工作区当前有 ${st.snapshots.length} 处未撤回的文件修改（可输入 /diff 查看、/undo ${targetHint} 还原至该轮代码，或 /resume ${targetHint} --code 同步回滚）。` : codeNote;
-      return { ok: true, status: buildStatusSummary(st, entries), recapText: `${formatRecentHistoryRecap(entries, 1, st.leafId)}${snapHint}` };
-    },
-    setModelMode: (mode: ModelMode): SessionStatusSummary => {
-      st.modelMode = mode;
-      saveProjectMeta(st.paths.metaFile, { modelMode: mode });
-      return buildStatusSummary(st);
-    },
+    resumeTurn: (rawTarget: string) => executeControllerResume(st, rawTarget),
+    setModelMode: (mode: ModelMode): SessionStatusSummary => { st.modelMode = mode; saveProjectMeta(st.paths.metaFile, { modelMode: mode }); return buildStatusSummary(st); },
     getDiff: (arg = "turn") => {
       syncStateFromDisk(st);
       const rawTokens = arg.trim().split(/\s+/).filter(Boolean), lower = rawTokens.map((t) => t.toLowerCase());
-      const isAll = lower.includes("all"), isFull = lower.includes("full");
-      const fileFilter = rawTokens.find((t) => !/^(?:turn|all|full)$/i.test(t));
-      const top = st.snapshots[st.snapshots.length - 1];
-      const targetSnaps = !isAll && top?.turnId ? st.snapshots.filter((s) => s.turnId === top.turnId) : st.snapshots;
+      const isAll = lower.includes("all"), isFull = lower.includes("full"), fileFilter = rawTokens.find((t) => !/^(?:turn|all|full)$/i.test(t));
+      const top = st.snapshots[st.snapshots.length - 1], targetSnaps = !isAll && top?.turnId ? st.snapshots.filter((s) => s.turnId === top.turnId) : st.snapshots;
       return { files: summarizeSnapshotsDiff(targetSnaps, st.paths.workspaceRoot, isFull), totalSnapshots: st.snapshots.length, formattedText: formatSnapshotsDiff(targetSnaps, st.paths.workspaceRoot, { full: isFull, totalVersions: st.snapshots.length, fileFilter }) };
     },
     undo: (arg = "turn") => executeControllerUndo(st, arg),
@@ -271,8 +228,7 @@ export function createSessionController(options: SessionControllerOptions = {}) 
       if (!candidate) return { ok: false, error: `未找到项目或目录 "${targetArg}"`, status: buildStatusSummary(st), entryCount: 0, recapText: "" };
       const realCandidate = fs.realpathSync(candidate);
       if (realCandidate === st.paths.workspaceRoot) return { ok: true, alreadyInWorkspace: true, status: buildStatusSummary(st), entryCount: loadDiskEntries(st.paths.sessionFile).length, recapText: "" };
-      st.sandboxGrants.reset();
-      st.paths = resolveProjectSessionPaths(realCandidate, st.homeBaseDir);
+      st.sandboxGrants.reset(); st.paths = resolveProjectSessionPaths(realCandidate, st.homeBaseDir);
       const entries = syncStateFromDisk(st);
       st.provider = st.customProvider ?? createRouterProvider(st.paths.wireLogFile, entries.length > 0, () => st.modelMode);
       return { ok: true, status: buildStatusSummary(st, entries), entryCount: entries.length, recapText: formatRecentHistoryRecap(entries, 1, st.leafId) };

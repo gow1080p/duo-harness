@@ -4,8 +4,9 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import type { LlmProvider } from "../core/contracts.js";
-import { createAgyBridgeProvider, probeAgyQuota } from "./agy-bridge.js";
+import { probeAgyQuota } from "./agy-bridge.js";
 import { runAgentSession } from "./cli.js";
+import { createRouterProvider, resolveActiveModelTarget } from "./router.js";
 import { resolveSafePath } from "./tools.js";
 
 export const ReviewFindingSchema = z.object({
@@ -59,7 +60,7 @@ export async function buildRepoMap(workspaceRoot: string, scanDir: string = "src
   return sections.join("\n");
 }
 
-export async function scanArchitectureViolations(workspaceRoot: string, files: string[], maxFileLines: number = 350): Promise<string[]> {
+export async function scanArchitectureViolations(workspaceRoot: string, files: string[], maxFileLines: number = 250): Promise<string[]> {
   const realRoot = resolveSafePath(workspaceRoot, ".", "read"), violations: string[] = [];
   for (const file of files) {
     const fullPath = resolveSafePath(workspaceRoot, file, "read");
@@ -105,25 +106,27 @@ export async function runCodeReview(options: CodeReviewOptions): Promise<{ repor
     const lines = (await fs.readFile(fullPath, "utf-8")).split("\n");
     preloadedSnippets.push(`=== 待审文件: ${file} ===\n${lines.slice(0, 360).map((l, i) => `${i + 1}: ${l}`).join("\n")}`);
   }
-  let activeProvider = options.provider, useAgyOneShot = false;
+  let activeProvider = options.provider;
+  const reviewWireLog = path.join(os.tmpdir(), "duo-review-wire.json");
   if (!activeProvider) {
-    const quota = await probeAgyQuota();
-    if (quota.shouldPreferAgy) { activeProvider = createAgyBridgeProvider(); useAgyOneShot = true; }
+    const hasAgyKey = Boolean(resolveActiveModelTarget(reviewWireLog, false, "agy", Date.now(), false, workspaceRoot).apiKey);
+    const quota = hasAgyKey ? await probeAgyQuota() : null;
+    if (hasAgyKey && quota?.shouldPreferAgy) activeProvider = createRouterProvider(reviewWireLog, false, () => "agy");
   }
   const reviewPrompt = [
     "请对以下目标文件执行独立代码与架构审查。",
     "【全库 RepoMap 符号骨架图 (供跨文件调用定位行号)】:", repoMap,
     "【本地确定性静态规则扫描结果】:", staticViolations.length > 0 ? staticViolations.join("\n") : "0 项静态违规",
     "【待审文件带行号源码】:", preloadedSnippets.join("\n\n"),
-    useAgyOneShot ? "以上已预加载完整待审源码与全库符号骨架，请直接基于现有信息完成单轮审查，切勿调用任何工具。" : "若待审文件调用了其他未预加载文件中的函数，请先调用 read_file 或 grep 工具核实上下游定义，禁止盲猜。",
+    "若待审文件调用了其他未预加载文件中的函数，请先调用 read_file 或 grep 工具核实上下游定义，禁止盲猜。",
     '审查完成后，必须只输出符合以下格式的纯 JSON：{"passed":boolean,"staticViolations":string[],"findings":[{"file":string,"line":number,"severity":"error"|"warning"|"info","issue":string,"fix":string}]}',
   ].join("\n\n");
 
   let verifiedReport: ReviewReport | null = null;
   const sessionResult = await runAgentSession(reviewPrompt, {
     workspaceRoot, provider: activeProvider, enableWriteTools: false,
-    maxSteps: options.maxSteps ?? (useAgyOneShot ? 2 : 6), sessionFile: options.sessionFile,
-    wireLogFile: path.join(os.tmpdir(), "duo-review-wire.json"),
+    maxSteps: options.maxSteps ?? 6, sessionFile: options.sessionFile,
+    wireLogFile: reviewWireLog,
     systemPrompt: "你是严谨的代码与架构审查特工。只允许使用只读工具追查跨文件引用，最终回答必须是严格的 ReviewReport JSON 对象。",
     verifyCompletion: (finalAnswer) => {
       const check = parseReviewReport(finalAnswer);

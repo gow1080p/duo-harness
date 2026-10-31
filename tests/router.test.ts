@@ -257,9 +257,11 @@ describe("Step 1.4: src/adapters/router.ts 协议转换与分时路由测试", (
     const forced = resolveActiveModelTarget(wireFile, true, "mimo", monPeakUtc);
     expect(forced.model).toBe("mimo-v2.6-pro");
 
-    // 显式指定 /model agy：走本机 Antigravity 订阅额度桥接
+    // 显式指定 /model agy：走 OpenAI 兼容订阅网关 (gemini.gow1080p.cn)
     const agyTarget = resolveActiveModelTarget(wireFile, true, "agy", monPeakUtc);
-    expect(agyTarget.model).toBe("gemini-4-argon-agy");
+    expect(agyTarget.protocol).toBe("openai");
+    expect(agyTarget.model).toBe("gemini-4-argon-high");
+    expect(agyTarget.apiUrl).toBe("https://gemini.gow1080p.cn/v1/chat/completions");
     expect(agyTarget.shortLabel).toContain("Argon");
 
     fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -295,7 +297,7 @@ describe("Step 1.4: src/adapters/router.ts 协议转换与分时路由测试", (
     expect((parsedToolReply.toolCalls?.[0]?.arguments as any)?.edits).toHaveLength(1);
     expect(parsedToolReply.reasoningContent).toBe("先改文件");
 
-    // cost-tracker 对 gemini-4-argon-agy 计为 ¥0
+    // cost-tracker 对 gemini-4-argon-agy 实付计为 ¥0，并折算 5h 订阅额度百分比
     const report = summarizeWireCost([
       {
         roundTimestamp: "2026-10-22T10:30:00.000Z",
@@ -306,6 +308,7 @@ describe("Step 1.4: src/adapters/router.ts 协议转换与分时路由测试", (
       },
     ]);
     expect(report.totalCostCny).toBe(0);
+    expect(report.totalQuotaPct).toBeGreaterThan(0.008);
     expect(report.periodLabel).toContain("Antigravity");
   });
 

@@ -5,8 +5,9 @@ import type { ImageAttachment } from "../core/contracts.js";
 import { expandHomePath, toPosixRelative } from "./platform.js";
 import { checkHardDeniedPath, resolveExistingRealPath } from "./sandbox-policy.js";
 import { BINARY_EXT_RE, IGNORED_DIRS, resolveSafePath, type SandboxGrants } from "./tools.js";
+import { invalidateSkillsCache } from "./skill-loader.js";
 import { captureClipboardImage, captureHeadlessScreenshot, findHeadlessBrowserBinary, hasPngMagicBytes, parseShotCommandArgs, persistHashedDebugPng } from "./vision-capture.js";
-import { runCommandInSandbox } from "./write-tools.js";
+import { runCommandInSandbox } from "./bash-tool.js";
 
 export { captureClipboardImage, captureHeadlessScreenshot, findHeadlessBrowserBinary, hasPngMagicBytes, parseShotCommandArgs, persistHashedDebugPng };
 
@@ -14,21 +15,30 @@ export const IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp)$/i;
 
 function getImageMimeType(filePath: string): string {
   const ext = path.extname(filePath).toLowerCase();
-  if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
-  if (ext === ".gif") return "image/gif";
-  if (ext === ".webp") return "image/webp";
-  return "image/png";
+  return ext === ".jpg" || ext === ".jpeg" ? "image/jpeg" : ext === ".gif" ? "image/gif" : ext === ".webp" ? "image/webp" : "image/png";
 }
 
-const workspaceFilesCache = new Map<string, { ts: number; files: string[] }>();
+const workspaceFilesCache = new Map<string, { realRoot: string; ts: number; rootMtimeMs: number; files: string[] }>();
 const ALLOWED_DOT_DIRS = new Set([".debug", ".claude", ".agents", ".pi", ".duo-harness", ".github"]);
 const HOME_HEAVY_DIRS = new Set(["AppData", "Library", "Applications", "Downloads", "Pictures", "Movies", "Music", "Videos", "OneDrive", "scoop", "target", "coverage"]);
 
+export function invalidateWorkspaceFilesCache(): void {
+  workspaceFilesCache.clear();
+  invalidateSkillsCache();
+}
+
 export function listWorkspaceFiles(workspaceRoot: string, maxFiles = 1200): string[] {
-  const realRoot = fs.existsSync(workspaceRoot) ? fs.realpathSync(workspaceRoot) : path.resolve(workspaceRoot);
-  const now = Date.now(), cached = workspaceFilesCache.get(realRoot);
-  if (cached && now - cached.ts < 3_000) return cached.files;
+  const key = process.platform === "win32" ? path.resolve(workspaceRoot).toLowerCase() : path.resolve(workspaceRoot);
+  const now = Date.now(), cached = workspaceFilesCache.get(key);
+  if (cached && now - cached.ts < 15_000) return cached.files;
+  if (cached && now - cached.ts < 60_000) {
+    try {
+      if (fs.statSync(cached.realRoot).mtimeMs === cached.rootMtimeMs) { cached.ts = now; return cached.files; }
+    } catch {}
+  }
   try {
+    const realRoot = fs.existsSync(workspaceRoot) ? fs.realpathSync(workspaceRoot) : path.resolve(workspaceRoot);
+    const rootMtimeMs = fs.existsSync(realRoot) ? fs.statSync(realRoot).mtimeMs : 0;
     const seen = new Set<string>(), isHomeRoot = path.resolve(realRoot).toLowerCase() === path.resolve(os.homedir()).toLowerCase();
     for (const debugImg of ["shot.png", "clipboard.png"]) {
       if (fs.existsSync(path.join(realRoot, ".debug", debugImg))) seen.add(`.debug/${debugImg}`);
@@ -49,11 +59,21 @@ export function listWorkspaceFiles(workspaceRoot: string, maxFiles = 1200): stri
       }
     }
     const files = [...seen].sort((a, b) => a.split("/").length - b.split("/").length || a.localeCompare(b));
-    workspaceFilesCache.set(realRoot, { ts: now, files });
+    workspaceFilesCache.set(key, { realRoot, ts: now, rootMtimeMs, files });
     return files;
-  } catch {
-    return [];
+  } catch { return []; }
+}
+
+function scoreSubsequence(target: string, query: string): number {
+  let qIdx = 0, consecutive = 0, boundaryHits = 0, lastMatch = -2;
+  for (let i = 0; i < target.length && qIdx < query.length; i++) {
+    if (target[i] === query[qIdx]) {
+      if (i === 0 || /[\/._\-]/.test(target[i - 1]!)) boundaryHits++;
+      if (lastMatch === i - 1) consecutive++;
+      lastMatch = i; qIdx++;
+    }
   }
+  return qIdx < query.length ? 0 : 10 + boundaryHits * 3 + consecutive * 2;
 }
 
 export function filterAndRankFiles(files: readonly string[], rawQuery: string, limit = 8): string[] {
@@ -62,7 +82,9 @@ export function filterAndRankFiles(files: readonly string[], rawQuery: string, l
   const scored: Array<{ file: string; score: number }> = [];
   for (const file of files) {
     const lower = file.toLowerCase(), base = path.posix.basename(lower);
-    const score = base === q ? 100 : base.startsWith(q) ? 80 : base.includes(q) ? 50 : lower.includes(q) ? 30 : 0;
+    const exactScore = base === q ? 100 : base.startsWith(q) ? 80 : base.includes(q) ? 50 : lower.includes(q) ? 30 : 0;
+    const baseSub = exactScore === 0 && q.length >= 2 ? scoreSubsequence(base, q) : 0;
+    const score = exactScore || (baseSub > 0 ? Math.min(28, baseSub + 4) : q.length >= 2 ? Math.min(26, scoreSubsequence(lower, q)) : 0);
     if (score > 0) scored.push({ file, score });
   }
   return scored.sort((a, b) => b.score - a.score || a.file.split("/").length - b.file.split("/").length || a.file.localeCompare(b.file)).slice(0, limit).map((x) => x.file);
@@ -99,40 +121,24 @@ export function buildAtMentionDropdown(
 
 export function stripAttachedFiles(raw: string): string {
   if (!raw || (!raw.includes("<attached_file") && !raw.includes("<context_state") && !raw.includes("[已折叠历史引用文件 @") && !raw.includes("[已折叠历史图片 @") && !raw.includes("[已折叠历史上下文状态"))) return raw;
-  const stripped = raw
-    .replace(/\s*<attached_file\b[^>]*>[\s\S]*?<\/attached_file>/g, "")
-    .replace(/\s*<context_state\b[^>]*>[\s\S]*?<\/context_state>/g, "")
-    .replace(/\s*\[已折叠历史(?:引用文件|图片) @[^\]]+\]/g, "")
-    .replace(/\s*\[已折叠历史上下文状态 [^\]]+\]/g, "")
-    .trim();
+  const stripped = raw.replace(/\s*<attached_file\b[^>]*>[\s\S]*?<\/attached_file>/g, "").replace(/\s*<context_state\b[^>]*>[\s\S]*?<\/context_state>/g, "").replace(/\s*\[已折叠历史(?:引用文件|图片) @[^\]]+\]/g, "").replace(/\s*\[已折叠历史上下文状态 [^\]]+\]/g, "").trim();
   if (stripped) return stripped;
   const paths = [...raw.matchAll(/(?:<attached_file\s+path="([^"]+)"|\[已折叠历史(?:引用文件|图片) @([^\]]+?)(?:\s*\((?:原长|\d+\s*KB)[^\]]*\))?\])/g)].map((m) => `@${(m[1] ?? m[2] ?? "").trim()}`);
   return paths.length > 0 ? `[引用文件: ${paths.join(", ")}]` : raw.slice(0, 80).trim();
 }
-
-export interface ParsedAttachmentToken {
-  target: string;
-  startLine?: number;
-  endLine?: number;
-  isClipboard?: boolean;
-}
-
+export interface ParsedAttachmentToken { target: string; startLine?: number; endLine?: number; isClipboard?: boolean; }
 export function extractAttachmentTokens(prompt: string): ParsedAttachmentToken[] {
   const tokens: ParsedAttachmentToken[] = [];
   const pushFileToken = (rawToken: string, explicitRange?: { start?: string; end?: string }, isExplicitAt = true) => {
     const unescaped = rawToken.replace(/\\ /g, " ").replace(/[.:;!?]+$/, "").trim();
     if (!unescaped) return;
-    if (isExplicitAt && (unescaped.toLowerCase() === "clipboard" || unescaped.toLowerCase() === "paste")) {
-      tokens.push({ target: "@clipboard", isClipboard: true });
-      return;
-    }
+    if (isExplicitAt && (unescaped.toLowerCase() === "clipboard" || unescaped.toLowerCase() === "paste")) { tokens.push({ target: "@clipboard", isClipboard: true }); return; }
     const rangeMatch = !explicitRange?.start ? unescaped.match(/^(.+?):(\d+)(?:-(\d+))?$/) : null;
     const target = rangeMatch ? rangeMatch[1]! : unescaped;
     const sStr = explicitRange?.start ?? rangeMatch?.[2], eStr = explicitRange?.end ?? rangeMatch?.[3];
     tokens.push({ target, ...(sStr ? { startLine: Math.max(1, Number(sStr)) } : {}), ...(eStr ? { endLine: Number(eStr) } : {}) });
   };
-  const pattern =
-    /(?:^|[\s(])@"([^"]+)"(?::(\d+)(?:-(\d+))?)?|(?:^|[\s(])@'([^']+)'(?::(\d+)(?:-(\d+))?)?|(?:^|[\s(])@((?:\\ |[^\s,;'"`<>()])+)|(?:'((?:\/|~\/|[A-Za-z]:[\\/])[^'\r\n]+)'|"((?:\/|~\/|[A-Za-z]:[\\/])[^"\r\n]+)")|(?:^|[\s(])((?:\/|~\/|[A-Za-z]:[\\/])(?:\\ |[^\s,;'"`<>()])+)/g;
+  const pattern = /(?:^|[\s(])@"([^"]+)"(?::(\d+)(?:-(\d+))?)?|(?:^|[\s(])@'([^']+)'(?::(\d+)(?:-(\d+))?)?|(?:^|[\s(])@((?:\\ |[^\s,;'"`<>()])+)|(?:'((?:\/|~\/|[A-Za-z]:[\\/])[^'\r\n]+)'|"((?:\/|~\/|[A-Za-z]:[\\/])[^"\r\n]+)")|(?:^|[\s(])((?:\/|~\/|[A-Za-z]:[\\/])(?:\\ |[^\s,;'"`<>()])+)/g;
   for (const m of prompt.matchAll(pattern)) {
     if (m[1] !== undefined) pushFileToken(m[1], { start: m[2], end: m[3] }, true);
     else if (m[4] !== undefined) pushFileToken(m[4], { start: m[5], end: m[6] }, true);
@@ -145,13 +151,7 @@ export function extractAttachmentTokens(prompt: string): ParsedAttachmentToken[]
   }
   return tokens;
 }
-
-export function expandAtMentions(
-  prompt: string,
-  workspaceRoot: string,
-  maxLinesPerFile = 300,
-  grants?: SandboxGrants,
-): { expandedPrompt: string; attachedPaths: string[]; attachedImages: ImageAttachment[] } {
+export function expandAtMentions(prompt: string, workspaceRoot: string, maxLinesPerFile = 300, grants?: SandboxGrants): { expandedPrompt: string; attachedPaths: string[]; attachedImages: ImageAttachment[] } {
   const tokens = extractAttachmentTokens(prompt);
   if (tokens.length === 0) return { expandedPrompt: prompt, attachedPaths: [], attachedImages: [] };
   const realRoot = fs.existsSync(workspaceRoot) ? fs.realpathSync(workspaceRoot) : path.resolve(workspaceRoot);

@@ -3,10 +3,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import { buildDefaultSystemPrompt, normalizeBashCommandForCwd } from "../src/adapters/bash-policy.js";
+import { listBackgroundTasks, stopBackgroundTask } from "../src/adapters/bg-process.js";
 import { runAgentSession } from "../src/adapters/cli.js";
 import { filterAndRankFiles, listWorkspaceFiles } from "../src/adapters/context-mention.js";
 import { attachLiveSlashDropdown, buildDropdownItems } from "../src/adapters/dropdown.js";
-import { cleanPlanArtifactText, extractPlanSteps, formatPlanProgressBanner, handlePlanAndSessionCmd, resolveGoalTaskAndContext } from "../src/adapters/plan-flow.js";
+import { cleanPlanArtifactText, extractPlanSteps, formatPlanProgressBanner, handlePlanAndSessionCmd, resolveGoalTaskAndContext, verifyGoalCompletion } from "../src/adapters/plan-flow.js";
 import { createReplCompleter, listManagedProjects, resolveProjectSessionPaths, resolveStartupWorkspace } from "../src/adapters/project-store.js";
 import { handleSlashCommand } from "../src/adapters/repl.js";
 import { scanArchitectureViolations } from "../src/adapters/reviewer.js";
@@ -15,7 +16,7 @@ import { createSessionController } from "../src/adapters/session-controller.js";
 import { expandSkillSlashCommand } from "../src/adapters/skill-loader.js";
 import { createStreamRenderer } from "../src/adapters/sse-stream.js";
 import { createBuiltinTools } from "../src/adapters/tools.js";
-import { createWriteTools, killTrackedChildren } from "../src/adapters/write-tools.js";
+import { createWriteTools, killTrackedChildren, runCommandInSandbox } from "../src/adapters/write-tools.js";
 
 describe("Claude Code 2.0 极简增强闭环验证 (background bash + leafId rewind + updatedCalls)", () => {
   it("1. run_bash(background: true): 常驻服务首屏快速返回、后续写日志零 SIGPIPE、read_file 免审读取日志与 killTrackedChildren 清剿", async () => {
@@ -206,21 +207,14 @@ describe("Claude Code 2.0 极简增强闭环验证 (background bash + leafId rew
     }
   });
 
-  it("4. 架构体积与单函数行数预算守恒（修改文件均 <= 350 行且 runCommandInSandbox <= 80 行）", async () => {
-    const violations = await scanArchitectureViolations(process.cwd(), [
-      "src/adapters/bash-tool.ts",
-      "src/adapters/sandbox-policy.ts",
-      "src/adapters/bash-policy.ts",
-      "src/adapters/write-tools.ts",
-      "src/adapters/plan-flow.ts",
-      "src/adapters/session-controller.ts",
-      "src/adapters/cli.ts",
-      "src/adapters/ui-logger.ts",
-      "src/adapters/sse-stream.ts",
-      "src/adapters/repl.ts",
-      "src/adapters/dropdown.ts",
-      "src/adapters/project-store.ts",
-    ]);
+  it("4. 架构体积与单函数行数预算守恒（全部 src/**/*.ts 文件均 <= 250 行且 runCommandInSandbox <= 80 行）", async () => {
+    const walkTs = (dir: string): string[] =>
+      fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) => {
+        const full = path.join(dir, e.name);
+        return e.isDirectory() ? walkTs(full) : e.name.endsWith(".ts") ? [path.relative(process.cwd(), full).replace(/\\/g, "/")] : [];
+      });
+    const allSrcFiles = walkTs(path.resolve(process.cwd(), "src"));
+    const violations = await scanArchitectureViolations(process.cwd(), allSrcFiles);
     expect(violations).toEqual([]);
     const bashSrc = fs.readFileSync(path.resolve(process.cwd(), "src/adapters/bash-tool.ts"), "utf-8").split("\n");
     const fnStart = bashSrc.findIndex((l) => l.startsWith("export function runCommandInSandbox("));
@@ -411,6 +405,153 @@ describe("Claude Code 2.0 极简增强闭环验证 (background bash + leafId rew
       expect(listManagedProjects(tmpWs).length).toBeGreaterThanOrEqual(1);
       expect(performance.now() - t0).toBeLessThan(15);
     } finally {
+      fs.rmSync(tmpWs, { recursive: true, force: true });
+    }
+  });
+
+  it("6. 竞品精华补齐闭环：/ps 后台进程面板与防回车误杀、文件名优先子序列模糊检索与写盘失效缓存、/goal 后台服务崩溃与日志异常门禁", async () => {
+    const tmpWs = fs.mkdtempSync(path.join(os.tmpdir(), "duo-cc2-cap-"));
+    try {
+      const ctrl = createSessionController({ workspaceRoot: tmpWs, homeBaseDir: tmpWs });
+      // (a) 0 任务时 /ps 下拉菜单返回安全保底项
+      expect(buildDropdownItems("/ps ", tmpWs).map((d) => d.fillText)).toEqual(["/ps"]);
+      expect(buildDropdownItems("/ps", tmpWs).some((d) => d.fillText === "/ps")).toBe(true);
+
+      // (b) 启动后台常驻服务：/ps 首项仍为 /ps 查看指令（防回车误杀），/ps kill 过滤至终止项，非托管 PID 拒绝越权终止
+      await runCommandInSandbox('node -e "console.log(\'ready on 4173\'); setInterval(()=>{}, 1000)"', tmpWs, 10_000, undefined, false, tmpWs, undefined, { background: true, startupWaitMs: 300 });
+      const active = listBackgroundTasks(tmpWs);
+      expect(active.length).toBe(1);
+      expect(active[0]!.status).toBe("running");
+      const psMenu = buildDropdownItems("/ps ", tmpWs);
+      expect(psMenu[0]!.fillText).toBe("/ps");
+      expect(psMenu.some((d) => d.fillText === `/ps kill ${active[0]!.pid}`)).toBe(true);
+      expect(psMenu.some((d) => d.fillText === "/ps kill all")).toBe(true);
+      expect(buildDropdownItems("/ps k", tmpWs)[0]!.fillText).toBe(`/ps kill ${active[0]!.pid}`);
+      expect(stopBackgroundTask(99999999, tmpWs)).toEqual([]);
+      expect(handlePlanAndSessionCmd("/ps", ctrl)).toBe(true);
+      expect(handlePlanAndSessionCmd("/ps kill all", ctrl)).toBe(true);
+      expect(listBackgroundTasks(tmpWs)).toEqual([]);
+
+      // (c) 后台服务在 1500ms 窗口内闪电崩溃：标记为 crashed 并由 verifyGoalCompletion 拦截打回 1 次（防死循环）
+      await runCommandInSandbox('node -e "console.error(\'Uncaught Error: EADDRINUSE :::4173\'); process.exit(1)"', tmpWs, 10_000, undefined, false, tmpWs, undefined, { background: true, startupWaitMs: 600 });
+      const crashed = listBackgroundTasks(tmpWs);
+      expect(crashed.some((t) => t.status === "crashed")).toBe(true);
+      const gate1 = await verifyGoalCompletion(tmpWs, "已完成全部服务改造并启动成功。", undefined, true);
+      expect(gate1.ok).toBe(false);
+      expect(gate1.errorOutput).toContain("已异常退出");
+      expect(gate1.errorOutput).toContain("EADDRINUSE");
+      const gate2 = await verifyGoalCompletion(tmpWs, "已完成全部服务改造并启动成功。", undefined, true);
+      expect(gate2.ok).toBe(true);
+
+      // (d) 文件名优先子序列模糊检索 (@stool / @basht) + edit_file 写盘自动失效缓存
+      const candidates = ["src/adapters/bash-tool.ts", "src/adapters/session-tool.ts", "docs/api/auth-plan.md"];
+      expect(filterAndRankFiles(candidates, "stool")[0]).toBe("src/adapters/session-tool.ts");
+      expect(filterAndRankFiles(candidates, "basht")[0]).toBe("src/adapters/bash-tool.ts");
+      expect(listWorkspaceFiles(tmpWs)).not.toContain("src/newly-created.ts");
+      const [editFileTool] = createWriteTools(tmpWs);
+      await editFileTool!.execute({ path: "src/newly-created.ts", oldText: "", newText: "export const x = 1;\n" });
+      expect(listWorkspaceFiles(tmpWs)).toContain("src/newly-created.ts");
+    } finally {
+      killTrackedChildren();
+      fs.rmSync(tmpWs, { recursive: true, force: true });
+    }
+  });
+
+  it("7. 优雅完全体四合一：delegate_research 单路/并行只读子代理与 .claude/agents/*.md 加载、fetch_url SSRF/DNS-Rebinding 双重防护与分页、多语言/自定义 /verify 门禁", async () => {
+    const tmpWs = fs.mkdtempSync(path.join(os.tmpdir(), "duo-elegance-v2-"));
+    try {
+      // (a) 自定义 .claude/agents/security.md 发现与 delegate_research 单路 & tasks 并行扇出（锁死只读工具、透传父 provider/sandboxGrants）
+      fs.mkdirSync(path.join(tmpWs, ".claude", "agents"), { recursive: true });
+      fs.writeFileSync(
+        path.join(tmpWs, ".claude", "agents", "security.md"),
+        "---\nname: security\ndescription: 安全审计专家\nmaxSteps: 6\n---\n你是安全审计子代理，请仅输出审计结论。",
+        "utf-8",
+      );
+      const seenTools: string[][] = [];
+      const mockProvider = {
+        async chat(msgs: readonly any[], tools?: readonly any[]) {
+          seenTools.push((tools ?? []).map((t) => t.name));
+          const userMsg = msgs.find((m) => m.role === "user")?.content ?? "";
+          return { role: "assistant" as const, content: `子代理已完成: ${userMsg.slice(0, 40)}` };
+        },
+      };
+      const builtins = createBuiltinTools(tmpWs, undefined, { provider: mockProvider });
+      const delegateTool = builtins.find((t) => t.name === "delegate_research")!;
+      expect(delegateTool).toBeDefined();
+      const singleOut = (await delegateTool.execute({ task: "检查鉴权模块", agent: "security" })) as string;
+      expect(singleOut).toContain("子代理已完成: 检查鉴权模块");
+      expect(seenTools[0]).toEqual(["read_file", "list_dir", "grep", "fetch_url"]);
+
+      const parallelOut = (await delegateTool.execute({
+        tasks: [
+          { task: "分析路由层", agent: "security" },
+          { task: "分析存储层" },
+        ],
+      })) as string;
+      expect(parallelOut).toContain("=== 子代理 #1 (security");
+      expect(parallelOut).toContain("=== 子代理 #2 (explore");
+
+      // (b) fetch_url：WHATWG IPv4-mapped IPv6 ([::ffff:169.254.169.254])、阿里云 100.100.100.200、环回 127.0.0.1 静态与 DNS 解析拦截 + HTML 转净荷 Markdown
+      const { executeWebFetch, htmlToCleanMarkdown, isBlockedFetchUrl, isBlockedIpAddress } = await import("../src/adapters/web-fetch-tool.js");
+      expect(isBlockedFetchUrl("http://169.254.169.254/latest/meta-data").blocked).toBe(true);
+      expect(isBlockedFetchUrl("http://[::ffff:169.254.169.254]/latest/meta-data").blocked).toBe(true);
+      expect(isBlockedFetchUrl("http://100.100.100.200/latest/meta-data").blocked).toBe(true);
+      expect(isBlockedFetchUrl("http://127.0.0.1:8080/admin").blocked).toBe(true);
+      expect(isBlockedIpAddress("::ffff:a9fe:a9fe")).toBe(true);
+      expect(isBlockedIpAddress("100.64.1.1")).toBe(true);
+      expect(isBlockedIpAddress("93.184.216.34")).toBe(false);
+
+      // DNS Rebinding 与 302 跳转内网拦截 + offset 分页续读
+      await expect(
+        executeWebFetch(
+          { url: "https://rebind.example.com/doc" },
+          { dnsLookup: async () => [{ address: "127.0.0.1", family: 4 }] },
+        ),
+      ).rejects.toThrow("解析到受限内网或回环地址");
+
+      await expect(
+        executeWebFetch(
+          { url: "https://public.example.com/jump" },
+          {
+            dnsLookup: async () => [{ address: "93.184.216.34", family: 4 }],
+            fetchImpl: async () => new Response(null, { status: 302, headers: { location: "http://169.254.169.254/latest" } }),
+          },
+        ),
+      ).rejects.toThrow("沙箱安全拦截");
+
+      const page1 = await executeWebFetch(
+        { url: "https://public.example.com/guide", offset: 0, maxChars: 500 },
+        {
+          dnsLookup: async () => [{ address: "93.184.216.34", family: 4 }],
+          fetchImpl: async () => new Response(`<h1>Guide</h1><p>${"A".repeat(600)}</p>`, { status: 200, headers: { "content-type": "text/html" } }),
+        },
+      );
+      expect(page1).toContain("# Guide");
+      expect(page1).toContain("offset: 500");
+
+      const cleanMd = htmlToCleanMarkdown("<html><head><style>body{color:red}</style><script>alert(1)</script></head><body><h1>API Title</h1><p>Visit <a href='https://example.com/docs'>Docs</a> &amp; enjoy.</p><pre><code>const a = 1;</code></pre></body></html>");
+      expect(cleanMd).toContain("# API Title");
+      expect(cleanMd).toContain("[Docs](https://example.com/docs) & enjoy.");
+      expect(cleanMd).not.toContain("alert(1)");
+
+      const fetchTool = builtins.find((t) => t.name === "fetch_url")!;
+      await expect(fetchTool.execute({ url: "http://[::ffff:169.254.169.254]/latest" })).rejects.toThrow("沙箱安全拦截");
+
+      // (c) /verify 自定义命令配置与多语言（Python 含空格路径 py_compile）完成前门禁
+      const ctrl = createSessionController({ workspaceRoot: tmpWs, homeBaseDir: tmpWs });
+      expect(buildDropdownItems("/verify ", tmpWs).map((d) => d.label)).toContain("/verify off");
+      expect(handlePlanAndSessionCmd("/verify off", ctrl)).toBe(true);
+      const skippedGate = await verifyGoalCompletion(tmpWs, "已完成全部修改。", undefined, false, ["bad file.py"]);
+      expect(skippedGate.ok).toBe(true);
+      expect((skippedGate as { skipped?: boolean }).skipped).toBe(true);
+
+      expect(handlePlanAndSessionCmd("/verify auto", ctrl)).toBe(true);
+      expect(handlePlanAndSessionCmd("/verify node -e \"process.exit(1)\"", ctrl)).toBe(true);
+      const customFailGate = await verifyGoalCompletion(tmpWs, "已完成全部修改。", undefined, false, ["README.md"]);
+      expect(customFailGate.ok).toBe(false);
+      expect(customFailGate.errorOutput).toContain("未通过");
+    } finally {
+      killTrackedChildren();
       fs.rmSync(tmpWs, { recursive: true, force: true });
     }
   });

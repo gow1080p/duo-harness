@@ -3,49 +3,34 @@ import { getVisualCols, shortenWorkspaceText, truncateCols } from "./platform.js
 import type { FileVersionSnapshot } from "./write-tools.js";
 
 export interface FileDiffSummaryItem {
-  file: string;
-  isNew: boolean;
-  edits: number;
-  oldLines: number;
-  newLines: number;
-  addedLines: number;
-  removedLines: number;
-  removedPreview: string[];
-  addedPreview: string[];
-  totalHunks?: number;
-  hunksPreview?: { removed: string[]; added: string[]; totalRemoved?: number; totalAdded?: number }[];
+  file: string; isNew: boolean; edits: number; oldLines: number; newLines: number;
+  addedLines: number; removedLines: number; removedPreview: string[]; addedPreview: string[];
+  totalHunks?: number; hunksPreview?: { removed: string[]; added: string[]; totalRemoved?: number; totalAdded?: number }[];
 }
 
 export function normalizeEditsArray(rawEdits: unknown): { oldText?: string; newText?: string }[] {
   let arr: unknown[] = Array.isArray(rawEdits) ? rawEdits : [];
   if (!Array.isArray(rawEdits) && typeof rawEdits === "string") {
-    try {
-      const parsed = JSON.parse(rawEdits);
-      if (Array.isArray(parsed)) arr = parsed;
-    } catch {}
+    try { const parsed = JSON.parse(rawEdits); if (Array.isArray(parsed)) arr = parsed; } catch {}
   }
   return arr.filter((x): x is { oldText?: string; newText?: string } => Boolean(x && typeof x === "object"));
 }
 
-export function truncateVisualCols(text: string, maxCols = 66): string {
-  return truncateCols(text, maxCols, "...");
-}
+export function truncateVisualCols(text: string, maxCols = 66): string { return truncateCols(text, maxCols, "..."); }
 
 export function highlightCodeLine(raw: string): string {
   const expanded = raw.replace(/\t/g, "  ");
   if (/^(?:\/\/|#|--)/.test(expanded.trim())) return `\x1b[90m\x1b[3m${expanded}\x1b[0m`;
   return expanded.replace(
     /("[^"\\]*(?:\\.[^"\\]*)*"|'[^'\\]*(?:\\.[^'\\]*)*'|`[^`]*`)|(?<![./\w])(package|import|func|type|struct|interface|return|if|else|for|range|switch|case|default|defer|go|var|const|let|export|from|async|await|class|function|def|fn|pub|impl|match|use|mod|trait|enum|CREATE|TABLE|IF|NOT|EXISTS|INSERT|INTO|VALUES|SELECT|FROM|WHERE|JOIN|ON|UPDATE|SET|ORDER|BY|PRIMARY|KEY)(?![./\w])|(?<![./\w])(true|false|null|undefined|nil|None|True|False|\d+(?:\.\d+)?)(?![./\w])/g,
-    (_m, strLit: string | undefined, kw: string | undefined) => (strLit ? `\x1b[32m${strLit}\x1b[0m` : kw ? `\x1b[1;35m${kw}\x1b[0m` : `\x1b[33m${_m}\x1b[0m`)
+    (_m, strLit: string | undefined, kw: string | undefined) => (strLit ? `\x1b[32m${strLit}\x1b[0m` : kw ? `\x1b[1;35m${kw}\x1b[0m` : `\x1b[33m${_m}\x1b[0m`),
   );
 }
 
 export function parseFileLineTarget(rawInput: string): { filePath: string; startLine?: number; endLine?: number } {
-  const trimmed = rawInput.trim();
-  const m = trimmed.match(/^(.+?):(\d+)(?:-(\d+))?$/);
+  const trimmed = rawInput.trim(), m = trimmed.match(/^(.+?):(\d+)(?:-(\d+))?$/);
   if (!m) return { filePath: trimmed };
-  const startLine = Math.max(1, Number(m[2]));
-  const endLine = m[3] ? Math.max(startLine, Number(m[3])) : undefined;
+  const startLine = Math.max(1, Number(m[2])), endLine = m[3] ? Math.max(startLine, Number(m[3])) : undefined;
   return { filePath: m[1]!, startLine, ...(endLine !== undefined ? { endLine } : {}) };
 }
 
@@ -74,14 +59,11 @@ export function extractCodeOutline(lines: readonly string[]): string[] {
   return symbols;
 }
 
-const BG_REM_LINE = "\x1b[22;31m\x1b[48;2;45;18;22m";
-const BG_REM_WORD = "\x1b[48;2;115;32;42m\x1b[1;97m";
-const BG_ADD_LINE = "\x1b[22;32m\x1b[48;2;16;46;28m";
-const BG_ADD_WORD = "\x1b[48;2;28;105;55m\x1b[1;97m";
+const BG_REM_LINE = "\x1b[22;31m\x1b[48;2;45;18;22m", BG_REM_WORD = "\x1b[48;2;115;32;42m\x1b[1;97m";
+const BG_ADD_LINE = "\x1b[22;32m\x1b[48;2;16;46;28m", BG_ADD_WORD = "\x1b[48;2;28;105;55m\x1b[1;97m";
 
 export function formatIntraLineDiffPair(oldLine: string, newLine: string, maxCols = 88): { remFormatted: string; addFormatted: string } {
-  const cleanOld = oldLine.replace(/\t/g, "  ");
-  const cleanNew = newLine.replace(/\t/g, "  ");
+  const cleanOld = oldLine.replace(/\t/g, "  "), cleanNew = newLine.replace(/\t/g, "  ");
   if (cleanOld.length * cleanNew.length > 160_000) {
     return {
       remFormatted: `${BG_REM_LINE}- ${truncateCols(cleanOld, maxCols, `${BG_REM_LINE}...`)}\x1b[0m`,
@@ -95,34 +77,15 @@ export function formatIntraLineDiffPair(oldLine: string, newLine: string, maxCol
   for (const part of parts) {
     if (part.removed) {
       let val = part.value;
-      if (isFirstRem) {
-        const ws = val.match(/^(\s*)/)?.[1] ?? "";
-        val = val.slice(ws.length);
-        remInline += ws; curRemCol += getVisualCols(ws);
-        isFirstRem = false;
-      }
-      if (val) {
-        remInline += `${BG_REM_WORD}${val}${BG_REM_LINE}`;
-        curRemCol += getVisualCols(val); remEndCol = curRemCol;
-        if (val.trim()) remChanged.push(val.trim());
-      }
+      if (isFirstRem) { const ws = val.match(/^(\s*)/)?.[1] ?? ""; val = val.slice(ws.length); remInline += ws; curRemCol += getVisualCols(ws); isFirstRem = false; }
+      if (val) { remInline += `${BG_REM_WORD}${val}${BG_REM_LINE}`; curRemCol += getVisualCols(val); remEndCol = curRemCol; if (val.trim()) remChanged.push(val.trim()); }
     } else if (part.added) {
       let val = part.value;
-      if (isFirstAdd) {
-        const ws = val.match(/^(\s*)/)?.[1] ?? "";
-        val = val.slice(ws.length);
-        addInline += ws; curAddCol += getVisualCols(ws);
-        isFirstAdd = false;
-      }
-      if (val) {
-        addInline += `${BG_ADD_WORD}${val}${BG_ADD_LINE}`;
-        curAddCol += getVisualCols(val); addEndCol = curAddCol;
-        if (val.trim()) addChanged.push(val.trim());
-      }
+      if (isFirstAdd) { const ws = val.match(/^(\s*)/)?.[1] ?? ""; val = val.slice(ws.length); addInline += ws; curAddCol += getVisualCols(ws); isFirstAdd = false; }
+      if (val) { addInline += `${BG_ADD_WORD}${val}${BG_ADD_LINE}`; curAddCol += getVisualCols(val); addEndCol = curAddCol; if (val.trim()) addChanged.push(val.trim()); }
     } else {
       if (part.value.trim().length > 0) { isFirstRem = false; isFirstAdd = false; }
-      remInline += part.value; addInline += part.value;
-      curRemCol += getVisualCols(part.value); curAddCol += getVisualCols(part.value);
+      remInline += part.value; addInline += part.value; curRemCol += getVisualCols(part.value); curAddCol += getVisualCols(part.value);
     }
   }
   const needRemTail = getVisualCols(cleanOld) > maxCols && remEndCol > maxCols - 3 && remChanged.length > 0;
@@ -146,9 +109,7 @@ function stripCommonPairIndent(removed: readonly string[], added: readonly strin
 
 function diffMiddleLines(oMid: readonly string[], nMid: readonly string[]): { removed: string[]; added: string[] } {
   if (oMid.length === 0 || nMid.length === 0) return { removed: [...oMid], added: [...nMid] };
-  const parts = Diff.diffLines(oMid.join("\n"), nMid.join("\n"));
-  const removed: string[] = [];
-  const added: string[] = [];
+  const parts = Diff.diffLines(oMid.join("\n"), nMid.join("\n")), removed: string[] = [], added: string[] = [];
   for (const part of parts) {
     if (!part.added && !part.removed) continue;
     const lines = part.value.replace(/\n$/, "").split("\n");
@@ -161,8 +122,7 @@ function diffMiddleLines(oMid: readonly string[], nMid: readonly string[]): { re
 function trimCommonEnds(oldText: string, newText: string): { oMid: string[]; nMid: string[] } {
   const oRaw = oldText ? oldText.replace(/\r\n/g, "\n").split("\n") : [];
   const nRaw = newText ? newText.replace(/\r\n/g, "\n").split("\n") : [];
-  let pre = 0;
-  let suf = 0;
+  let pre = 0, suf = 0;
   while (pre < oRaw.length && pre < nRaw.length && oRaw[pre] === nRaw[pre]) pre++;
   while (suf < oRaw.length - pre && suf < nRaw.length - pre && oRaw[oRaw.length - 1 - suf] === nRaw[nRaw.length - 1 - suf]) suf++;
   return { oMid: oRaw.slice(pre, oRaw.length - suf), nMid: nRaw.slice(pre, nRaw.length - suf) };
@@ -178,16 +138,11 @@ export function extractChangedHunks(oldText: string, newText: string): { removed
   const { oMid, nMid } = trimCommonEnds(oldText, newText);
   if (oMid.length === 0 && nMid.length === 0) return [];
   const hunks: { removed: string[]; added: string[] }[] = [];
-  let curI = 0;
-  let curJ = 0;
-  let i = 0;
+  let curI = 0, curJ = 0, i = 0;
   while (i + 2 < oMid.length) {
     let matchJ = -1;
     for (let j = curJ; j + 2 < nMid.length; j++) {
-      if (oMid[i] === nMid[j] && oMid[i + 1] === nMid[j + 1] && oMid[i + 2] === nMid[j + 2]) {
-        matchJ = j;
-        break;
-      }
+      if (oMid[i] === nMid[j] && oMid[i + 1] === nMid[j + 1] && oMid[i + 2] === nMid[j + 2]) { matchJ = j; break; }
     }
     if (matchJ !== -1) {
       if (i > curI || matchJ > curJ) {
@@ -196,8 +151,7 @@ export function extractChangedHunks(oldText: string, newText: string): { removed
       }
       let len = 3;
       while (i + len < oMid.length && matchJ + len < nMid.length && oMid[i + len] === nMid[matchJ + len]) len++;
-      curI = i += len;
-      curJ = matchJ + len;
+      curI = i += len; curJ = matchJ + len;
     } else i++;
   }
   if (curI < oMid.length || curJ < nMid.length) {
@@ -210,40 +164,26 @@ export function extractChangedHunks(oldText: string, newText: string): { removed
 export function summarizeSnapshotsDiff(snapshots: readonly { path: string; beforeContent: string | null; afterContent: string; hunkCount?: number }[], workspaceRoot?: string, full = false): FileDiffSummaryItem[] {
   const byFile = new Map<string, { before: string | null; after: string; edits: number }>();
   for (const s of snapshots) {
-    const rel = shortenWorkspaceText(s.path, workspaceRoot);
-    const prev = byFile.get(rel);
+    const rel = shortenWorkspaceText(s.path, workspaceRoot), prev = byFile.get(rel);
     byFile.set(rel, { before: prev ? prev.before : s.beforeContent, after: s.afterContent, edits: (prev?.edits ?? 0) + Math.max(1, s.hunkCount ?? 1) });
   }
-  const items: FileDiffSummaryItem[] = [];
-  const isMulti = byFile.size >= 3 && !full;
-  const maxH = full ? 1000 : isMulti ? 2 : 8;
-  const maxL = full ? 10_000 : isMulti ? 5 : 15;
-  const maxC = full ? 160 : 76;
+  const items: FileDiffSummaryItem[] = [], isMulti = byFile.size >= 3 && !full;
+  const maxH = full ? 1000 : isMulti ? 2 : 8, maxL = full ? 10_000 : isMulti ? 5 : 15, maxC = full ? 160 : 76;
   for (const [file, info] of byFile.entries()) {
     if (info.before !== null && info.before === info.after) continue;
-    const oldArr = info.before === null ? [] : info.before.replace(/\r\n/g, "\n").split("\n");
-    const newArr = info.after.replace(/\r\n/g, "\n").split("\n");
+    const oldArr = info.before === null ? [] : info.before.replace(/\r\n/g, "\n").split("\n"), newArr = info.after.replace(/\r\n/g, "\n").split("\n");
     const hunks = info.before === null ? [{ removed: [], added: stripCommonPairIndent([], newArr).added }] : extractChangedHunks(info.before, info.after);
-    const removed = hunks.flatMap((h) => h.removed);
-    const added = hunks.flatMap((h) => h.added);
+    const removed = hunks.flatMap((h) => h.removed), added = hunks.flatMap((h) => h.added);
     const hunksPreview = hunks.slice(0, maxH).map((h) => ({
       removed: h.removed.slice(0, maxL).map((l) => truncateVisualCols(l, maxC)),
       added: h.added.slice(0, maxL).map((l) => truncateVisualCols(l, maxC)),
-      totalRemoved: h.removed.length,
-      totalAdded: h.added.length,
+      totalRemoved: h.removed.length, totalAdded: h.added.length,
     }));
     items.push({
-      file,
-      isNew: info.before === null,
-      edits: info.edits,
-      oldLines: oldArr.length,
-      newLines: newArr.length,
-      addedLines: info.before === null ? newArr.length : added.length,
-      removedLines: info.before === null ? 0 : removed.length,
-      removedPreview: removed.slice(0, 5).map((l) => truncateVisualCols(l, 70)),
-      addedPreview: added.slice(0, 5).map((l) => truncateVisualCols(l, 70)),
-      totalHunks: hunks.length,
-      hunksPreview,
+      file, isNew: info.before === null, edits: info.edits, oldLines: oldArr.length, newLines: newArr.length,
+      addedLines: info.before === null ? newArr.length : added.length, removedLines: info.before === null ? 0 : removed.length,
+      removedPreview: removed.slice(0, 5).map((l) => truncateVisualCols(l, 70)), addedPreview: added.slice(0, 5).map((l) => truncateVisualCols(l, 70)),
+      totalHunks: hunks.length, hunksPreview,
     });
   }
   return items;

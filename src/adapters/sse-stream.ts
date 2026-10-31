@@ -16,26 +16,19 @@ export function parseOpenAiAssistantMessage(rawMsg: Record<string, any>): Assist
     try {
       const parsed = JSON.parse(rawArgsStr);
       parsedArgs = typeof parsed === "object" && parsed !== null ? parsed : { _value: parsed };
-    } catch {
-      parsedArgs = { _invalidJson: String(rawArgsStr) };
-    }
+    } catch { parsedArgs = { _invalidJson: String(rawArgsStr) }; }
     return { id: String(tc?.id || `call_${idx}`), name: String(tc?.function?.name || "unknown"), arguments: parsedArgs };
   });
-
   return AssistantMessageSchema.parse({
-    role: "assistant",
-    content: rawMsg.content ?? "",
+    role: "assistant", content: rawMsg.content ?? "",
     ...(toolCalls.length > 0 ? { toolCalls } : {}),
-    ...(typeof (rawMsg.reasoning_content ?? rawMsg.reasoning) === "string"
-      ? { reasoningContent: rawMsg.reasoning_content ?? rawMsg.reasoning }
-      : {}),
+    ...(typeof (rawMsg.reasoning_content ?? rawMsg.reasoning) === "string" ? { reasoningContent: rawMsg.reasoning_content ?? rawMsg.reasoning } : {}),
   });
 }
 
 export function assembleSsePayloads(dataPayloads: readonly string[]): AssistantMessage {
   let content = "", reasoning = "", hasReasoning = false;
   const toolMap = new Map<number, { id: string; name: string; argsRaw: string }>();
-
   for (const payload of dataPayloads) {
     const trimmed = payload.trim();
     if (!trimmed || trimmed === "[DONE]") continue;
@@ -60,9 +53,7 @@ export function assembleSsePayloads(dataPayloads: readonly string[]): AssistantM
   const rawToolCalls = Array.from(toolMap.entries()).sort(([a], [b]) => a - b).map(([idx, acc]) => ({
     id: acc.id || `call_${idx}`, type: "function", function: { name: acc.name || "unknown", arguments: acc.argsRaw || "{}" },
   }));
-  return parseOpenAiAssistantMessage({
-    content, ...(hasReasoning ? { reasoning_content: reasoning } : {}), ...(rawToolCalls.length > 0 ? { tool_calls: rawToolCalls } : {}),
-  });
+  return parseOpenAiAssistantMessage({ content, ...(hasReasoning ? { reasoning_content: reasoning } : {}), ...(rawToolCalls.length > 0 ? { tool_calls: rawToolCalls } : {}) });
 }
 
 export async function readOpenAiSseStream(
@@ -79,13 +70,8 @@ export async function readOpenAiSseStream(
     if (typeof rawMsg.content === "string" && rawMsg.content) emitContent(rawMsg.content);
     return { message: parseOpenAiAssistantMessage(rawMsg), rawSseLines: [`[非流式 JSON 响应] ${JSON.stringify(data)}`] };
   }
-
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  const rawSseLines: string[] = [];
-  const dataPayloads: string[] = [];
+  const reader = res.body.getReader(), decoder = new TextDecoder(), rawSseLines: string[] = [], dataPayloads: string[] = [];
   let buffer = "";
-
   const processLine = (line: string) => {
     const trimmed = line.trim();
     if (!trimmed.startsWith("data:")) return;
@@ -100,27 +86,18 @@ export async function readOpenAiSseStream(
       if (typeof delta?.content === "string" && delta.content) emitContent(delta.content);
       if (Array.isArray(delta?.tool_calls)) {
         for (const tc of delta.tool_calls) {
-          onStreamEvent?.({
-            type: "tool_call_delta",
-            index: typeof tc.index === "number" ? tc.index : 0,
-            name: typeof tc.function?.name === "string" ? tc.function.name : undefined,
-            argsDelta: typeof tc.function?.arguments === "string" ? tc.function.arguments : "",
-          });
+          onStreamEvent?.({ type: "tool_call_delta", index: typeof tc.index === "number" ? tc.index : 0, name: typeof tc.function?.name === "string" ? tc.function.name : undefined, argsDelta: typeof tc.function?.arguments === "string" ? tc.function.arguments : "" });
         }
       }
     } catch {}
   };
-
   while (true) {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const { done, value } = await (idleTimeoutMs > 0
       ? Promise.race([
           reader.read(),
           new Promise<never>((_, reject) => {
-            timer = setTimeout(() => {
-              reject(new Error(`SSE 流空闲超时 (${idleTimeoutMs}ms 无新数据)`));
-              reader.cancel().catch(() => {});
-            }, idleTimeoutMs);
+            timer = setTimeout(() => { reject(new Error(`SSE 流空闲超时 (${idleTimeoutMs}ms 无新数据)`)); reader.cancel().catch(() => {}); }, idleTimeoutMs);
           }),
         ]).finally(() => clearTimeout(timer))
       : reader.read());

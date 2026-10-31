@@ -5,40 +5,31 @@ import { padCols, truncateCols } from "./platform.js";
 export { padCols, truncateCols };
 
 export interface HttpWireLogEntry {
-  roundTimestamp: string;
-  apiUrl: string;
-  requestBody: Record<string, unknown>;
-  rawSseLines: string[];
-  assembledMessage?: AssistantMessage;
+  roundTimestamp: string; apiUrl: string; requestBody: Record<string, unknown>;
+  rawSseLines: string[]; assembledMessage?: AssistantMessage;
 }
 
 export interface RoundCostMetric {
   round: number; model: string; messageCount: number; promptTokens: number; cacheHitTokens: number;
   cacheMissTokens: number; completionTokens: number; reasoningTokens: number; expectedPrefixTokens: number;
-  billCacheRatePct: number; prefixRetentionPct: number | null; diagnosis: string; costCny: number; savedCny: number;
+  billCacheRatePct: number; prefixRetentionPct: number | null; diagnosis: string; costCny: number; savedCny: number; quotaPct: number;
 }
 
 export interface SessionCostSummary {
   isReplay: boolean; periodLabel: string; rounds: RoundCostMetric[]; totalPromptTokens: number;
   totalCacheHitTokens: number; totalCompletionTokens: number; totalReasoningTokens: number;
-  overallCacheRatePct: number; totalCostCny: number; totalSavedCny: number;
+  overallCacheRatePct: number; totalCostCny: number; totalSavedCny: number; totalQuotaPct: number;
 }
 
 interface UnitRates {
   inMissPerM: number; cacheHitPerM: number; outPerM: number; minCacheTokens: number; periodLabel: string;
+  quotaRates?: { inUsd: number; cacheUsd: number; outUsd: number; poolUsd: number };
 }
 
-export function extractUsageFromSseLines(
-  rawSseLines: readonly string[],
-  fallbackModel = "unknown",
-) {
+export function extractUsageFromSseLines(rawSseLines: readonly string[], fallbackModel = "unknown") {
   for (let i = rawSseLines.length - 1; i >= 0; i--) {
     const line = rawSseLines[i]!.trim();
-    const jsonStr = line.startsWith("data:")
-      ? line.slice(5).trim()
-      : line.startsWith("[非流式 JSON 响应]")
-        ? line.replace("[非流式 JSON 响应]", "").trim()
-        : "";
+    const jsonStr = line.startsWith("data:") ? line.slice(5).trim() : line.startsWith("[非流式 JSON 响应]") ? line.replace("[非流式 JSON 响应]", "").trim() : "";
     if (!jsonStr || jsonStr === "[DONE]") continue;
     try {
       const parsed = JSON.parse(jsonStr) as Record<string, any>;
@@ -50,28 +41,26 @@ export function extractUsageFromSseLines(
       const completionTokens = Math.max(0, Number(u.completion_tokens ?? 0));
       const rawReasoning = Number(u.completion_tokens_details?.reasoning_tokens ?? u.reasoning_tokens ?? 0);
       const respModel = String(parsed.model || fallbackModel);
-      const displayModel =
-        fallbackModel && fallbackModel !== "unknown" && respModel !== fallbackModel
-          ? `${fallbackModel} (${respModel})`
-          : respModel;
+      const displayModel = fallbackModel && fallbackModel !== "unknown" && respModel !== fallbackModel ? `${fallbackModel} (${respModel})` : respModel;
       return {
-        model: displayModel,
-        promptTokens,
-        cacheHitTokens,
-        cacheMissTokens: Math.max(0, promptTokens - cacheHitTokens),
-        completionTokens,
-        reasoningTokens: Math.min(completionTokens, Math.max(0, rawReasoning)),
+        model: displayModel, promptTokens, cacheHitTokens, cacheMissTokens: Math.max(0, promptTokens - cacheHitTokens),
+        completionTokens, reasoningTokens: Math.min(completionTokens, Math.max(0, rawReasoning)),
       };
-    } catch {
-      continue;
-    }
+    } catch { continue; }
   }
   return null;
 }
 
 function resolveUnitRates(model: string, isoTimestamp: string): UnitRates {
-  if (/agy|antigravity|argon|gemini/i.test(model)) {
-    return { inMissPerM: 0, cacheHitPerM: 0, outPerM: 0, minCacheTokens: 0, periodLabel: "Antigravity 订阅额度桥接 (实付 ¥0)" };
+  if (/agy|antigravity|argon|gemini|claude/i.test(model)) {
+    const quotaRates = /opus/i.test(model)
+      ? { inUsd: 15.0, cacheUsd: 1.5, outUsd: 75.0, poolUsd: 60.0 }
+      : /sonnet|claude/i.test(model)
+        ? { inUsd: 3.0, cacheUsd: 0.3, outUsd: 15.0, poolUsd: 60.0 }
+        : /flash/i.test(model)
+          ? { inUsd: 0.3, cacheUsd: 0.03, outUsd: 2.5, poolUsd: 138.0 }
+          : { inUsd: 2.0, cacheUsd: 0.2, outUsd: 12.0, poolUsd: 138.0 };
+    return { inMissPerM: 0, cacheHitPerM: 0, outPerM: 0, minCacheTokens: 0, periodLabel: "Antigravity 订阅额度桥接 (实付 ¥0)", quotaRates };
   }
   if (/mimo/i.test(model)) {
     return { inMissPerM: 2.0, cacheHitPerM: 0.2, outPerM: 6.0, minCacheTokens: 1024, periodLabel: "小米 MiMo 2.6 计费档 (满 1024 tok 起缓)" };
@@ -101,6 +90,10 @@ function computeRoundMetric(
       usage.completionTokens * rates.outPerM) /
     1_000_000;
   const noCacheCost = (usage.promptTokens * rates.inMissPerM + usage.completionTokens * rates.outPerM) / 1_000_000;
+  const q = rates.quotaRates;
+  const quotaPct = !isReplay && q && q.poolUsd > 0
+    ? (((usage.cacheMissTokens * q.inUsd + usage.cacheHitTokens * q.cacheUsd + usage.completionTokens * q.outUsd) / 1_000_000) / q.poolUsd) * 100
+    : 0;
   const billCacheRatePct = usage.promptTokens > 0 ? (usage.cacheHitTokens / usage.promptTokens) * 100 : 0;
 
   let expectedPrefixTokens = 0;
@@ -126,15 +119,8 @@ function computeRoundMetric(
   }
 
   return {
-    round,
-    messageCount: msgCount,
-    ...usage,
-    expectedPrefixTokens,
-    billCacheRatePct,
-    prefixRetentionPct,
-    diagnosis,
-    costCny: isReplay ? 0 : rawCost,
-    savedCny: isReplay ? noCacheCost : Math.max(0, noCacheCost - rawCost),
+    round, messageCount: msgCount, ...usage, expectedPrefixTokens, billCacheRatePct, prefixRetentionPct, diagnosis,
+    costCny: isReplay ? 0 : rawCost, savedCny: isReplay ? noCacheCost : Math.max(0, noCacheCost - rawCost), quotaPct,
   };
 }
 
@@ -152,9 +138,7 @@ export function summarizeWireCost(
     if (!usage) return;
     const rates = resolveUnitRates(usage.model, entry.roundTimestamp);
     if (!isReplay) periodLabel = rates.periodLabel;
-    const msgCount = Array.isArray(entry.requestBody?.messages)
-      ? entry.requestBody.messages.length
-      : Number(entry.requestBody?.messageCount ?? 0);
+    const msgCount = Array.isArray(entry.requestBody?.messages) ? entry.requestBody.messages.length : Number(entry.requestBody?.messageCount ?? 0);
     rounds.push(computeRoundMetric(rounds.length + 1, msgCount, usage, rates, rounds[rounds.length - 1], isReplay));
   });
 
@@ -164,21 +148,17 @@ export function summarizeWireCost(
   const totalReasoningTokens = rounds.reduce((s, r) => s + r.reasoningTokens, 0);
 
   return {
-    isReplay,
-    periodLabel,
-    rounds,
-    totalPromptTokens,
-    totalCacheHitTokens,
-    totalCompletionTokens,
-    totalReasoningTokens,
+    isReplay, periodLabel, rounds, totalPromptTokens, totalCacheHitTokens, totalCompletionTokens, totalReasoningTokens,
     overallCacheRatePct: totalPromptTokens > 0 ? (totalCacheHitTokens / totalPromptTokens) * 100 : 0,
     totalCostCny: rounds.reduce((s, r) => s + r.costCny, 0),
     totalSavedCny: rounds.reduce((s, r) => s + r.savedCny, 0),
+    totalQuotaPct: rounds.reduce((s, r) => s + r.quotaPct, 0),
   };
 }
 
 export interface TurnMetricsSummary {
   activeModel: string; turnCostCny: number; turnSavedCny: number; sessionCostCny: number; totalCostCny: number;
+  turnQuotaPct: number; sessionQuotaPct: number; totalQuotaPct: number;
   cacheHitRatePct: number; sessionCacheHitRatePct: number; lastStepCacheHitRatePct: number;
   contextTokens: number; stepCacheTrajectory: string;
 }
@@ -209,6 +189,9 @@ export function computeTurnMetrics(wireLogFile: string, stepsUsed: number, isRep
       turnSavedCny: turnRounds.reduce((a, r) => a + r.savedCny, 0),
       sessionCostCny: sessionRounds.reduce((a, r) => a + r.costCny, 0),
       totalCostCny: s.totalCostCny,
+      turnQuotaPct: turnRounds.reduce((a, r) => a + r.quotaPct, 0),
+      sessionQuotaPct: sessionRounds.reduce((a, r) => a + r.quotaPct, 0),
+      totalQuotaPct: s.totalQuotaPct,
       cacheHitRatePct: turnRate,
       sessionCacheHitRatePct: sSession.overallCacheRatePct,
       lastStepCacheHitRatePct: lastRound?.billCacheRatePct ?? turnRate,
@@ -231,13 +214,13 @@ export function formatCostReport(summary: SessionCostSummary): string {
     const inCol = padCols(`命中${r.cacheHitTokens}/共${r.promptTokens}`, 18, "right");
     const diagCol = padCols(r.diagnosis, 16);
     const outCol = padCols(`${r.completionTokens}词`, 6, "right");
-    lines.push(
-      `${padCols(`第${r.round}步`, 6)} | ${inCol} | ${diagCol} | ${outCol} | ¥${r.costCny.toFixed(4)} (省¥${r.savedCny.toFixed(4)})`,
-    );
+    const costCol = r.quotaPct > 0 ? `额度 ${r.quotaPct.toFixed(2)}% (实付¥0)` : `¥${r.costCny.toFixed(4)} (省¥${r.savedCny.toFixed(4)})`;
+    lines.push(`${padCols(`第${r.round}步`, 6)} | ${inCol} | ${diagCol} | ${outCol} | ${costCol}`);
   }
   lines.push(rule);
+  const quotaSuffix = summary.totalQuotaPct > 0 ? ` | 订阅额度 ${summary.totalQuotaPct.toFixed(2)}%` : "";
   lines.push(
-    `总计 ${summary.rounds.length} 步: 共输入 ${summary.totalPromptTokens} 词 (缓存命中 ${summary.totalCacheHitTokens} 词, 占 ${summary.overallCacheRatePct.toFixed(1)}%) | 实付 ¥${summary.totalCostCny.toFixed(4)}`,
+    `总计 ${summary.rounds.length} 步: 共输入 ${summary.totalPromptTokens} 词 (缓存命中 ${summary.totalCacheHitTokens} 词, 占 ${summary.overallCacheRatePct.toFixed(1)}%) | 实付 ¥${summary.totalCostCny.toFixed(4)}${quotaSuffix}`,
   );
   return lines.join("\n");
 }
