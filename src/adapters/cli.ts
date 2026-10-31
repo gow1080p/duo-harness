@@ -68,6 +68,11 @@ async function executeToolBatchStep(
     }
     options.onStepEvent?.({ phase: "executing", step: state.step, detail: "tool_results", toolResults: rawResults });
     const cleanResults: ToolResultMessage[] = rawResults.map(({ details: _d, terminate: _t, ...rest }) => rest);
+    const lastMsg = state.messages[state.messages.length - 1];
+    const rLen = lastMsg?.role === "assistant" ? (lastMsg.reasoningContent?.length ?? 0) : 0;
+    if (rLen > 2_500 && cleanResults.length > 0 && !rawResults.some((r) => r.terminate)) {
+      cleanResults[cleanResults.length - 1]!.content += `\n[系统提示：检测到上一步 thinking 思考过程长达 ${rLen} 字符，后续步骤请将思考控制在 150 字以内，严禁在 thinking 中预先默写完整代码草稿，请直接调用工具落盘]`;
+    }
     const next = stepAgentLoop(state, { type: "TOOLS_FINISHED", results: cleanResults });
     if (rawResults.some((r) => !r.isError && r.terminate)) {
       const lastMsg = state.messages[state.messages.length - 1];

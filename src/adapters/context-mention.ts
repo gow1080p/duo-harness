@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import type { ImageAttachment } from "../core/contracts.js";
 import { expandHomePath, toPosixRelative } from "./platform.js";
@@ -20,31 +21,51 @@ function getImageMimeType(filePath: string): string {
 }
 
 const workspaceFilesCache = new Map<string, { ts: number; files: string[] }>();
+const ALLOWED_DOT_DIRS = new Set([".debug", ".claude", ".agents", ".pi", ".duo-harness", ".github"]);
+const HOME_HEAVY_DIRS = new Set(["AppData", "Library", "Applications", "Downloads", "Pictures", "Movies", "Music", "Videos", "OneDrive", "scoop", "target", "coverage"]);
 
 export function listWorkspaceFiles(workspaceRoot: string, maxFiles = 1200): string[] {
   const realRoot = fs.existsSync(workspaceRoot) ? fs.realpathSync(workspaceRoot) : path.resolve(workspaceRoot);
-  const now = Date.now();
-  const cached = workspaceFilesCache.get(realRoot);
+  const now = Date.now(), cached = workspaceFilesCache.get(realRoot);
   if (cached && now - cached.ts < 3_000) return cached.files;
   try {
-    const entries = fs.readdirSync(realRoot, { recursive: true, withFileTypes: true });
-    const files: string[] = [];
+    const seen = new Set<string>(), isHomeRoot = path.resolve(realRoot).toLowerCase() === path.resolve(os.homedir()).toLowerCase();
     for (const debugImg of ["shot.png", "clipboard.png"]) {
-      if (fs.existsSync(path.join(realRoot, ".debug", debugImg))) files.push(`.debug/${debugImg}`);
+      if (fs.existsSync(path.join(realRoot, ".debug", debugImg))) seen.add(`.debug/${debugImg}`);
     }
-    for (const e of entries) {
-      if (!e.isFile() || e.name.startsWith(".") || (BINARY_EXT_RE.test(e.name) && !IMAGE_EXT_RE.test(e.name))) continue;
-      const relDir = path.relative(realRoot, e.parentPath);
-      if (relDir && relDir.split(path.sep).some((p) => IGNORED_DIRS.has(p) || p.startsWith("."))) continue;
-      files.push(toPosixRelative(realRoot, path.join(e.parentPath, e.name)));
-      if (files.length >= maxFiles) break;
+    const maxDepth = isHomeRoot ? 1 : 6, queue: Array<{ dir: string; depth: number }> = [{ dir: realRoot, depth: 0 }];
+    while (queue.length > 0 && seen.size < maxFiles) {
+      const { dir, depth } = queue.shift()!;
+      let entries: fs.Dirent[] = [];
+      try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+      for (const e of entries) {
+        const full = path.join(dir, e.name);
+        if (e.isDirectory()) {
+          if (depth < maxDepth && (e.name.startsWith(".") ? ALLOWED_DOT_DIRS.has(e.name) : !IGNORED_DIRS.has(e.name) && !(isHomeRoot && HOME_HEAVY_DIRS.has(e.name)))) queue.push({ dir: full, depth: depth + 1 });
+        } else if (e.isFile() && !e.name.startsWith(".") && (!BINARY_EXT_RE.test(e.name) || IMAGE_EXT_RE.test(e.name))) {
+          seen.add(toPosixRelative(realRoot, full));
+          if (seen.size >= maxFiles) break;
+        }
+      }
     }
-    files.sort((a, b) => a.split("/").length - b.split("/").length || a.localeCompare(b));
+    const files = [...seen].sort((a, b) => a.split("/").length - b.split("/").length || a.localeCompare(b));
     workspaceFilesCache.set(realRoot, { ts: now, files });
     return files;
   } catch {
     return [];
   }
+}
+
+export function filterAndRankFiles(files: readonly string[], rawQuery: string, limit = 8): string[] {
+  const q = rawQuery.trim().toLowerCase();
+  if (!q) return files.slice(0, limit);
+  const scored: Array<{ file: string; score: number }> = [];
+  for (const file of files) {
+    const lower = file.toLowerCase(), base = path.posix.basename(lower);
+    const score = base === q ? 100 : base.startsWith(q) ? 80 : base.includes(q) ? 50 : lower.includes(q) ? 30 : 0;
+    if (score > 0) scored.push({ file, score });
+  }
+  return scored.sort((a, b) => b.score - a.score || a.file.split("/").length - b.file.split("/").length || a.file.localeCompare(b.file)).slice(0, limit).map((x) => x.file);
 }
 
 export function buildAtMentionDropdown(
@@ -64,14 +85,7 @@ export function buildAtMentionDropdown(
   if (!m) return [];
   const rawQuery = m[1]!, query = rawQuery.toLowerCase(), atIndex = before.length - rawQuery.length - 1;
   const trimmedAfter = after.startsWith(" ") ? after.slice(1) : after;
-  const allFiles = listWorkspaceFiles(workspaceRoot);
-  const exactBase: string[] = [], fuzzyPath: string[] = [];
-  for (const f of allFiles) {
-    const lower = f.toLowerCase(), base = path.posix.basename(lower);
-    if (!query || base.startsWith(query)) exactBase.push(f);
-    else if (lower.includes(query)) fuzzyPath.push(f);
-  }
-  const items = [...exactBase, ...fuzzyPath].slice(0, 7).map((relPath) => {
+  const items = filterAndRankFiles(listWorkspaceFiles(workspaceRoot), query, 7).map((relPath) => {
     const formattedRef = relPath.includes(" ") ? `@"${relPath}"` : `@${relPath}`;
     const replacedPrefix = `${before.slice(0, atIndex)}${formattedRef} `;
     return { label: formattedRef, desc: `📎 引用工作区文件 (${relPath})`, fillText: `${replacedPrefix}${trimmedAfter}`, expandOnly: true, cursorAfter: replacedPrefix.length };

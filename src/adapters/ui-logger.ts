@@ -17,14 +17,14 @@ function formatInlineMarkdown(line: string, restore = ""): string {
   });
 }
 
-export function formatMarkdownLine(rawLine: string, inCodeBlock: boolean): { text: string; nextInCodeBlock: boolean } {
+export function formatMarkdownLine(rawLine: string, inCodeBlock: boolean, codeLineNum?: number): { text: string; nextInCodeBlock: boolean } {
   const fenceMatch = rawLine.match(/^\s*```(\w*)\s*$/);
   if (fenceMatch) {
     return inCodeBlock
       ? { text: "\x1b[90m  ╰────────────────────────\x1b[0m", nextInCodeBlock: false }
       : { text: `\x1b[90m  ╭── ${fenceMatch[1] || "code"} ────────────────\x1b[0m`, nextInCodeBlock: true };
   }
-  if (inCodeBlock) return { text: `\x1b[90m  │ \x1b[0m${highlightCodeLine(rawLine)}\x1b[0m`, nextInCodeBlock: true };
+  if (inCodeBlock) return { text: `\x1b[90m  │ ${codeLineNum ? `${String(codeLineNum).padStart(3)} │ ` : ""}\x1b[0m${highlightCodeLine(rawLine)}\x1b[0m`, nextInCodeBlock: true };
   if (/^\s*(?:---+|\*\*\*+)\s*$/.test(rawLine)) return { text: "\x1b[90m  ────────────────────────────────────────\x1b[0m", nextInCodeBlock: false };
   if (/^\s*\|[\s:|-]+\|\s*$/.test(rawLine)) return { text: "\x1b[90m  ├────────────────────────────────────────┤\x1b[0m", nextInCodeBlock: false };
   if (/^\s*\|.*\|\s*$/.test(rawLine)) {

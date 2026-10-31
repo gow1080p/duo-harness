@@ -156,9 +156,9 @@ function formatReasoningBox(reasoningRaw: string, columns = 80): { text: string;
   };
 }
 
-function formatCommittedLine(currentLine: string, linePrefix: string, inCodeBlock: boolean, maxCols: number): { out: string; nextInCodeBlock: boolean } {
+function formatCommittedLine(currentLine: string, linePrefix: string, inCodeBlock: boolean, maxCols: number, codeLineNum?: number): { out: string; nextInCodeBlock: boolean } {
   if (inCodeBlock || /^\s*```/.test(currentLine)) {
-    const { text: formatted, nextInCodeBlock } = formatMarkdownLine(currentLine, inCodeBlock);
+    const { text: formatted, nextInCodeBlock } = formatMarkdownLine(currentLine, inCodeBlock, codeLineNum);
     return { out: `${linePrefix ? `${linePrefix.trimEnd()}\n` : ""}${formatted}`, nextInCodeBlock };
   }
   const pfxCols = getVisualCols(linePrefix), pad = pfxCols > 0 ? " ".repeat(pfxCols) : "";
@@ -167,7 +167,7 @@ function formatCommittedLine(currentLine: string, linePrefix: string, inCodeBloc
 }
 
 export function createStreamRenderer(stream: { write: (s: string) => unknown; columns?: number } = process.stdout) {
-  let inReasoning = false, hasStartedContent = false, inCodeBlock = false;
+  let inReasoning = false, hasStartedContent = false, inCodeBlock = false, codeLineIdx = 0;
   let currentLine = "", linePrefix = "", previewCols = 0, toolName = "", toolChars = 0, reasoningRaw = "", reasoningRows = 0;
   let pendingTableLines: string[] = [], tablePrefix = "";
 
@@ -196,7 +196,9 @@ export function createStreamRenderer(stream: { write: (s: string) => unknown; co
     }
     flushTable();
     const maxCols = Math.min(Math.max(58, (stream.columns ?? 92) - 4), 108);
-    const { out, nextInCodeBlock } = formatCommittedLine(currentLine, linePrefix, inCodeBlock, maxCols);
+    const lineNum = inCodeBlock && !/^\s*```/.test(currentLine) ? ++codeLineIdx : undefined;
+    const { out, nextInCodeBlock } = formatCommittedLine(currentLine, linePrefix, inCodeBlock, maxCols, lineNum);
+    if (!nextInCodeBlock) codeLineIdx = 0;
     inCodeBlock = nextInCodeBlock;
     stream.write(`\r\x1b[K${out}${withNewline ? "\n" : ""}`);
     currentLine = linePrefix = ""; previewCols = 0;

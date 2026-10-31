@@ -214,6 +214,9 @@ async function applyFileEdit(workspaceRoot: string, snapshots: FileVersionSnapsh
       const cleanNew = item.newText.startsWith("\uFEFF") ? item.newText.slice(1) : item.newText;
       workingContent = cleanOld === "" ? cleanNew : replaceSingleItem(workingContent, cleanOld, cleanNew, args.path, rawBefore === null);
     }
+    if (rawBefore !== null && workingContent === beforeBody) {
+      throw new Error(`edit_file 未产生任何实际修改：${args.path} 的 newText 与原内容完全相同（+0 / -0 行），请传入实际修改后的代码`);
+    }
 
     const finalContent = bom + workingContent;
     writeFileAtomicSync(fullPath, finalContent);

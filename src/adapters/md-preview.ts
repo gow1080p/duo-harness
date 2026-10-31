@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { marked } from "marked";
+import { listWorkspaceFiles } from "./context-mention.js";
 import { parseFileLineTarget, renderSourceCodeBox } from "./diff-presenter.js";
 import { editFileInExternalEditor, expandHomePath, runTerminalPager } from "./platform.js";
 import { writeFileAtomicSync } from "./store.js";
@@ -23,14 +24,11 @@ export function resolveDefaultOpenTarget(workspaceRoot: string, recentPaths: rea
     const candidate = path.resolve(workspaceRoot, recentPaths[i]!);
     if (fs.existsSync(candidate)) return candidate;
   }
-  const planFile = path.join(workspaceRoot, ".debug", "plan.md");
-  if (fs.existsSync(planFile)) return planFile;
-  try {
-    const entries = fs.readdirSync(workspaceRoot, { withFileTypes: true }).filter((e) => e.isFile() && !e.name.startsWith(".")).sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-    const preferred = entries.find((e) => /\.(?:html?|svg|pdf|md)$/i.test(e.name)) ?? entries[0];
-    if (preferred) return path.join(workspaceRoot, preferred.name);
-  } catch {}
-  return workspaceRoot;
+  const mdTarget = resolveDefaultMdTarget(workspaceRoot, recentPaths);
+  if (fs.existsSync(mdTarget)) return mdTarget;
+  const files = listWorkspaceFiles(workspaceRoot).filter((f) => !f.startsWith("."));
+  const preferred = files.find((f) => /\.(?:html?|svg|pdf|md)$/i.test(f)) ?? files[0];
+  return preferred ? path.join(workspaceRoot, preferred) : workspaceRoot;
 }
 
 export function resolveDefaultMdTarget(workspaceRoot: string, recentPaths: readonly string[] = []): string {
@@ -41,8 +39,8 @@ export function resolveDefaultMdTarget(workspaceRoot: string, recentPaths: reado
     if (/\.(?:md|markdown)$/i.test(candidate) && fs.existsSync(candidate)) return candidate;
   }
   try {
-    const mdFiles = fs.readdirSync(workspaceRoot, { withFileTypes: true }).filter((e) => e.isFile() && /\.(?:md|markdown)$/i.test(e.name))
-      .map((e) => ({ full: path.join(workspaceRoot, e.name), mtime: fs.statSync(path.join(workspaceRoot, e.name)).mtimeMs })).sort((a, b) => b.mtime - a.mtime);
+    const mdFiles = listWorkspaceFiles(workspaceRoot).filter((f) => !f.startsWith(".") && /\.(?:md|markdown)$/i.test(f))
+      .map((rel) => ({ full: path.join(workspaceRoot, rel), mtime: fs.statSync(path.join(workspaceRoot, rel)).mtimeMs })).sort((a, b) => b.mtime - a.mtime);
     if (mdFiles[0]) return mdFiles[0].full;
   } catch {}
   return path.join(workspaceRoot, "README.md");

@@ -55,7 +55,7 @@ export function resolveExistingRealPath(targetPath: string): string {
 }
 
 export function getBuiltinReadonlySkillRoots(home = os.homedir()): string[] {
-  const bases = [".duo-harness/skills", ".codex/skills", ".agents/skills", ".claude/skills", ".gemini/config/plugins", ".gemini/antigravity/builtin/skills"].map((p) => path.join(home, p));
+  const bases = [".duo-harness/skills", ".duo-harness/commands", ".codex/skills", ".agents/skills", ".claude/skills", ".claude/commands", ".pi/agent/prompts", ".gemini/config/plugins", ".gemini/antigravity/builtin/skills"].map((p) => path.join(home, p));
   const out = new Set(bases.map(resolveExistingRealPath));
   for (const b of bases) {
     try { for (const d of fsSync.readdirSync(b)) out.add(resolveExistingRealPath(path.join(b, d))); } catch {}
@@ -281,7 +281,7 @@ export function isWriteToolCall(call: ToolCall, workspaceRoot: string, readonlyM
     const args = (call.arguments ?? {}) as Record<string, unknown>, rawCwd = typeof args.cwd === "string" ? args.cwd.trim() : "", home = os.homedir();
     const effectiveCwd = rawCwd ? path.resolve(workspaceRoot, expandHomePath(rawCwd.replace(/\$HOME|\$\{HOME\}|%USERPROFILE%/gi, home), home)) : workspaceRoot;
     const normalizedCmd = normalizeBashCommandForCwd(String(args.command ?? ""), workspaceRoot, effectiveCwd);
-    return args.readonly === false || !isReadonlyBashCommand(normalizedCmd, undefined, workspaceRoot, effectiveCwd);
+    return args.readonly === false || Boolean(args.background) || !isReadonlyBashCommand(normalizedCmd, undefined, workspaceRoot, effectiveCwd, true);
   }
   return readonlyMap.get(call.name) === false || call.name === "edit_file" || call.name === "rollback_version";
 }

@@ -10,26 +10,29 @@ import { loadJsonlEntries, writeFileAtomicSync } from "./store.js";
 import type { FileVersionSnapshot } from "./write-tools.js";
 
 export { formatSnapshotsDiff };
-
 export interface ProjectMetaState {
   projectKey: string; workspaceRoot: string; updatedAt: string; activeLeafId?: string | null;
   modelMode?: string; lastUndoNotice?: string | null; lastPlanLeafId?: string | null;
   lastExecutedPlanHash?: string | null; inputHistory?: string[];
 }
-
 export function computePlanHash(text: string): string {
   return crypto.createHash("sha256").update(text.trim(), "utf-8").digest("hex").slice(0, 16);
 }
-
+const managedProjectsCache = new Map<string, { ts: number; items: ManagedProjectSummary[] }>();
+const jsonlStatsCache = new Map<string, { mtimeMs: number; size: number; entryCount: number; lastLeafId: string | null }>();
+function normCmpPath(p: string): string {
+  const resolved = path.resolve(p), real = fs.existsSync(resolved) ? fs.realpathSync(resolved) : resolved;
+  return process.platform === "win32" ? real.toLowerCase() : real;
+}
 export function loadProjectMeta(metaFile: string): Partial<ProjectMetaState> {
   if (!fs.existsSync(metaFile)) return {};
   try { return JSON.parse(fs.readFileSync(metaFile, "utf-8")); } catch { return {}; }
 }
-
 export function saveProjectMeta(metaFile: string, patch: Partial<ProjectMetaState>): void {
   try {
     const prev = loadProjectMeta(metaFile);
     writeFileAtomicSync(metaFile, JSON.stringify({ ...prev, ...patch, updatedAt: new Date().toISOString() }, null, 2));
+    managedProjectsCache.clear();
   } catch {}
 }
 
@@ -63,38 +66,68 @@ export const SLASH_COMMANDS = [
   { cmd: "/exit", label: "/exit", desc: "退出交互终端" },
 ] as const;
 
-export function resolveProjectSessionPaths(workspaceRoot = process.cwd(), homeBaseDir = path.join(os.homedir(), ".duo-harness", "projects")): ProjectSessionPaths {
-  const resolved = path.resolve(workspaceRoot);
-  const realRoot = fs.existsSync(resolved) ? fs.realpathSync(resolved) : resolved;
+export function defaultProjectsBaseDir(homeDir = os.homedir()): string {
+  return process.env.VITEST ? path.join(os.tmpdir(), "duo-vitest-projects") : path.join(homeDir, ".duo-harness", "projects");
+}
+
+export function resolveStartupWorkspace(explicitWorkspaceRoot?: string, homeBaseDir = defaultProjectsBaseDir(), cwd = process.cwd(), homeDir = os.homedir()): string {
+  if (explicitWorkspaceRoot) return explicitWorkspaceRoot;
+  const homeCmp = normCmpPath(homeDir);
+  if (normCmpPath(cwd) !== homeCmp) return cwd;
+  try {
+    const lastFile = path.join(homeBaseDir, "last-workspace.json");
+    if (fs.existsSync(lastFile)) {
+      const ws = String(JSON.parse(fs.readFileSync(lastFile, "utf-8"))?.workspaceRoot ?? "");
+      if (ws && fs.existsSync(ws) && normCmpPath(ws) !== homeCmp) return ws;
+    }
+  } catch {}
+  const recent = [...listManagedProjects(homeBaseDir)].filter((p) => p.workspaceRoot && fs.existsSync(p.workspaceRoot) && normCmpPath(p.workspaceRoot) !== homeCmp).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || b.entryCount - a.entryCount)[0];
+  return recent ? recent.workspaceRoot : cwd;
+}
+
+export function resolveProjectSessionPaths(workspaceRoot = process.cwd(), homeBaseDir = defaultProjectsBaseDir(), options?: { readonly?: boolean }): ProjectSessionPaths {
+  const resolved = path.resolve(workspaceRoot), realRoot = fs.existsSync(resolved) ? fs.realpathSync(resolved) : resolved;
   const baseName = path.basename(realRoot).replace(/[^a-zA-Z0-9_-]/g, "_") || "root";
   const hash8 = crypto.createHash("sha256").update(realRoot).digest("hex").slice(0, 8);
-  const projectKey = `${baseName}-${hash8}`;
-  const projectDir = path.join(homeBaseDir, projectKey);
-  fs.mkdirSync(projectDir, { recursive: true });
-  const metaFile = path.join(projectDir, "meta.json");
-  saveProjectMeta(metaFile, { projectKey, workspaceRoot: realRoot });
+  const projectKey = `${baseName}-${hash8}`, projectDir = path.join(homeBaseDir, projectKey), metaFile = path.join(projectDir, "meta.json");
+  if (!options?.readonly) {
+    fs.mkdirSync(projectDir, { recursive: true });
+    if (!fs.existsSync(metaFile)) saveProjectMeta(metaFile, { projectKey, workspaceRoot: realRoot });
+    const realCmp = normCmpPath(realRoot), tmpCmp = normCmpPath(os.tmpdir());
+    if (realCmp !== normCmpPath(os.homedir()) && !realCmp.startsWith(tmpCmp)) {
+      try { writeFileAtomicSync(path.join(homeBaseDir, "last-workspace.json"), JSON.stringify({ workspaceRoot: realRoot, updatedAt: new Date().toISOString() })); } catch {}
+    }
+  }
   return { projectKey, workspaceRoot: realRoot, projectDir, sessionFile: path.join(projectDir, "chat.jsonl"), wireLogFile: path.join(projectDir, "http-wire.json"), snapshotsFile: path.join(projectDir, "snapshots.json"), metaFile };
 }
 
-export function listManagedProjects(homeBaseDir = path.join(os.homedir(), ".duo-harness", "projects")): ManagedProjectSummary[] {
+export function listManagedProjects(homeBaseDir = defaultProjectsBaseDir()): ManagedProjectSummary[] {
   if (!fs.existsSync(homeBaseDir)) return [];
+  const cacheKey = path.resolve(homeBaseDir), now = Date.now(), cached = managedProjectsCache.get(cacheKey);
+  if (cached && now - cached.ts < 3_000) return cached.items;
   const list: ManagedProjectSummary[] = [];
   for (const d of fs.readdirSync(homeBaseDir, { withFileTypes: true }).filter((x) => x.isDirectory())) {
     try {
-      const pDir = path.join(homeBaseDir, d.name);
-      const meta = JSON.parse(fs.readFileSync(path.join(pDir, "meta.json"), "utf-8"));
-      const sFile = path.join(pDir, "chat.jsonl");
-      const entries = fs.existsSync(sFile) ? loadJsonlEntries(sFile) : [];
-      list.push({
-        projectKey: String(meta.projectKey ?? d.name),
-        workspaceRoot: String(meta.workspaceRoot ?? ""),
-        updatedAt: String(meta.updatedAt ?? ""),
-        entryCount: entries.length,
-        lastLeafId: entries.length > 0 ? entries[entries.length - 1]!.id : null,
-      });
+      const pDir = path.join(homeBaseDir, d.name), meta = JSON.parse(fs.readFileSync(path.join(pDir, "meta.json"), "utf-8")), sFile = path.join(pDir, "chat.jsonl");
+      let entryCount = 0, lastLeafId: string | null = null;
+      if (fs.existsSync(sFile)) {
+        const st = fs.statSync(sFile), hit = jsonlStatsCache.get(sFile);
+        if (hit && hit.mtimeMs === st.mtimeMs && hit.size === st.size) { entryCount = hit.entryCount; lastLeafId = hit.lastLeafId; }
+        else {
+          const lines = fs.readFileSync(sFile, "utf-8").split(/\r?\n/).filter(Boolean);
+          entryCount = lines.length;
+          lastLeafId = entryCount > 0 ? String(JSON.parse(lines[entryCount - 1]!)?.id ?? "") || null : null;
+          jsonlStatsCache.set(sFile, { mtimeMs: st.mtimeMs, size: st.size, entryCount, lastLeafId });
+        }
+      }
+      const wsRoot = String(meta.workspaceRoot ?? "");
+      if (!wsRoot || (entryCount === 0 && !fs.existsSync(wsRoot))) continue;
+      list.push({ projectKey: String(meta.projectKey ?? d.name), workspaceRoot: wsRoot, updatedAt: String(meta.updatedAt ?? ""), entryCount, lastLeafId });
     } catch {}
   }
-  return list.sort((a, b) => a.projectKey.localeCompare(b.projectKey));
+  const items = list.sort((a, b) => a.projectKey.localeCompare(b.projectKey));
+  managedProjectsCache.set(cacheKey, { ts: now, items });
+  return items;
 }
 
 export function resolveTargetWorkspace(targetArg: string, currentWorkspaceRoot: string, homeBaseDir?: string): string | null {
@@ -133,9 +166,13 @@ export function createReplCompleter(getWorkspaceRoot: () => string, getSessionFi
       const idHits = entries.map((e) => `${cmdPrefix}${e.id}`);
       return [[...turnHits, ...idHits].filter((c) => c.startsWith(line)), line];
     }
+    if (/^\/(?:plan|goal)(?:\s|$)/i.test(line)) {
+      if (!fs.existsSync(path.join(getWorkspaceRoot(), ".debug", "plan.md"))) return [[], line];
+      const opts = /^\/goal(?:\s|$)/i.test(line) ? ["/goal", "/goal plan"] : ["/plan view", "/plan full", "/plan edit", "/plan open --web"];
+      return [opts.filter((c) => c.startsWith(line.trim())), line];
+    }
     if (line.startsWith("/")) {
-      const all = SLASH_COMMANDS.map((c) => c.cmd);
-      const hits = all.filter((c) => c.startsWith(line));
+      const all = SLASH_COMMANDS.map((c) => c.cmd), hits = all.filter((c) => c.startsWith(line));
       return [hits.length > 0 ? hits : all, line];
     }
     return [[], line];
@@ -144,35 +181,20 @@ export function createReplCompleter(getWorkspaceRoot: () => string, getSessionFi
 
 export function loadProjectSnapshots(snapshotsFile: string): FileVersionSnapshot[] {
   if (!fs.existsSync(snapshotsFile)) return [];
-  try {
-    const parsed = JSON.parse(fs.readFileSync(snapshotsFile, "utf-8"));
-    if (Array.isArray(parsed)) return parsed as FileVersionSnapshot[];
-    return Array.isArray(parsed?.snapshots) ? (parsed.snapshots as FileVersionSnapshot[]) : [];
-  } catch { return []; }
+  try { const p = JSON.parse(fs.readFileSync(snapshotsFile, "utf-8")); return Array.isArray(p) ? p : Array.isArray(p?.snapshots) ? p.snapshots : []; } catch { return []; }
 }
-
 export function loadProjectRedoBatches(snapshotsFile: string): FileVersionSnapshot[][] {
   if (!fs.existsSync(snapshotsFile)) return [];
-  try {
-    const parsed = JSON.parse(fs.readFileSync(snapshotsFile, "utf-8"));
-    return Array.isArray(parsed?.redoBatches) ? (parsed.redoBatches as FileVersionSnapshot[][]) : [];
-  } catch { return []; }
+  try { const p = JSON.parse(fs.readFileSync(snapshotsFile, "utf-8")); return Array.isArray(p?.redoBatches) ? p.redoBatches : []; } catch { return []; }
 }
-
 export function saveProjectSnapshots(snapshotsFile: string, snapshots: readonly FileVersionSnapshot[], redoBatches: readonly FileVersionSnapshot[][] = []): void {
   try {
     let toSave = [...snapshots];
     if (toSave.length > 80) {
-      const earliestBefore = new Map<string, string | null>();
-      for (const s of toSave) if (!earliestBefore.has(s.path)) earliestBefore.set(s.path, s.beforeContent);
+      const earliest = new Map<string, string | null>(), patched = new Set<string>();
+      for (const s of toSave) if (!earliest.has(s.path)) earliest.set(s.path, s.beforeContent);
       toSave = toSave.slice(-80).map((s) => ({ ...s }));
-      const patched = new Set<string>();
-      for (const s of toSave) {
-        if (!patched.has(s.path) && earliestBefore.has(s.path)) {
-          s.beforeContent = earliestBefore.get(s.path)!;
-          patched.add(s.path);
-        }
-      }
+      for (const s of toSave) if (!patched.has(s.path) && earliest.has(s.path)) { s.beforeContent = earliest.get(s.path)!; patched.add(s.path); }
     }
     const cleanRedo = redoBatches.filter((b) => Array.isArray(b) && b.length > 0).slice(-40);
     writeFileAtomicSync(snapshotsFile, JSON.stringify(cleanRedo.length > 0 ? { snapshots: toSave, redoBatches: cleanRedo } : toSave, null, 2));
@@ -180,27 +202,14 @@ export function saveProjectSnapshots(snapshotsFile: string, snapshots: readonly 
 }
 
 function cleanPreviewText(raw: string): string {
-  return stripAttachedFiles(raw)
-    .replace(/\s*\[系统提示：[\s\S]*?\]/g, "")
-    .replace(/```[\s\S]*?```/g, "[代码块]")
-    .replace(/#{1,6}\s*/g, "")
-    .replace(/\*\*([^*]+)\*\*/g, "$1")
-    .replace(/`([^`]+)`/g, "$1")
-    .replace(/\s+/g, " ")
-    .trim();
+  return stripAttachedFiles(raw).replace(/\s*\[系统提示：[\s\S]*?\]/g, "").replace(/```[\s\S]*?```/g, "[代码块]").replace(/#{1,6}\s*/g, "").replace(/\*\*([^*]+)\*\*/g, "$1").replace(/`([^`]+)`/g, "$1").replace(/\s+/g, " ").trim();
 }
 
 export function extractConversationTurns(entries: readonly SessionEntry[], activeLeafId?: string | null): ConversationTurnSummary[] {
   const rawTurns: Omit<ConversationTurnSummary, "turnIndex" | "isCurrentLeaf">[] = [];
   for (const e of entries) {
     if (e.message.role === "user") {
-      rawTurns.push({
-        userEntryId: e.id,
-        leafEntryId: e.id,
-        userText: cleanPreviewText(e.message.content),
-        replyText: "",
-        toolSteps: 0,
-      });
+      rawTurns.push({ userEntryId: e.id, leafEntryId: e.id, userText: cleanPreviewText(e.message.content), replyText: "", toolSteps: 0 });
     } else if (rawTurns.length > 0) {
       const cur = rawTurns[rawTurns.length - 1]!;
       cur.leafEntryId = e.id;
@@ -211,11 +220,7 @@ export function extractConversationTurns(entries: readonly SessionEntry[], activ
     }
   }
   const filtered = rawTurns.filter((t, i) => t.replyText !== "" || i === rawTurns.length - 1 || t.userText !== rawTurns[i + 1]?.userText);
-  return filtered.map((t, idx) => ({
-    ...t,
-    turnIndex: idx + 1,
-    isCurrentLeaf: Boolean(activeLeafId && (t.leafEntryId === activeLeafId || t.userEntryId === activeLeafId)),
-  }));
+  return filtered.map((t, idx) => ({ ...t, turnIndex: idx + 1, isCurrentLeaf: Boolean(activeLeafId && (t.leafEntryId === activeLeafId || t.userEntryId === activeLeafId)) }));
 }
 
 export function formatRecentHistoryRecap(entries: readonly SessionEntry[], maxTurns = 3, activeLeafId?: string | null): string {
@@ -226,15 +231,10 @@ export function formatRecentHistoryRecap(entries: readonly SessionEntry[], maxTu
     const cur = turns.find((t) => t.isCurrentLeaf) ?? turns[turns.length - 1]!;
     const uShort = cur.userText.length > 68 ? `${cur.userText.slice(0, 65)}...` : cur.userText;
     const rShort = cur.replyText ? (cur.replyText.length > 74 ? `${cur.replyText.slice(0, 71)}...` : cur.replyText) : `已执行 ${cur.toolSteps} 步工具调用`;
-    return [
-      `╭─ 💬 当前续接对话 (#${cur.turnIndex}/${turns.length} · 直接输入将继续追问 | /new 开启新会话 | /resume 切换历史)`,
-      `│ 👤 你: ${uShort}`,
-      `╰─ 🤖 AI (${cur.toolSteps}步): \x1b[2m${rShort}\x1b[0m`,
-    ].join("\n");
+    return [`╭─ 💬 当前续接对话 (#${cur.turnIndex}/${turns.length} · 直接输入将继续追问 | /new 开启新会话 | /resume 切换历史)`, `│ 👤 你: ${uShort}`, `╰─ 🤖 AI (${cur.toolSteps}步): \x1b[2m${rShort}\x1b[0m`].join("\n");
   }
-  const recent = turns.slice(-maxTurns);
   const lines = [`📜 [对话历史 (共 ${turns.length} 轮 · 输入 /resume 用 ↑/↓ 方向键切换轮次 | /new 开启新对话)]:`];
-  for (const t of recent) {
+  for (const t of turns.slice(-maxTurns)) {
     const badge = t.isCurrentLeaf ? "\x1b[32;1m●当前续接\x1b[0m " : "          ";
     const uShort = t.userText.length > 58 ? `${t.userText.slice(0, 55)}...` : t.userText;
     const rShort = t.replyText ? (t.replyText.length > 66 ? `${t.replyText.slice(0, 63)}...` : t.replyText) : `(执行了 ${t.toolSteps} 步工具调用)`;

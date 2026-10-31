@@ -6,7 +6,7 @@ import { projectToMessages } from "../core/session-tree.js";
 import { runAgentSession, type RunSessionOptions } from "./cli.js";
 import { expandAtMentions } from "./context-mention.js";
 import { loadAndFormatWireCost } from "./cost-tracker.js";
-import { type ConversationTurnSummary, extractConversationTurns, formatRecentHistoryRecap, formatSnapshotsDiff, loadProjectMeta, loadProjectRedoBatches, loadProjectSnapshots, type ProjectSessionPaths, resolveProjectSessionPaths, resolveTargetWorkspace, saveProjectMeta, saveProjectSnapshots } from "./project-store.js";
+import { type ConversationTurnSummary, extractConversationTurns, formatRecentHistoryRecap, formatSnapshotsDiff, loadProjectMeta, loadProjectRedoBatches, loadProjectSnapshots, type ProjectSessionPaths, resolveProjectSessionPaths, resolveStartupWorkspace, resolveTargetWorkspace, saveProjectMeta, saveProjectSnapshots } from "./project-store.js";
 import { createRouterProvider, listAvailableModelModes, type ModelMode, resolveActiveModelTarget } from "./router.js";
 import { appendJsonlEntries, loadJsonlEntries, withSessionLock } from "./store.js";
 import { computeTurnMetrics, type FileDiffSummaryItem, summarizeSnapshotsDiff } from "./ui-logger.js";
@@ -50,8 +50,8 @@ function syncStateFromDisk(st: ControllerMutableState): SessionEntry[] {
   return entries;
 }
 
-function buildStatusSummary(st: ControllerMutableState): SessionStatusSummary {
-  const entries = syncStateFromDisk(st);
+function buildStatusSummary(st: ControllerMutableState, preloadedEntries?: SessionEntry[]): SessionStatusSummary {
+  const entries = preloadedEntries ?? syncStateFromDisk(st);
   const rootId = entries[0]?.id ?? null, isNew = !st.leafId || st.leafId === rootId || entries.length <= 1;
   const turns = extractConversationTurns(entries, st.leafId);
   const cur = isNew ? undefined : (turns.find((t) => t.isCurrentLeaf) ?? turns[turns.length - 1]);
@@ -199,7 +199,7 @@ function executeControllerCompact(st: ControllerMutableState) {
 }
 
 export function createSessionController(options: SessionControllerOptions = {}) {
-  const initialPaths = resolveProjectSessionPaths(options.workspaceRoot, options.homeBaseDir);
+  const initialPaths = resolveProjectSessionPaths(resolveStartupWorkspace(options.workspaceRoot, options.homeBaseDir), options.homeBaseDir);
   const st: ControllerMutableState = {
     paths: initialPaths, snapshots: [], redoBatches: [], leafId: null, modelMode: "auto",
     provider: options.provider ?? createRouterProvider(initialPaths.wireLogFile, true, () => st.modelMode),
@@ -248,7 +248,7 @@ export function createSessionController(options: SessionControllerOptions = {}) 
       }
       const targetHint = byTurn ? `#${byTurn.turnIndex}` : resolvedId;
       const snapHint = !codeNote && st.snapshots.length > 0 ? `\n💡 提示：工作区当前有 ${st.snapshots.length} 处未撤回的文件修改（可输入 /diff 查看、/undo ${targetHint} 还原至该轮代码，或 /resume ${targetHint} --code 同步回滚）。` : codeNote;
-      return { ok: true, status: buildStatusSummary(st), recapText: `${formatRecentHistoryRecap(entries, 1, st.leafId)}${snapHint}` };
+      return { ok: true, status: buildStatusSummary(st, entries), recapText: `${formatRecentHistoryRecap(entries, 1, st.leafId)}${snapHint}` };
     },
     setModelMode: (mode: ModelMode): SessionStatusSummary => {
       st.modelMode = mode;
@@ -275,7 +275,7 @@ export function createSessionController(options: SessionControllerOptions = {}) 
       st.paths = resolveProjectSessionPaths(realCandidate, st.homeBaseDir);
       const entries = syncStateFromDisk(st);
       st.provider = st.customProvider ?? createRouterProvider(st.paths.wireLogFile, entries.length > 0, () => st.modelMode);
-      return { ok: true, status: buildStatusSummary(st), entryCount: entries.length, recapText: formatRecentHistoryRecap(entries, 1, st.leafId) };
+      return { ok: true, status: buildStatusSummary(st, entries), entryCount: entries.length, recapText: formatRecentHistoryRecap(entries, 1, st.leafId) };
     },
     clearHistory: (): SessionStatusSummary => {
       for (const f of [st.paths.sessionFile, st.paths.wireLogFile, st.paths.snapshotsFile]) if (fs.existsSync(f)) fs.unlinkSync(f);

@@ -7,7 +7,7 @@ import { probeAgyQuota } from "./agy-bridge.js";
 import { runLocalBangCommand } from "./context-mention.js";
 import { padCols } from "./cost-tracker.js";
 import { attachLiveSlashDropdown, encodePastedNewlines, getPromptVisualCols, restorePastedNewlines } from "./dropdown.js";
-import { buildPlanContextPrompt, handlePlanAndSessionCmd, PLAN_DENY_REASON, PLAN_MODE_CONTEXT_PROMPT, resolveGoalTaskAndContext, savePlanArtifact, verifyGoalCompletion } from "./plan-flow.js";
+import { buildPlanContextPrompt, handlePlanAndSessionCmd, PLAN_DENY_REASON, PLAN_MODE_CONTEXT_PROMPT, printGoalPlanProgress, resolveGoalTaskAndContext, savePlanArtifact, verifyGoalCompletion } from "./plan-flow.js";
 import { editBufferInExternalEditor, editFileInExternalEditor, openInDefaultApp, resolveDefaultOpenTarget } from "./platform.js";
 import { createReplCompleter, formatRecentHistoryRecap, listManagedProjects, loadProjectMeta, type ManagedProjectSummary, type ProjectSessionPaths, resolveProjectSessionPaths, saveProjectMeta, SLASH_COMMANDS } from "./project-store.js";
 import { executeReplReviewCommand } from "./reviewer.js";
@@ -41,6 +41,7 @@ export async function handleSlashCommand(rawCmd: string, ctrl: SessionController
     return true;
   }
   const exact = !rawCmd.includes(" ") ? SLASH_COMMANDS.find((c) => c.cmd.trim() === rawCmd) : undefined;
+  if (!exact && expandSkillSlashCommand(rawCmd, ctrl.getPaths().workspaceRoot) !== rawCmd) return false;
   const unique = !rawCmd.includes(" ") ? SLASH_COMMANDS.filter((c) => c.cmd.trim().startsWith(rawCmd)) : [];
   const cmd = exact ? exact.cmd.trim() : unique.length === 1 ? unique[0]!.cmd.trim() : rawCmd;
   if (handlePlanAndSessionCmd(cmd, ctrl)) return true;
@@ -179,7 +180,9 @@ export async function runOneShotCli(rawArgs: string[], pipedText = "", options: 
       suppressFinalEcho: true, maxSteps: isGoal ? 50 : undefined, signal: ac.signal, contextPrompt: mergedCtx,
       onApprovalRequest: (_calls, meta) => {
         if (isPlan) {
-          const extDeny = `禁止读取工作区 (${ws}) 以外的外部路径 (${meta?.externalDirs.join(", ")})，请仅基于当前工作区内已有文件完成规划，切勿再读取外部目录。`;
+          if (meta?.hasWrite === false && meta?.hasEscalated && (meta?.externalDirs?.length ?? 0) === 0 && Boolean(meta?.escalatedReasons?.length && meta.escalatedReasons.every((r) => r.startsWith("发起外部网络请求")))) return { approved: true };
+          const extTarget = meta?.externalDirs.length ? meta.externalDirs.join(", ") : "外部网络或系统资源";
+          const extDeny = `禁止读取工作区 (${ws}) 以外的外部路径 (${extTarget})，请仅基于当前工作区内已有文件完成规划，切勿再读取外部目录。`;
           return { approved: false, reason: meta?.hasWrite === false && meta?.hasEscalated ? extDeny : PLAN_DENY_REASON };
         }
         if ((autoYes || isGoal) && !meta?.hasEscalated) return { approved: true };
@@ -189,6 +192,7 @@ export async function runOneShotCli(rawArgs: string[], pipedText = "", options: 
       verifyCompletion: isPlan ? undefined : (ans) => (isGoal || ctrl.getDiff("turn").files.some((f) => /\.[cm]?tsx?$/i.test(f.file)) ? verifyGoalCompletion(ws, ans, ac.signal, isGoal) : { ok: true, skipped: true } as any),
     });
     if (isPlan) savePlanArtifact(ctrl, res.finalAnswer, res.leafId);
+    else if (isGoal) printGoalPlanProgress(ctrl, !res.finalAnswer.startsWith("[ABORT]"));
   } finally {
     for (const sig of ["SIGINT", "SIGHUP", "SIGTERM"] as const) process.off(sig, onSigint);
     killTrackedChildren();
@@ -196,11 +200,11 @@ export async function runOneShotCli(rawArgs: string[], pipedText = "", options: 
 }
 
 export async function startInteractiveRepl(options: { workspaceRoot?: string; homeBaseDir?: string; provider?: LlmProvider } = {}): Promise<void> {
-  const ctrl = createSessionController(options), replState = { autoApprove: false, inMainPrompt: false, inApprovalPrompt: false, turnAbort: null as AbortController | null, steerQueue: [] as string[] };
+  const ctrl = createSessionController(options), replState = { autoApprove: false, inMainPrompt: false, inApprovalPrompt: false, turnAbort: null as AbortController | null, steerQueue: [] as string[], promptCols: 4 };
   let terminated = false;
   printReplWelcomeBanner(ctrl);
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout, history: [...(loadProjectMeta(ctrl.getPaths().metaFile).inputHistory ?? [])], historySize: 80, completer: createReplCompleter(() => ctrl.getPaths().workspaceRoot, () => ctrl.getPaths().sessionFile) });
-  const detachDropdown = attachLiveSlashDropdown(rl, () => replState.inMainPrompt, () => getPromptVisualCols(formatPrompt(ctrl)), () => ctrl.getPaths().workspaceRoot, options.homeBaseDir, () => ctrl.getLeafId(), {
+  const detachDropdown = attachLiveSlashDropdown(rl, () => replState.inMainPrompt, () => replState.promptCols, () => ctrl.getPaths().workspaceRoot, options.homeBaseDir, () => ctrl.getLeafId(), {
     isApprovalActive: () => replState.inApprovalPrompt, onAbortRun: () => replState.turnAbort?.abort(),
     onSteerLine: (text) => { replState.steerQueue.push(text); console.log(`\n  💬 [已加入插话队列] 当前工具执行完毕后立即注入：「${text.slice(0, 60)}」`); },
     onExternalEditor: () => {
@@ -222,7 +226,7 @@ export async function startInteractiveRepl(options: { workspaceRoot?: string; ho
     while (!terminated) {
       replState.inMainPrompt = true; setMacClipboardPromptActive(true);
       let line = "";
-      try { process.stdout.write("\n"); line = restorePastedNewlines(await rl.question(formatPrompt(ctrl))).trim(); if (process.stdout.isTTY) process.stdout.write("\x1b]133;C\x07"); } catch (err) {
+      try { process.stdout.write("\n"); const promptStr = formatPrompt(ctrl); replState.promptCols = getPromptVisualCols(promptStr); line = restorePastedNewlines(await rl.question(promptStr)).trim(); if (process.stdout.isTTY) process.stdout.write("\x1b]133;C\x07"); } catch (err) {
         if (terminated || (err instanceof Error && (err.name === "AbortError" || err.message.includes("Ctrl+C") || (err as any).code === "ERR_USE_AFTER_CLOSE"))) {
           if (!terminated) process.stdout.write("\r\n\x1b[J👋 已退出 Duo-Harness。\n");
           break;
@@ -252,12 +256,14 @@ export async function startInteractiveRepl(options: { workspaceRoot?: string; ho
           suppressFinalEcho: true, maxSteps: isGoal ? 50 : undefined, signal: replState.turnAbort.signal, contextPrompt: turnCtx,
           drainSteerMessages: () => replState.steerQueue.splice(0, replState.steerQueue.length),
           onApprovalRequest: (calls, meta) => {
+            if (isPlan && meta?.hasWrite === false && meta?.hasEscalated && (meta?.externalDirs?.length ?? 0) === 0 && Boolean(meta?.escalatedReasons?.length && meta.escalatedReasons.every((r) => r.startsWith("发起外部网络请求")))) return { approved: true };
             if (isPlan) return meta?.hasWrite === false && meta?.hasEscalated ? promptUserApproval(rl, calls, ws, replState, meta) : { approved: false, reason: PLAN_DENY_REASON };
             return isGoal && !meta?.hasEscalated ? { approved: true } : promptUserApproval(rl, calls, ws, replState, meta);
           },
           verifyCompletion: isPlan ? undefined : (ans) => (isGoal || ctrl.getDiff("turn").files.some((f) => /\.[cm]?tsx?$/i.test(f.file)) ? verifyGoalCompletion(ws, ans, replState.turnAbort?.signal, isGoal) : { ok: true, skipped: true } as any),
         });
         if (isPlan) savePlanArtifact(ctrl, res.finalAnswer, res.leafId);
+        else if (isGoal) printGoalPlanProgress(ctrl, !res.finalAnswer.startsWith("[ABORT]"));
       } catch (err) { console.error(`\n❌ 本轮运行异常: ${err instanceof Error ? err.message : String(err)}`); } finally { rl.off("SIGINT", onSigint); replState.turnAbort = null; replState.steerQueue = []; }
     }
   } finally { process.off("SIGHUP", onTerminateSignal); process.off("SIGTERM", onTerminateSignal); killTrackedChildren(); detachDropdown(); rl.close(); }
